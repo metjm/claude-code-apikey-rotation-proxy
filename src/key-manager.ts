@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   type ApiKey,
@@ -21,6 +21,20 @@ export class KeyManager {
   constructor(dataDir: string) {
     this.statePath = join(dataDir, "state.json");
     this.load();
+
+    // Flush pending saves on shutdown so uninstall/restart never loses state
+    const flush = () => this.flushAndExit();
+    process.on("SIGTERM", flush);
+    process.on("SIGINT", flush);
+  }
+
+  private flushAndExit(): void {
+    if (this.saveTimer) {
+      clearTimeout(this.saveTimer);
+      this.saveTimer = null;
+      this.saveNow();
+    }
+    process.exit(0);
   }
 
   // ── Key selection ───────────────────────────────────────────────
@@ -187,8 +201,12 @@ export class KeyManager {
     const dir = this.statePath.replace(/\/[^/]+$/, "");
     mkdirSync(dir, { recursive: true });
 
+    // Atomic write: write to temp file, then rename so a kill mid-write
+    // never leaves a truncated state.json
+    const tmp = this.statePath + ".tmp";
     const state: StoredState = { version: 1, keys: this.keys };
-    writeFileSync(this.statePath, JSON.stringify(state, null, 2));
+    writeFileSync(tmp, JSON.stringify(state, null, 2));
+    renameSync(tmp, this.statePath);
   }
 }
 
