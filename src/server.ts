@@ -1,3 +1,4 @@
+#!/usr/bin/env bun
 import { loadConfig } from "./config.ts";
 import { KeyManager } from "./key-manager.ts";
 import { handleAdminRoute } from "./admin.ts";

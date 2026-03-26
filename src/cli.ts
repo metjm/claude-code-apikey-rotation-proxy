@@ -1,11 +1,12 @@
+#!/usr/bin/env bun
 /**
- * Simple CLI to add keys without needing curl.
+ * CLI to manage the proxy without needing curl.
  *
  * Usage:
- *   bun run src/cli.ts add sk-ant-xxx... [label]
- *   bun run src/cli.ts list
- *   bun run src/cli.ts remove sk-ant-xxx...
- *   bun run src/cli.ts stats
+ *   claude-proxy-ctl add sk-ant-xxx... [label]
+ *   claude-proxy-ctl list
+ *   claude-proxy-ctl remove sk-ant-xxx...
+ *   claude-proxy-ctl stats
  */
 
 const BASE = process.env["PROXY_URL"] ?? "http://localhost:4080";

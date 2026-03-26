@@ -3,11 +3,14 @@
   "version": "0.1.0",
   "type": "module",
   "private": true,
+  "bin": {
+    "claude-proxy": "src/server.ts",
+    "claude-proxy-ctl": "src/cli.ts"
+  },
   "scripts": {
     "start": "bun run src/server.ts",
     "dev": "bun --watch run src/server.ts",
-    "typecheck": "tsc --noEmit",
-    "add-key": "bun run src/cli.ts"
+    "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
     "@types/bun": "latest",
