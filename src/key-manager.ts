@@ -18,14 +18,15 @@ export class KeyManager {
   private readonly statePath: string;
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
 
-  constructor(dataDir: string) {
+  constructor(dataDir: string, opts?: { registerShutdownHandler?: boolean }) {
     this.statePath = join(dataDir, "state.json");
     this.load();
 
-    // Flush pending saves on shutdown so uninstall/restart never loses state
-    const flush = () => this.flushAndExit();
-    process.on("SIGTERM", flush);
-    process.on("SIGINT", flush);
+    if (opts?.registerShutdownHandler) {
+      const flush = () => this.flushAndExit();
+      process.on("SIGTERM", flush);
+      process.on("SIGINT", flush);
+    }
   }
 
   private flushAndExit(): void {

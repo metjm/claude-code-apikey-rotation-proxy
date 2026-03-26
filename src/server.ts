@@ -71,7 +71,7 @@ Environment:
 
 function startServer(): void {
   const config = loadConfig();
-  const keyManager = new KeyManager(config.dataDir);
+  const keyManager = new KeyManager(config.dataDir, { registerShutdownHandler: true });
 
   const server = Bun.serve({
     port: config.port,
