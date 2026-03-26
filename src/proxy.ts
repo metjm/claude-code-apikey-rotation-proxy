@@ -130,13 +130,26 @@ export async function proxyRequest(
       }
     }
 
-    const proxiedResponse = new Response(upstream.body, {
+    const isStreaming = (upstream.headers.get("content-type") ?? "").includes("text/event-stream");
+    let body: ReadableStream<Uint8Array> | string | null;
+
+    if (isStreaming && upstream.body !== null) {
+      body = createTokenTrackingStream(upstream.body, entry, keyManager);
+    } else if (upstream.body !== null) {
+      const text = await upstream.text();
+      extractTokensFromJson(text, entry, keyManager);
+      body = text;
+    } else {
+      keyManager.recordSuccess(entry, 0, 0);
+      body = null;
+    }
+
+    const proxiedResponse = new Response(body, {
       status: upstream.status,
       statusText: upstream.statusText,
       headers: responseHeaders,
     });
 
-    keyManager.recordSuccess(entry, 0, 0);
     return { kind: "success", response: proxiedResponse, usedKey: entry };
   }
 
@@ -191,3 +204,94 @@ function parseRetryAfter(header: string | null): number {
   const secs = parseFloat(header);
   return Number.isFinite(secs) && secs > 0 ? secs : 60;
 }
+
+// ── Token tracking ────────────────────────────────────────────────
+
+interface AnthropicUsage {
+  readonly input_tokens?: number;
+  readonly output_tokens?: number;
+}
+
+interface AnthropicResponse {
+  readonly usage?: AnthropicUsage;
+}
+
+interface AnthropicStreamDelta {
+  readonly type?: string;
+  readonly usage?: AnthropicUsage;
+  readonly message?: { readonly usage?: AnthropicUsage };
+}
+
+function extractTokensFromJson(
+  text: string,
+  entry: import("./types.ts").ApiKeyEntry,
+  keyManager: KeyManager,
+): void {
+  try {
+    const parsed = JSON.parse(text) as AnthropicResponse;
+    const input = parsed.usage?.input_tokens ?? 0;
+    const output = parsed.usage?.output_tokens ?? 0;
+    keyManager.recordSuccess(entry, input, output);
+    if (input > 0 || output > 0) {
+      log("info", "Token usage", { label: entry.label, input, output });
+    }
+  } catch {
+    keyManager.recordSuccess(entry, 0, 0);
+  }
+}
+
+/**
+ * Wraps a streaming response body to intercept SSE events and extract token
+ * usage from message_start and message_delta events. Data passes through
+ * unmodified — we only observe.
+ */
+function createTokenTrackingStream(
+  source: ReadableStream<Uint8Array>,
+  entry: import("./types.ts").ApiKeyEntry,
+  keyManager: KeyManager,
+): ReadableStream<Uint8Array> {
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let inputTokens = 0;
+  let outputTokens = 0;
+
+  return source.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      controller.enqueue(chunk);
+
+      buffer += decoder.decode(chunk, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+
+      for (const line of lines) {
+        if (!line.startsWith("data: ")) continue;
+        const json = line.slice(6).trim();
+        if (json === "[DONE]") continue;
+
+        try {
+          const event = JSON.parse(json) as AnthropicStreamDelta;
+          if (event.type === "message_start" && event.message?.usage) {
+            inputTokens += event.message.usage.input_tokens ?? 0;
+          }
+          if (event.type === "message_delta" && event.usage) {
+            outputTokens += event.usage.output_tokens ?? 0;
+          }
+        } catch {
+          // Not valid JSON — skip
+        }
+      }
+    },
+
+    flush() {
+      keyManager.recordSuccess(entry, inputTokens, outputTokens);
+      if (inputTokens > 0 || outputTokens > 0) {
+        log("info", "Token usage (stream)", {
+          label: entry.label,
+          input: inputTokens,
+          output: outputTokens,
+        });
+      }
+    },
+  }));
+}
+
