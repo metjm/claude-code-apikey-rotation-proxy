@@ -27,7 +27,9 @@ export class KeyManager {
 
   /**
    * Pick the best available key.
-   * Strategy: least-recently-used among non-rate-limited keys.
+   * Strategy: stick with the most-recently-used key until it's rate-limited,
+   * then fall back to the next one. This preserves API prompt caching which
+   * is per-key.
    * Returns null only if no keys are registered at all.
    */
   getNextAvailableKey(): ApiKeyEntry | null {
@@ -36,7 +38,7 @@ export class KeyManager {
     const currentTime = now();
     const available = this.keys
       .filter((k) => k.availableAt <= currentTime)
-      .sort((a, b) => (a.stats.lastUsedAt ?? 0) - (b.stats.lastUsedAt ?? 0));
+      .sort((a, b) => (b.stats.lastUsedAt ?? 0) - (a.stats.lastUsedAt ?? 0));
 
     if (available.length > 0) return available[0]!;
     return null;
