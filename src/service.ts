@@ -1,15 +1,21 @@
-import { existsSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { execSync } from "node:child_process";
 import { homedir } from "node:os";
 
-type Platform = "linux" | "darwin";
+type Backend = "launchd" | "systemd" | "pidfile";
 
-function getPlatform(): Platform {
-  const p = process.platform;
-  if (p === "linux") return "linux";
-  if (p === "darwin") return "darwin";
-  throw new Error(`Unsupported platform: ${p}. Only linux (systemd) and macOS (launchd) are supported.`);
+function detectBackend(): Backend {
+  if (process.platform === "darwin") return "launchd";
+  if (process.platform === "linux") {
+    // Check if PID 1 is actually systemd — wrapper scripts can fake `systemctl`
+    try {
+      const init = readFileSync("/proc/1/comm", "utf-8").trim();
+      if (init === "systemd") return "systemd";
+    } catch {}
+    return "pidfile";
+  }
+  return "pidfile";
 }
 
 function getBunPath(): string {
@@ -23,6 +29,93 @@ function getServerScript(): string {
 }
 
 const SERVICE_NAME = "claude-proxy";
+
+// ── PID file (universal fallback) ─────────────────────────────────
+
+function pidDir(): string {
+  return join(homedir(), `.${SERVICE_NAME}`);
+}
+
+function pidFilePath(): string {
+  return join(pidDir(), "pid");
+}
+
+function logFilePath(): string {
+  return join(pidDir(), "output.log");
+}
+
+function readPid(): number | null {
+  const p = pidFilePath();
+  if (!existsSync(p)) return null;
+  const raw = readFileSync(p, "utf-8").trim();
+  const pid = parseInt(raw, 10);
+  if (Number.isNaN(pid)) return null;
+
+  // Check if process is alive
+  try {
+    process.kill(pid, 0);
+    return pid;
+  } catch {
+    // Stale PID file
+    unlinkSync(p);
+    return null;
+  }
+}
+
+function installPidfile(dataDir: string): void {
+  const existing = readPid();
+  if (existing !== null) {
+    console.log(`Already running (pid ${existing}). Run 'claude-proxy service uninstall' first.`);
+    return;
+  }
+
+  const bunPath = getBunPath();
+  const serverScript = getServerScript();
+  const dir = pidDir();
+  mkdirSync(dir, { recursive: true });
+
+  const logPath = logFilePath();
+
+  const child = Bun.spawn([bunPath, "run", serverScript], {
+    stdin: "ignore",
+    stdout: Bun.file(logPath),
+    stderr: Bun.file(logPath),
+    env: { ...process.env, DATA_DIR: dataDir },
+    cwd: dirname(serverScript),
+  });
+
+  writeFileSync(pidFilePath(), String(child.pid));
+  console.log(`\nStarted claude-proxy (pid ${child.pid})`);
+  console.log(`  Logs: ${logPath}`);
+  console.log(`  Stop: claude-proxy service uninstall`);
+}
+
+function uninstallPidfile(): void {
+  const pid = readPid();
+  if (pid !== null) {
+    try {
+      process.kill(pid, "SIGTERM");
+      console.log(`Stopped process ${pid}.`);
+    } catch {
+      console.log(`Process ${pid} already dead.`);
+    }
+  } else {
+    console.log("Not running.");
+  }
+  const p = pidFilePath();
+  if (existsSync(p)) unlinkSync(p);
+  console.log("Service uninstalled.");
+}
+
+function statusPidfile(): void {
+  const pid = readPid();
+  if (pid !== null) {
+    console.log(`Running (pid ${pid})`);
+    console.log(`  Logs: ${logFilePath()}`);
+  } else {
+    console.log("Not running.");
+  }
+}
 
 // ── Systemd (Linux) ───────────────────────────────────────────────
 
@@ -83,7 +176,7 @@ function statusSystemd(): void {
   try {
     execSync(`systemctl --user status ${SERVICE_NAME}`, { stdio: "inherit" });
   } catch {
-    // systemctl returns non-zero for inactive services, that's fine
+    // systemctl returns non-zero for inactive services
   }
 }
 
@@ -170,24 +263,40 @@ function statusLaunchd(): void {
 
 // ── Public API ────────────────────────────────────────────────────
 
+const BACKEND_LABELS: Record<Backend, string> = {
+  launchd: "launchd (macOS)",
+  systemd: "systemd (Linux)",
+  pidfile: "background process",
+};
+
 export function serviceInstall(dataDir: string): void {
-  const platform = getPlatform();
+  const backend = detectBackend();
   const resolvedDataDir = resolve(dataDir);
   mkdirSync(resolvedDataDir, { recursive: true });
   console.log(`Data directory: ${resolvedDataDir}`);
+  console.log(`Backend: ${BACKEND_LABELS[backend]}`);
 
-  if (platform === "linux") installSystemd(resolvedDataDir);
-  else installLaunchd(resolvedDataDir);
+  switch (backend) {
+    case "systemd": installSystemd(resolvedDataDir); break;
+    case "launchd": installLaunchd(resolvedDataDir); break;
+    case "pidfile": installPidfile(resolvedDataDir); break;
+  }
 }
 
 export function serviceUninstall(): void {
-  const platform = getPlatform();
-  if (platform === "linux") uninstallSystemd();
-  else uninstallLaunchd();
+  const backend = detectBackend();
+  switch (backend) {
+    case "systemd": uninstallSystemd(); break;
+    case "launchd": uninstallLaunchd(); break;
+    case "pidfile": uninstallPidfile(); break;
+  }
 }
 
 export function serviceStatus(): void {
-  const platform = getPlatform();
-  if (platform === "linux") statusSystemd();
-  else statusLaunchd();
+  const backend = detectBackend();
+  switch (backend) {
+    case "systemd": statusSystemd(); break;
+    case "launchd": statusLaunchd(); break;
+    case "pidfile": statusPidfile(); break;
+  }
 }
