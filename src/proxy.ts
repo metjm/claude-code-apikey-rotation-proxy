@@ -19,11 +19,15 @@ const STRIPPED_REQUEST_HEADERS: ReadonlySet<string> = new Set([
 
 /**
  * Headers we strip from the upstream response before forwarding to the client.
+ * content-encoding is stripped because Bun's fetch auto-decompresses responses,
+ * so the body is already decompressed when we forward it.
  */
 const STRIPPED_RESPONSE_HEADERS: ReadonlySet<string> = new Set([
   "connection",
   "keep-alive",
   "transfer-encoding",
+  "content-encoding",
+  "content-length",
 ]);
 
 /**
