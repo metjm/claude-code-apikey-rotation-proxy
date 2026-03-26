@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * CLI to manage the proxy without needing curl.
+ * CLI to manage proxy keys. Works offline — reads/writes state.json directly.
  *
  * Usage:
  *   claude-proxy-ctl add sk-ant-xxx... [label]
@@ -9,70 +9,73 @@
  *   claude-proxy-ctl stats
  */
 
-const BASE = process.env["PROXY_URL"] ?? "http://localhost:4080";
-const TOKEN = process.env["ADMIN_TOKEN"] ?? "";
+import { setLogLevel } from "./logger.ts";
+setLogLevel("error");
+
+import { loadConfig } from "./config.ts";
+import { KeyManager } from "./key-manager.ts";
+
+const config = loadConfig();
+const keyManager = new KeyManager(config.dataDir);
 
 const [command, ...args] = process.argv.slice(2);
 
-async function main(): Promise<void> {
-  const headers: Record<string, string> = {
-    "content-type": "application/json",
-  };
-  if (TOKEN) {
-    headers["authorization"] = `Bearer ${TOKEN}`;
-  }
-
-  switch (command) {
-    case "add": {
-      const key = args[0];
-      const label = args[1];
-      if (!key) {
-        console.error("Usage: bun run src/cli.ts add <api-key> [label]");
-        process.exit(1);
-      }
-      const res = await fetch(`${BASE}/admin/keys`, {
-        method: "POST",
-        headers,
-        body: JSON.stringify({ key, label }),
-      });
-      console.log(await res.json());
-      break;
-    }
-
-    case "list": {
-      const res = await fetch(`${BASE}/admin/keys`, { headers });
-      console.log(JSON.stringify(await res.json(), null, 2));
-      break;
-    }
-
-    case "remove": {
-      const key = args[0];
-      if (!key) {
-        console.error("Usage: bun run src/cli.ts remove <api-key>");
-        process.exit(1);
-      }
-      const res = await fetch(`${BASE}/admin/keys/remove`, {
-        method: "POST",
-        headers,
-        body: JSON.stringify({ key }),
-      });
-      console.log(await res.json());
-      break;
-    }
-
-    case "stats": {
-      const res = await fetch(`${BASE}/admin/stats`, { headers });
-      console.log(JSON.stringify(await res.json(), null, 2));
-      break;
-    }
-
-    default:
-      console.log(`Commands: add, list, remove, stats`);
+switch (command) {
+  case "add": {
+    const key = args[0];
+    const label = args[1];
+    if (!key) {
+      console.error("Usage: claude-proxy-ctl add <api-key> [label]");
       process.exit(1);
+    }
+    try {
+      const entry = keyManager.addKey(key, label);
+      console.log(`Added key "${entry.label}"`);
+    } catch (err) {
+      console.error(`Error: ${(err as Error).message}`);
+      process.exit(1);
+    }
+    break;
   }
-}
 
-main().catch((err: unknown) => {
-  console.error("CLI error:", err);
-  process.exit(1);
-});
+  case "list": {
+    const keys = keyManager.listKeys();
+    if (keys.length === 0) {
+      console.log("No keys configured.");
+    } else {
+      console.log(JSON.stringify(keys, null, 2));
+    }
+    break;
+  }
+
+  case "remove": {
+    const key = args[0];
+    if (!key) {
+      console.error("Usage: claude-proxy-ctl remove <api-key>");
+      process.exit(1);
+    }
+    if (keyManager.removeKey(key)) {
+      console.log("Key removed.");
+    } else {
+      console.error("Key not found.");
+      process.exit(1);
+    }
+    break;
+  }
+
+  case "stats": {
+    const keys = keyManager.listKeys();
+    for (const k of keys) {
+      console.log(`\n${k.label} (${k.maskedKey})${k.isAvailable ? "" : " [rate-limited]"}`);
+      console.log(`  Requests: ${k.stats.successfulRequests}/${k.stats.totalRequests} successful`);
+      console.log(`  Tokens: ${k.stats.totalTokensIn} in / ${k.stats.totalTokensOut} out`);
+      console.log(`  Rate limits: ${k.stats.rateLimitHits}, Errors: ${k.stats.errors}`);
+    }
+    if (keys.length === 0) console.log("No keys configured.");
+    break;
+  }
+
+  default:
+    console.log("Commands: add, list, remove, stats");
+    process.exit(1);
+}
