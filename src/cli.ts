@@ -75,7 +75,13 @@ switch (command) {
     break;
   }
 
+  case "watch": {
+    const { startWatch } = await import("./watch.ts");
+    startWatch();
+    break;
+  }
+
   default:
-    console.log("Commands: add, list, remove, stats");
+    console.log("Commands: add, list, remove, stats, watch");
     process.exit(1);
 }

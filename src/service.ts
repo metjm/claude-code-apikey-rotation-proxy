@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { execSync } from "node:child_process";
 import { homedir } from "node:os";
@@ -40,8 +40,24 @@ function pidFilePath(): string {
   return join(pidDir(), "pid");
 }
 
-function logFilePath(): string {
-  return join(pidDir(), "output.log");
+export function logDir(): string {
+  return join(pidDir(), "logs");
+}
+
+function newLogFilePath(): string {
+  const ts = new Date().toISOString().replace(/[:.]/g, "-").replace("T", "_").replace("Z", "");
+  return join(logDir(), `output-${ts}.log`);
+}
+
+function latestLogFile(): string | null {
+  const dir = logDir();
+  if (!existsSync(dir)) return null;
+  const { readdirSync } = require("node:fs") as typeof import("node:fs");
+  const files = readdirSync(dir)
+    .filter((f: string) => f.startsWith("output-") && f.endsWith(".log"))
+    .sort()
+    .reverse();
+  return files.length > 0 ? join(dir, files[0]!) : null;
 }
 
 function readPid(): number | null {
@@ -74,12 +90,15 @@ function installPidfile(dataDir: string): void {
   const dir = pidDir();
   mkdirSync(dir, { recursive: true });
 
-  const logPath = logFilePath();
+  const logsDir = logDir();
+  mkdirSync(logsDir, { recursive: true });
+  const logPath = newLogFilePath();
+  const logFd = openSync(logPath, "a");
 
   const child = Bun.spawn([bunPath, "run", serverScript], {
     stdin: "ignore",
-    stdout: Bun.file(logPath),
-    stderr: Bun.file(logPath),
+    stdout: logFd,
+    stderr: logFd,
     env: { ...process.env, DATA_DIR: dataDir },
     cwd: dirname(serverScript),
   });
@@ -114,7 +133,8 @@ function statusPidfile(): void {
   const pid = readPid();
   if (pid !== null) {
     console.log(`Running (pid ${pid})`);
-    console.log(`  Logs: ${logFilePath()}`);
+    const latest = latestLogFile();
+    if (latest) console.log(`  Logs: ${latest}`);
   } else {
     console.log("Not running.");
   }
