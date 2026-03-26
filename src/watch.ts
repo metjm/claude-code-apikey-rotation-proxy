@@ -35,6 +35,16 @@ function fmtNum(n: number): string {
   return String(n);
 }
 
+function fmtCountdown(ms: number): string {
+  const totalSec = Math.ceil(ms / 1000);
+  const h = Math.floor(totalSec / 3600);
+  const m = Math.floor((totalSec % 3600) / 60);
+  const s = totalSec % 60;
+  if (h > 0) return `${h}h${String(m).padStart(2, "0")}m`;
+  if (m > 0) return `${m}m${String(s).padStart(2, "0")}s`;
+  return `${s}s`;
+}
+
 function fmtUptime(ms: number): string {
   const s = Math.floor(ms / 1000);
   if (s < 60) return `${s}s`;
@@ -105,7 +115,15 @@ function render(
   for (const k of keys.slice(0, 8)) {
     const c = keyColor(k.label);
     const ratio = totalReqs > 0 ? k.stats.totalRequests / totalReqs : 0;
-    const badge = k.isAvailable ? `${GREEN}[OK]${RST}` : `${YELLOW}[RATE-LTD]${RST}`;
+    let badge: string;
+    if (k.isAvailable) {
+      badge = `${GREEN}[OK]${RST}`;
+    } else {
+      const remaining = k.availableAt - Date.now();
+      badge = remaining > 0
+        ? `${YELLOW}[RATE-LTD ${fmtCountdown(remaining)}]${RST}`
+        : `${YELLOW}[RATE-LTD]${RST}`;
+    }
     keyLines.push(
       `${pad(`  ${c}${BOLD}${k.label}${RST}`, 16)}  ${bar(ratio, 14, c)}  ${pad(`${WHITE}${String(k.stats.totalRequests).padStart(4)} req${RST}`, 12)}  ${DIM}${fmtNum(k.stats.totalTokensIn).padStart(6)}/${fmtNum(k.stats.totalTokensOut).padStart(6)} tok${RST}  ${badge}`
     );
