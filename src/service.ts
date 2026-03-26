@@ -84,10 +84,13 @@ function installPidfile(dataDir: string): void {
     cwd: dirname(serverScript),
   });
 
+  child.unref();
+
   writeFileSync(pidFilePath(), String(child.pid));
   console.log(`\nStarted claude-proxy (pid ${child.pid})`);
   console.log(`  Logs: ${logPath}`);
   console.log(`  Stop: claude-proxy service uninstall`);
+  process.exit(0);
 }
 
 function uninstallPidfile(): void {
