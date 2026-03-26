@@ -87,6 +87,7 @@ function render(
   keys: readonly MaskedKeyEntry[],
   activity: Event[],
   startedAt: number,
+  connected: boolean,
   paused: boolean,
   cols: number,
   rows: number,
@@ -94,9 +95,10 @@ function render(
   const totalReqs = keys.reduce((s, k) => s + k.stats.totalRequests, 0);
   const availCount = keys.filter((k) => k.isAvailable).length;
   const sep = DIM + "\u2500".repeat(cols) + RST;
+  const connStatus = connected ? `${GREEN}\u25cf${RST}` : `${RED}\u25cf reconnecting${RST}`;
 
   // Header
-  const hdr = `${BOLD}${CYAN} CLAUDE PROXY ${RST} ${DIM}\u2502${RST} ${WHITE}${keys.length}${RST} keys  ${DIM}\u2502${RST} ${GREEN}${availCount}${RST} avail  ${DIM}\u2502${RST} ${WHITE}${totalReqs}${RST} reqs  ${DIM}\u2502${RST} ${DIM}${fmtUptime(Date.now() - startedAt)}${RST}`;
+  const hdr = `${BOLD}${CYAN} CLAUDE PROXY ${RST} ${connStatus} ${DIM}\u2502${RST} ${WHITE}${keys.length}${RST} keys  ${DIM}\u2502${RST} ${GREEN}${availCount}${RST} avail  ${DIM}\u2502${RST} ${WHITE}${totalReqs}${RST} reqs  ${DIM}\u2502${RST} ${DIM}${fmtUptime(Date.now() - startedAt)}${RST}`;
 
   // Keys
   const keyLines: string[] = [];
@@ -199,13 +201,13 @@ export async function startWatch(): Promise<void> {
   }
 
   function doRender() {
-    if (!paused) render(keys, activity, startedAt, paused, cols, rows);
+    render(keys, activity, startedAt, connected, paused, cols, rows);
   }
 
   process.stdin.on("data", (key: string) => {
     if (key === "q" || key === "\x03") { cleanup(); process.exit(0); }
     if (key === "c") { activity.length = 0; doRender(); }
-    if (key === " ") { paused = !paused; render(keys, activity, startedAt, paused, cols, rows); }
+    if (key === " ") { paused = !paused; doRender(); }
   });
 
   process.stdout.on("resize", () => {
@@ -214,7 +216,11 @@ export async function startWatch(): Promise<void> {
     doRender();
   });
 
+  let connected = false;
   doRender();
+
+  // Re-render every second for uptime counter + connection status
+  setInterval(() => { if (!paused) render(keys, activity, startedAt, connected, paused, cols, rows); }, 1_000);
 
   // Connect to SSE with auto-reconnect
   async function connect(): Promise<void> {
@@ -222,6 +228,7 @@ export async function startWatch(): Promise<void> {
       try {
         const res = await fetch(url);
         if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+        connected = true;
 
         const reader = res.body.getReader();
         const decoder = new TextDecoder();
@@ -240,31 +247,20 @@ export async function startWatch(): Promise<void> {
             if (!dataLine) continue;
             try {
               const event = JSON.parse(dataLine.slice(6)) as Event;
-
-              // Update keys snapshot from every event
-              if (event.keys) {
-                keys = event.keys as MaskedKeyEntry[];
-              }
-
-              // Don't add "keys" type to activity (it's just the initial snapshot)
+              if (event.keys) keys = event.keys as MaskedKeyEntry[];
               if (event.type !== "keys") {
                 activity.push(event);
                 if (activity.length > MAX_ACTIVITY) activity.shift();
               }
-
-              doRender();
             } catch {}
           }
         }
       } catch {
-        // Server not running or disconnected — retry
-        keys = [];
-        doRender();
+        connected = false;
       }
 
       // Wait before reconnecting
       await new Promise((r) => setTimeout(r, 2000));
-      doRender();
     }
   }
 

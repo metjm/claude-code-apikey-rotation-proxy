@@ -160,28 +160,32 @@ function handleEvents(
   _req: Request,
   keyManager: KeyManager,
 ): Response {
-  // Send initial state as first event, then stream live events
   const stream = new ReadableStream({
     start(controller) {
-      const initial: ProxyEvent = {
-        type: "keys",
-        ts: new Date().toISOString(),
-        keys: keyManager.listKeys(),
-      };
-      controller.enqueue(`data: ${JSON.stringify(initial)}\n\n`);
+      function sendKeys() {
+        try {
+          const ev: ProxyEvent = { type: "keys", ts: new Date().toISOString(), keys: keyManager.listKeys() };
+          controller.enqueue(`data: ${JSON.stringify(ev)}\n\n`);
+        } catch {}
+      }
+
+      // Initial snapshot + heartbeat every 5s with fresh stats
+      sendKeys();
+      const heartbeat = setInterval(sendKeys, 5_000);
 
       const unsubscribe = subscribe((event) => {
         try {
           controller.enqueue(`data: ${JSON.stringify(event)}\n\n`);
         } catch {
           unsubscribe();
+          clearInterval(heartbeat);
         }
       });
 
-      // Clean up if client disconnects
       _req.signal.addEventListener("abort", () => {
         unsubscribe();
-        try { controller.close(); } catch {}
+        clearInterval(heartbeat);
+        try { controller.close(); } catch {};
       });
     },
   });
