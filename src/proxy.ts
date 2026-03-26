@@ -42,6 +42,8 @@ export async function proxyRequest(
     return { kind: "no_keys" };
   }
 
+  const url = new URL(req.url);
+
   const triedKeys = new Set<string>();
   let attempts = 0;
 
@@ -60,15 +62,15 @@ export async function proxyRequest(
     attempts++;
     keyManager.recordRequest(entry);
 
-    const url = new URL(req.url);
     const upstreamUrl = `${config.upstream}${url.pathname}${url.search}`;
     const headers = buildUpstreamHeaders(req.headers, entry.key);
 
-    log("debug", "Proxying request", {
+    log("info", "Proxying request", {
       label: entry.label,
       method: req.method,
       path: url.pathname,
       attempt: attempts,
+      authType: isOAuthToken(entry.key) ? "bearer" : "x-api-key",
     });
 
     let upstream: Response;
@@ -88,6 +90,11 @@ export async function proxyRequest(
       };
     }
 
+    log("info", "Upstream responded", {
+      label: entry.label,
+      status: upstream.status,
+    });
+
     if (upstream.status === RATE_LIMIT_STATUS) {
       const retryAfter = parseRetryAfter(upstream.headers.get("retry-after"));
       keyManager.recordRateLimit(entry, retryAfter);
@@ -104,6 +111,11 @@ export async function proxyRequest(
     if (upstream.status >= 400) {
       keyManager.recordError(entry);
       const body = await upstream.text();
+      log("warn", "Upstream error", {
+        label: entry.label,
+        status: upstream.status,
+        body: body.slice(0, 500),
+      });
       return { kind: "error", status: upstream.status, body, usedKey: entry };
     }
 
@@ -147,6 +159,11 @@ function fetchUpstream(
   return fetch(url, { method, headers, body, duplex: "half" } satisfies BunFetchRequestInit);
 }
 
+/** OAuth tokens (sk-ant-oat-*) use Bearer auth; regular API keys use x-api-key. */
+function isOAuthToken(key: string): boolean {
+  return key.startsWith("sk-ant-oat");
+}
+
 function buildUpstreamHeaders(incoming: Headers, apiKey: string): Headers {
   const headers = new Headers();
   for (const [key, value] of incoming.entries()) {
@@ -154,7 +171,13 @@ function buildUpstreamHeaders(incoming: Headers, apiKey: string): Headers {
       headers.set(key, value);
     }
   }
-  headers.set("x-api-key", apiKey);
+
+  if (isOAuthToken(apiKey)) {
+    headers.set("authorization", `Bearer ${apiKey}`);
+  } else {
+    headers.set("x-api-key", apiKey);
+  }
+
   headers.set("anthropic-version", incoming.get("anthropic-version") ?? "2023-06-01");
   return headers;
 }
