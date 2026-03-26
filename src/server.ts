@@ -5,6 +5,7 @@ import { handleAdminRoute } from "./admin.ts";
 import { proxyRequest } from "./proxy.ts";
 import { log } from "./logger.ts";
 import { serviceInstall, serviceStatus, serviceUninstall } from "./service.ts";
+import { claudeConfigInstall, claudeConfigUninstall, claudeConfigStatus } from "./claude-config.ts";
 import type { UnixMs } from "./types.ts";
 
 const subcommand = process.argv[2];
@@ -27,6 +28,24 @@ if (subcommand === "service") {
       console.log("Usage: claude-proxy service <install|uninstall|status>");
       process.exit(1);
   }
+} else if (subcommand === "claude") {
+  const action = process.argv[3];
+  const config = loadConfig();
+
+  switch (action) {
+    case "install":
+      claudeConfigInstall(config.port);
+      break;
+    case "uninstall":
+      claudeConfigUninstall();
+      break;
+    case "status":
+      claudeConfigStatus(config.port);
+      break;
+    default:
+      console.log("Usage: claude-proxy claude <install|uninstall|status>");
+      process.exit(1);
+  }
 } else if (subcommand === "help" || subcommand === "--help" || subcommand === "-h") {
   console.log(`claude-proxy — API key rotation proxy for Claude Code
 
@@ -35,6 +54,9 @@ Usage:
   claude-proxy service install        Install as a system service (auto-start)
   claude-proxy service uninstall      Remove the system service
   claude-proxy service status         Check service status
+  claude-proxy claude install         Add proxy to Claude Code settings
+  claude-proxy claude uninstall       Remove proxy from Claude Code settings
+  claude-proxy claude status          Check if Claude Code is using the proxy
 
 Environment:
   PORT              Listen port (default: 4080)
