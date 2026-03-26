@@ -1,8 +1,5 @@
-import { openSync, readSync, readFileSync, fstatSync, existsSync, readdirSync } from "node:fs";
-import { join } from "node:path";
-import { logDir } from "./service.ts";
 import { loadConfig } from "./config.ts";
-import type { StoredState, ApiKeyEntry, UnixMs } from "./types.ts";
+import type { MaskedKeyEntry } from "./types.ts";
 
 // ── ANSI ─────────────────────────────────────────────────────────
 
@@ -26,11 +23,9 @@ const CYAN = fg(14);
 
 // ── Helpers ──────────────────────────────────────────────────────
 
-interface LogEntry { ts: string; level: string; msg: string; label?: string; [k: string]: unknown }
-
 function fmtTime(iso: string): string {
   const d = new Date(iso);
-  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}:${String(d.getSeconds()).padStart(2, "0")}`;
+  return [d.getHours(), d.getMinutes(), d.getSeconds()].map((n) => String(n).padStart(2, "0")).join(":");
 }
 
 function fmtNum(n: number): string {
@@ -63,150 +58,122 @@ function trunc(s: string, n: number): string {
   return s.length > n ? s.slice(0, n - 1) + "\u2026" : s;
 }
 
-function sep(cols: number): string {
-  return DIM + "\u2500".repeat(cols) + RST;
-}
-
-// ── Read state.json ──────────────────────────────────────────────
-
-function readState(statePath: string): StoredState | null {
-  try {
-    return JSON.parse(readFileSync(statePath, "utf-8")) as StoredState;
-  } catch {
-    return null;
-  }
-}
-
-// ── Log file discovery ───────────────────────────────────────────
-
-function findLogFiles(): string[] {
-  const dir = logDir();
-  if (!existsSync(dir)) return [];
-  return readdirSync(dir)
-    .filter((f) => f.startsWith("output-") && f.endsWith(".log"))
-    .sort()
-    .map((f) => join(dir, f));
-}
-
 // ── Color assignment ─────────────────────────────────────────────
 
-const keyColorMap = new Map<string, string>();
+const colorMap = new Map<string, string>();
 let colorIdx = 0;
-
 function keyColor(label: string): string {
-  let c = keyColorMap.get(label);
+  let c = colorMap.get(label);
   if (!c) {
-    c = fg(KEY_COLORS[colorIdx % KEY_COLORS.length]!);
-    keyColorMap.set(label, c);
-    colorIdx++;
+    c = fg(KEY_COLORS[colorIdx++ % KEY_COLORS.length]!);
+    colorMap.set(label, c);
   }
   return c;
 }
 
-// ── Log entry formatting ─────────────────────────────────────────
+// ── Event types ──────────────────────────────────────────────────
 
-function msgColor(e: LogEntry): string {
-  switch (e.msg) {
-    case "Token usage": case "Token usage (stream)": return GREEN;
-    case "Rate limited, trying next key": case "Key rate-limited": return YELLOW;
-    case "Upstream error": case "Upstream fetch failed": return RED;
-    case "Upstream responded": {
-      const s = e["status"] as number;
-      return s >= 200 && s < 400 ? GREEN : s === 429 ? YELLOW : RED;
-    }
-    default: return "";
-  }
-}
-
-function logDetail(e: LogEntry): string {
-  switch (e.msg) {
-    case "Proxying request":
-      return `${DIM}${e["method"]} ${trunc(String(e["path"]), 20)}  #${e["attempt"]}${RST}`;
-    case "Upstream responded": {
-      const s = e["status"] as number;
-      const c = s >= 200 && s < 400 ? GREEN : s === 429 ? YELLOW : RED;
-      return `${c}${s}${RST}`;
-    }
-    case "Token usage": case "Token usage (stream)":
-      return `${GREEN}${fmtNum(e["input"] as number)} in / ${fmtNum(e["output"] as number)} out${RST}`;
-    case "Rate limited, trying next key":
-      return `${YELLOW}retry ${e["retryAfter"]}s, ${e["availableKeys"]} avail${RST}`;
-    case "Key rate-limited":
-      return `${YELLOW}${BOLD}retry ${e["retryAfterSecs"]}s${RST}`;
-    case "Upstream error":
-      return `${RED}${e["status"]}${RST}`;
-    case "Upstream fetch failed":
-      return `${RED}${trunc(String(e["error"] ?? ""), 40)}${RST}`;
-    default:
-      return DIM + trunc(e.msg, 40) + RST;
-  }
+interface Event {
+  type: string;
+  ts: string;
+  label?: string;
+  keys?: MaskedKeyEntry[];
+  [k: string]: unknown;
 }
 
 // ── Render ────────────────────────────────────────────────────────
 
 function render(
-  keys: readonly ApiKeyEntry[],
-  entries: LogEntry[],
+  keys: readonly MaskedKeyEntry[],
+  activity: Event[],
   startedAt: number,
   paused: boolean,
   cols: number,
   rows: number,
 ): void {
-  const now = Date.now() as UnixMs;
   const totalReqs = keys.reduce((s, k) => s + k.stats.totalRequests, 0);
-  const availCount = keys.filter((k) => k.availableAt <= now).length;
+  const availCount = keys.filter((k) => k.isAvailable).length;
+  const sep = DIM + "\u2500".repeat(cols) + RST;
 
   // Header
-  const hdr = `${BOLD}${CYAN} CLAUDE PROXY ${RST} ${DIM}│${RST} ${WHITE}${keys.length}${RST} keys  ${DIM}│${RST} ${GREEN}${availCount}${RST} avail  ${DIM}│${RST} ${WHITE}${totalReqs}${RST} reqs  ${DIM}│${RST} ${DIM}${fmtUptime(Date.now() - startedAt)}${RST}`;
+  const hdr = `${BOLD}${CYAN} CLAUDE PROXY ${RST} ${DIM}\u2502${RST} ${WHITE}${keys.length}${RST} keys  ${DIM}\u2502${RST} ${GREEN}${availCount}${RST} avail  ${DIM}\u2502${RST} ${WHITE}${totalReqs}${RST} reqs  ${DIM}\u2502${RST} ${DIM}${fmtUptime(Date.now() - startedAt)}${RST}`;
 
   // Keys
   const keyLines: string[] = [];
   for (const k of keys.slice(0, 8)) {
     const c = keyColor(k.label);
     const ratio = totalReqs > 0 ? k.stats.totalRequests / totalReqs : 0;
-    const avail = k.availableAt <= now;
-    const badge = !avail ? `${YELLOW}[RATE-LTD]${RST}` : `${GREEN}[OK]${RST}`;
+    const badge = k.isAvailable ? `${GREEN}[OK]${RST}` : `${YELLOW}[RATE-LTD]${RST}`;
     keyLines.push(
       `${pad(`  ${c}${BOLD}${k.label}${RST}`, 16)}  ${bar(ratio, 14, c)}  ${pad(`${WHITE}${String(k.stats.totalRequests).padStart(4)} req${RST}`, 12)}  ${DIM}${fmtNum(k.stats.totalTokensIn).padStart(6)}/${fmtNum(k.stats.totalTokensOut).padStart(6)} tok${RST}  ${badge}`
     );
   }
-  if (keys.length === 0) keyLines.push(`  ${DIM}No keys configured${RST}`);
+  if (keys.length === 0) keyLines.push(`  ${DIM}Waiting for server...${RST}`);
 
-  // Log
+  // Activity log
   const fixedRows = 1 + 1 + Math.max(keyLines.length, 1) + 1 + 1 + 1 + 1;
   const logRows = Math.max(3, rows - fixedRows);
-  const visible = entries.slice(-(logRows - 1));
+  const visible = activity.slice(-(logRows - 1));
   const logLines = [`  ${BOLD}RECENT ACTIVITY${RST}`];
   for (const e of visible) {
     const time = `${GRAY}${fmtTime(e.ts)}${RST}`;
     const lbl = e.label ? pad(`${keyColor(e.label)}${e.label}${RST}`, 10) : pad(`${DIM}system${RST}`, 10);
-    const mc = msgColor(e);
-    const msg = pad(`${mc}${trunc(e.msg, 28)}${RST}`, 30);
-    logLines.push(`  ${time}  ${lbl}  ${msg}  ${logDetail(e)}`);
+    logLines.push(`  ${time}  ${lbl}  ${fmtEvent(e, cols)}`);
   }
   while (logLines.length < logRows) logLines.push("");
 
   // Footer
-  const ctrl = `${DIM}  q${RST} quit  ${DIM}│${RST}  ${DIM}SPACE${RST} pause  ${DIM}│${RST}  ${DIM}c${RST} clear`;
+  const ctrl = `${DIM}  q${RST} quit  ${DIM}\u2502${RST}  ${DIM}SPACE${RST} pause  ${DIM}\u2502${RST}  ${DIM}c${RST} clear`;
   const pind = paused ? `${YELLOW}${BOLD} PAUSED ${RST}` : "";
-  const ctrlLen = ctrl.replace(/\x1b\[[0-9;]*m/g, "").length;
-  const pindLen = pind.replace(/\x1b\[[0-9;]*m/g, "").length;
-  const footer = ctrl + " ".repeat(Math.max(0, cols - ctrlLen - pindLen)) + pind;
+  const cLen = ctrl.replace(/\x1b\[[0-9;]*m/g, "").length;
+  const pLen = pind.replace(/\x1b\[[0-9;]*m/g, "").length;
+  const footer = ctrl + " ".repeat(Math.max(0, cols - cLen - pLen)) + pind;
 
   process.stdout.write(
     CLEAR + "\x1b[1;1H" +
-    [pad(hdr, cols), sep(cols), keyLines.join("\n"), sep(cols), logLines.join("\n"), sep(cols), footer].join("\n")
+    [pad(hdr, cols), sep, keyLines.join("\n"), sep, logLines.join("\n"), sep, footer].join("\n")
   );
+}
+
+function fmtEvent(e: Event, _cols: number): string {
+  switch (e.type) {
+    case "request": {
+      const msg = pad(`${WHITE}Proxying request${RST}`, 30);
+      return `${msg}  ${DIM}${e["method"]} ${trunc(String(e["path"]), 20)}  #${e["attempt"]}${RST}`;
+    }
+    case "response": {
+      const s = e["status"] as number;
+      const c = s >= 200 && s < 400 ? GREEN : s === 429 ? YELLOW : RED;
+      const msg = pad(`${c}Upstream responded${RST}`, 30);
+      return `${msg}  ${c}${s}${RST}`;
+    }
+    case "tokens": {
+      const msg = pad(`${GREEN}Token usage${RST}`, 30);
+      return `${msg}  ${GREEN}${fmtNum(e["input"] as number)} in / ${fmtNum(e["output"] as number)} out${RST}`;
+    }
+    case "rate_limit": {
+      const msg = pad(`${YELLOW}${BOLD}Rate limited${RST}`, 30);
+      return `${msg}  ${YELLOW}retry ${e["retryAfter"]}s, ${e["availableKeys"]} avail${RST}`;
+    }
+    case "error": {
+      const msg = pad(`${RED}Error${RST}`, 30);
+      const detail = e["status"] ? String(e["status"]) : trunc(String(e["error"] ?? ""), 40);
+      return `${msg}  ${RED}${detail}${RST}`;
+    }
+    default:
+      return DIM + e.type + RST;
+  }
 }
 
 // ── Main ─────────────────────────────────────────────────────────
 
-export function startWatch(): void {
+export async function startWatch(): Promise<void> {
   const config = loadConfig();
-  const statePath = join(config.dataDir, "state.json");
+  const url = `http://localhost:${config.port}/admin/events`;
 
-  const entries: LogEntry[] = [];
-  const MAX_ENTRIES = 200;
+  let keys: readonly MaskedKeyEntry[] = [];
+  const activity: Event[] = [];
+  const MAX_ACTIVITY = 200;
   const startedAt = Date.now();
   let paused = false;
   let cols = process.stdout.columns ?? 80;
@@ -231,10 +198,14 @@ export function startWatch(): void {
     process.stdin.setEncoding("utf-8");
   }
 
+  function doRender() {
+    if (!paused) render(keys, activity, startedAt, paused, cols, rows);
+  }
+
   process.stdin.on("data", (key: string) => {
     if (key === "q" || key === "\x03") { cleanup(); process.exit(0); }
-    if (key === "c") { entries.length = 0; doRender(); }
-    if (key === " ") { paused = !paused; doRender(); }
+    if (key === "c") { activity.length = 0; doRender(); }
+    if (key === " ") { paused = !paused; render(keys, activity, startedAt, paused, cols, rows); }
   });
 
   process.stdout.on("resize", () => {
@@ -243,80 +214,59 @@ export function startWatch(): void {
     doRender();
   });
 
-  function doRender() {
-    const state = readState(statePath);
-    const keys = state?.keys ?? [];
-    render(keys, entries, startedAt, paused, cols, rows);
-  }
-
-  // Load recent entries from latest log file
-  const logFiles = findLogFiles();
-  if (logFiles.length > 0) {
-    const latest = logFiles[logFiles.length - 1]!;
-    loadTail(latest, entries, MAX_ENTRIES);
-  }
   doRender();
 
-  // Tail log file + refresh stats
-  let tailingFile: string | null = null;
-  let tailFd: number | null = null;
-  let tailOffset = 0;
-  let lineBuf = "";
-  const buf = Buffer.alloc(64 * 1024);
+  // Connect to SSE with auto-reconnect
+  async function connect(): Promise<void> {
+    while (true) {
+      try {
+        const res = await fetch(url);
+        if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
 
-  setInterval(() => {
-    // Discover new log files on restart
-    const files = findLogFiles();
-    const latest = files.length > 0 ? files[files.length - 1]! : null;
-    if (latest && latest !== tailingFile) {
-      tailingFile = latest;
-      tailFd = openSync(latest, "r");
-      tailOffset = fstatSync(tailFd).size;
-      lineBuf = "";
-    }
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = "";
 
-    // Read new log entries
-    if (tailFd !== null) {
-      const stat = fstatSync(tailFd);
-      if (stat.size < tailOffset) tailOffset = 0;
-      if (stat.size > tailOffset) {
-        const n = readSync(tailFd, buf, 0, Math.min(stat.size - tailOffset, buf.length), tailOffset);
-        tailOffset += n;
-        lineBuf += buf.toString("utf-8", 0, n);
-        const lines = lineBuf.split("\n");
-        lineBuf = lines.pop() ?? "";
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          try {
-            const e = JSON.parse(line) as LogEntry;
-            if (typeof e.ts === "string" && typeof e.msg === "string") {
-              entries.push(e);
-              if (entries.length > MAX_ENTRIES) entries.shift();
-            }
-          } catch {}
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buf += decoder.decode(value, { stream: true });
+          const parts = buf.split("\n\n");
+          buf = parts.pop() ?? "";
+
+          for (const part of parts) {
+            const dataLine = part.split("\n").find((l) => l.startsWith("data: "));
+            if (!dataLine) continue;
+            try {
+              const event = JSON.parse(dataLine.slice(6)) as Event;
+
+              // Update keys snapshot from every event
+              if (event.keys) {
+                keys = event.keys as MaskedKeyEntry[];
+              }
+
+              // Don't add "keys" type to activity (it's just the initial snapshot)
+              if (event.type !== "keys") {
+                activity.push(event);
+                if (activity.length > MAX_ACTIVITY) activity.shift();
+              }
+
+              doRender();
+            } catch {}
+          }
         }
+      } catch {
+        // Server not running or disconnected — retry
+        keys = [];
+        doRender();
       }
+
+      // Wait before reconnecting
+      await new Promise((r) => setTimeout(r, 2000));
+      doRender();
     }
-
-    if (!paused) doRender();
-  }, 500);
-}
-
-function loadTail(logPath: string, entries: LogEntry[], max: number): void {
-  const fd = openSync(logPath, "r");
-  const size = fstatSync(fd).size;
-  const readSize = Math.min(size, 64 * 1024);
-  if (readSize === 0) return;
-  const buf = Buffer.alloc(readSize);
-  readSync(fd, buf, 0, readSize, size - readSize);
-  for (const line of buf.toString("utf-8").split("\n")) {
-    if (!line.trim()) continue;
-    try {
-      const e = JSON.parse(line) as LogEntry;
-      if (typeof e.ts === "string" && typeof e.msg === "string") {
-        entries.push(e);
-        if (entries.length > max) entries.shift();
-      }
-    } catch {}
   }
+
+  connect();
 }

@@ -1,6 +1,7 @@
 import type { KeyManager } from "./key-manager.ts";
 import type { ProxyConfig, ProxyResult } from "./types.ts";
 import { log } from "./logger.ts";
+import { emitWithKeys } from "./events.ts";
 
 const RATE_LIMIT_STATUS = 429 as const;
 
@@ -76,6 +77,10 @@ export async function proxyRequest(
       attempt: attempts,
       authType: isOAuthToken(entry.key) ? "bearer" : "x-api-key",
     });
+    emitWithKeys({
+      type: "request", ts: new Date().toISOString(), label: entry.label,
+      method: req.method, path: url.pathname, attempt: attempts,
+    }, keyManager.listKeys());
 
     let upstream: Response;
     try {
@@ -86,6 +91,10 @@ export async function proxyRequest(
         label: entry.label,
         error: String(err),
       });
+      emitWithKeys({
+        type: "error", ts: new Date().toISOString(), label: entry.label,
+        error: String(err),
+      }, keyManager.listKeys());
       return {
         kind: "error",
         status: 502,
@@ -98,6 +107,10 @@ export async function proxyRequest(
       label: entry.label,
       status: upstream.status,
     });
+    emitWithKeys({
+      type: "response", ts: new Date().toISOString(), label: entry.label,
+      status: upstream.status,
+    }, keyManager.listKeys());
 
     if (upstream.status === RATE_LIMIT_STATUS) {
       const retryAfter = parseRetryAfter(upstream.headers.get("retry-after"));
@@ -109,6 +122,10 @@ export async function proxyRequest(
         retryAfter,
         availableKeys: keyManager.availableCount(),
       });
+      emitWithKeys({
+        type: "rate_limit", ts: new Date().toISOString(), label: entry.label,
+        retryAfter, availableKeys: keyManager.availableCount(),
+      }, keyManager.listKeys());
       continue;
     }
 
@@ -120,6 +137,10 @@ export async function proxyRequest(
         status: upstream.status,
         body: body.slice(0, 500),
       });
+      emitWithKeys({
+        type: "error", ts: new Date().toISOString(), label: entry.label,
+        status: upstream.status,
+      }, keyManager.listKeys());
       return { kind: "error", status: upstream.status, body, usedKey: entry };
     }
 
@@ -234,6 +255,10 @@ function extractTokensFromJson(
     keyManager.recordSuccess(entry, input, output);
     if (input > 0 || output > 0) {
       log("info", "Token usage", { label: entry.label, input, output });
+      emitWithKeys({
+        type: "tokens", ts: new Date().toISOString(), label: entry.label,
+        input, output,
+      }, keyManager.listKeys());
     }
   } catch {
     keyManager.recordSuccess(entry, 0, 0);
@@ -290,6 +315,10 @@ function createTokenTrackingStream(
           input: inputTokens,
           output: outputTokens,
         });
+        emitWithKeys({
+          type: "tokens", ts: new Date().toISOString(), label: entry.label,
+          input: inputTokens, output: outputTokens,
+        }, keyManager.listKeys());
       }
     },
   }));

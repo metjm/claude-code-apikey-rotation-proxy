@@ -1,6 +1,7 @@
 import type { KeyManager } from "./key-manager.ts";
 import type { ProxyConfig, AddKeyRequest } from "./types.ts";
 import { log } from "./logger.ts";
+import { subscribe, type ProxyEvent } from "./events.ts";
 
 type RouteHandler = (
   req: Request,
@@ -27,6 +28,10 @@ const routes: ReadonlyMap<string, ReadonlyMap<string, RouteHandler>> = new Map([
     "/admin/health",
     new Map<string, RouteHandler>([["GET", handleHealth]]),
   ],
+  [
+    "/admin/events",
+    new Map<string, RouteHandler>([["GET", handleEvents]]),
+  ],
 ]);
 
 /**
@@ -41,8 +46,8 @@ export function handleAdminRoute(
 
   if (!url.pathname.startsWith("/admin/")) return null;
 
-  // Auth check (skip for /admin/health)
-  if (url.pathname !== "/admin/health" && config.adminToken !== null) {
+  // Auth check (skip for /admin/health and /admin/events which are local-only)
+  if (url.pathname !== "/admin/health" && url.pathname !== "/admin/events" && config.adminToken !== null) {
     const bearer = req.headers.get("authorization");
     if (bearer !== `Bearer ${config.adminToken}`) {
       return json({ error: "Unauthorized" }, 401);
@@ -148,6 +153,45 @@ function handleStats(
     availableKeys: keys.filter((k) => k.isAvailable).length,
     totals,
     keys,
+  });
+}
+
+function handleEvents(
+  _req: Request,
+  keyManager: KeyManager,
+): Response {
+  // Send initial state as first event, then stream live events
+  const stream = new ReadableStream({
+    start(controller) {
+      const initial: ProxyEvent = {
+        type: "keys",
+        ts: new Date().toISOString(),
+        keys: keyManager.listKeys(),
+      };
+      controller.enqueue(`data: ${JSON.stringify(initial)}\n\n`);
+
+      const unsubscribe = subscribe((event) => {
+        try {
+          controller.enqueue(`data: ${JSON.stringify(event)}\n\n`);
+        } catch {
+          unsubscribe();
+        }
+      });
+
+      // Clean up if client disconnects
+      _req.signal.addEventListener("abort", () => {
+        unsubscribe();
+        try { controller.close(); } catch {}
+      });
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache",
+      "connection": "keep-alive",
+    },
   });
 }
 
