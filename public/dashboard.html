@@ -618,7 +618,7 @@ function showError(id, msg) {
 // ── Token created modal ────────────────────────────────────────
 function showTokenCreated(label, token) {
   const proxyUrl = window.location.origin;
-  const snippet = JSON.stringify({ env: { ANTHROPIC_BASE_URL: proxyUrl, ANTHROPIC_API_KEY: token } }, null, 2);
+  const snippet = JSON.stringify({ env: { ANTHROPIC_BASE_URL: proxyUrl, ANTHROPIC_AUTH_TOKEN: token } }, null, 2);
   document.getElementById('token-modal-snippet').textContent = snippet;
   document.getElementById('token-modal').classList.remove('hidden');
   document.getElementById('modal-copy-btn').textContent = 'Copy to clipboard';
@@ -635,7 +635,7 @@ function copyModalSnippet() {
 // ── Setup instructions ─────────────────────────────────────────
 function renderSetupSnippet() {
   const proxyUrl = window.location.origin;
-  const snippet = JSON.stringify({ env: { ANTHROPIC_BASE_URL: proxyUrl, ANTHROPIC_API_KEY: "TOKEN_HERE" } }, null, 2);
+  const snippet = JSON.stringify({ env: { ANTHROPIC_BASE_URL: proxyUrl, ANTHROPIC_AUTH_TOKEN: "TOKEN_HERE" } }, null, 2);
   document.getElementById('setup-snippet').textContent = snippet;
 }
 function copySnippet() {
