@@ -668,7 +668,7 @@ describe("POST /admin/keys/remove", () => {
     const res = await handleAdminRoute(req, km, config);
     expect(res!.status).toBe(400);
     const body = (await jsonBody(res!)) as { error: string };
-    expect(body.error).toContain("need 'key' field");
+    expect(body.error).toContain("'key'");
   });
 
   test("returns 400 for non-string key field", async () => {
@@ -686,7 +686,7 @@ describe("POST /admin/keys/remove", () => {
     const res = await handleAdminRoute(req, km, config);
     expect(res!.status).toBe(400);
     const body = (await jsonBody(res!)) as { error: string };
-    expect(body.error).toContain("need 'key' field");
+    expect(body.error).toContain("Invalid JSON body");
   });
 
   test("returns 400 for empty body", async () => {
@@ -972,7 +972,7 @@ describe("POST /admin/tokens/remove", () => {
     const res = await handleAdminRoute(req, km, config);
     expect(res!.status).toBe(400);
     const body = (await jsonBody(res!)) as { error: string };
-    expect(body.error).toContain("need 'token' field");
+    expect(body.error).toContain("'token'");
   });
 
   test("returns 400 for non-string token field", async () => {
@@ -990,7 +990,7 @@ describe("POST /admin/tokens/remove", () => {
     const res = await handleAdminRoute(req, km, config);
     expect(res!.status).toBe(400);
     const body = (await jsonBody(res!)) as { error: string };
-    expect(body.error).toContain("need 'token' field");
+    expect(body.error).toContain("Invalid JSON body");
   });
 
   test("returns 400 for empty body", async () => {
