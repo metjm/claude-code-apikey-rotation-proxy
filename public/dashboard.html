@@ -388,7 +388,9 @@ function renderKeys() {
       <div class="card-bar"><div class="card-bar-fill" style="width:${(ratio * 100).toFixed(1)}%;background:var(--${isAvail ? 'green' : 'yellow'})"></div></div>
       <div class="card-stats">
         <b>${fmtNum(k.stats.totalRequests)}</b> req &nbsp;
-        <b>${fmtNum(k.stats.totalTokensIn)}</b> in / <b>${fmtNum(k.stats.totalTokensOut)}</b> out<br>
+        <b>${fmtNum(k.stats.totalTokensIn)}</b> in / <b>${fmtNum(k.stats.totalTokensOut)}</b> out
+        ${(k.stats.totalCacheRead || 0) > 0 ? ` &nbsp;<span class="c-dim">${fmtNum(k.stats.totalCacheRead)} cached</span>` : ''}
+        ${(k.stats.totalCacheCreation || 0) > 0 ? ` &nbsp;<span class="c-dim">${fmtNum(k.stats.totalCacheCreation)} cache-write</span>` : ''}<br>
         ${badge}
         ${k.stats.rateLimitHits > 0 ? ` &nbsp;<span class="c-dim">${k.stats.rateLimitHits} rate-limits</span>` : ''}
         ${k.stats.errors > 0 ? ` &nbsp;<span class="c-red">${k.stats.errors} errors</span>` : ''}
@@ -415,6 +417,8 @@ function renderTokens() {
       <div class="card-stats">
         <b>${fmtNum(t.stats.totalRequests)}</b> req &nbsp;
         <b>${fmtNum(t.stats.totalTokensIn)}</b> in / <b>${fmtNum(t.stats.totalTokensOut)}</b> out
+        ${(t.stats.totalCacheRead || 0) > 0 ? ` &nbsp;<span class="c-dim">${fmtNum(t.stats.totalCacheRead)} cached</span>` : ''}
+        ${(t.stats.totalCacheCreation || 0) > 0 ? ` &nbsp;<span class="c-dim">${fmtNum(t.stats.totalCacheCreation)} cache-write</span>` : ''}
         ${t.stats.errors > 0 ? `<br><span class="c-red">${t.stats.errors} errors</span>` : ''}
       </div>
     </div>`;
