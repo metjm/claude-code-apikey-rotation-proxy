@@ -103,6 +103,15 @@ function startServer(): void {
         }
       }
 
+      const incomingXApiKey = req.headers.get("x-api-key");
+      const incomingAuth = req.headers.get("authorization");
+      log("info", "Incoming request auth", {
+        hasXApiKey: !!incomingXApiKey,
+        xApiKeyPrefix: incomingXApiKey?.slice(0, 20),
+        hasAuthorization: !!incomingAuth,
+        authorizationPrefix: incomingAuth?.slice(0, 30),
+      });
+
       const result = await proxyRequest(req, keyManager, config, proxyUser);
 
       switch (result.kind) {
