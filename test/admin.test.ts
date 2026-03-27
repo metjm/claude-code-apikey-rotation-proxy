@@ -1033,7 +1033,7 @@ describe("POST /admin/keys/update", () => {
     expect(res!.status).toBe(400);
   });
 
-  test("returns 400 for missing label field", async () => {
+  test("returns 400 when neither label nor priority is provided", async () => {
     const res = await handleAdminRoute(makeReq("POST", "/admin/keys/update", { key: "sk-ant-api03-x" }), km, config)!;
     expect(res!.status).toBe(400);
   });
@@ -1053,6 +1053,46 @@ describe("POST /admin/keys/update", () => {
     const req = new Request("http://localhost/admin/keys/update", { method: "POST", body: "not json", headers: { "content-type": "application/json" } });
     const res = await handleAdminRoute(req, km, config)!;
     expect(res!.status).toBe(400);
+  });
+
+  test("updates priority via full key", async () => {
+    km.addKey("sk-ant-api03-priority-test-0000", "pri-test");
+    const res = await handleAdminRoute(makeReq("POST", "/admin/keys/update", { key: "sk-ant-api03-priority-test-0000", priority: 1 }), km, config)!;
+    expect(res!.status).toBe(200);
+    const body = await res!.json();
+    expect(body.updated).toBe(true);
+    expect(body.priority).toBe(1);
+    expect(km.listKeys().find(k => k.label === "pri-test")!.priority).toBe(1);
+  });
+
+  test("updates priority via masked key", async () => {
+    km.addKey("sk-ant-api03-masked-priority-test", "masked-pri");
+    const masked = km.listKeys().find(k => k.label === "masked-pri")!.maskedKey;
+    const res = await handleAdminRoute(makeReq("POST", "/admin/keys/update", { maskedKey: masked, priority: 3 }), km, config)!;
+    expect(res!.status).toBe(200);
+    expect(km.listKeys().find(k => k.label === "masked-pri")!.priority).toBe(3);
+  });
+
+  test("returns 400 for invalid priority value", async () => {
+    const res = await handleAdminRoute(makeReq("POST", "/admin/keys/update", { key: "sk-ant-api03-x", priority: 5 }), km, config)!;
+    expect(res!.status).toBe(400);
+  });
+
+  test("updates both label and priority together", async () => {
+    km.addKey("sk-ant-api03-both-update-test-00", "old");
+    const res = await handleAdminRoute(makeReq("POST", "/admin/keys/update", { key: "sk-ant-api03-both-update-test-00", label: "new", priority: 1 }), km, config)!;
+    expect(res!.status).toBe(200);
+    const entry = km.listKeys().find(k => k.label === "new");
+    expect(entry).toBeDefined();
+    expect(entry!.priority).toBe(1);
+  });
+
+  test("label update works via masked key", async () => {
+    km.addKey("sk-ant-api03-label-needs-key-000", "lbl");
+    const masked = km.listKeys().find(k => k.label === "lbl")!.maskedKey;
+    const res = await handleAdminRoute(makeReq("POST", "/admin/keys/update", { maskedKey: masked, label: "new-lbl" }), km, config)!;
+    expect(res!.status).toBe(200);
+    expect(km.listKeys().find(k => k.label === "new-lbl")).toBeDefined();
   });
 });
 

@@ -56,6 +56,8 @@ export interface ApiKeyEntry {
   stats: ApiKeyStats;
   /** Key is rate-limited until this time. 0 = available now. */
   availableAt: UnixMs;
+  /** Selection priority: 1 = Preferred, 2 = Normal, 3 = Fallback. */
+  priority: number;
 }
 
 export interface MaskedKeyEntry {
@@ -64,6 +66,7 @@ export interface MaskedKeyEntry {
   readonly stats: ApiKeyStats;
   readonly availableAt: UnixMs;
   readonly isAvailable: boolean;
+  readonly priority: number;
 }
 
 // ── Proxy token entry ─────────────────────────────────────────────

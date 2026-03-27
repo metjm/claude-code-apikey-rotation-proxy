@@ -77,6 +77,12 @@
   .card-remove:hover { color: var(--red); }
   .editable { cursor: pointer; border-bottom: 1px dashed var(--border); }
   .editable:hover { border-bottom-color: var(--blue); }
+  .priority-select {
+    background: var(--bg3); color: var(--text); border: 1px solid var(--border); border-radius: 3px;
+    font-family: var(--font); font-size: 10px; padding: 1px 4px; cursor: pointer; margin-top: 4px;
+  }
+  .priority-select:focus { outline: none; border-color: var(--blue); }
+  .priority-select option { background: var(--bg2); color: var(--text); }
   .empty-state { color: var(--text-dim); font-size: 12px; padding: 20px 0; text-align: center; flex: 1; display: flex; align-items: center; justify-content: center; }
 
   /* Add forms */
@@ -381,6 +387,7 @@ function renderKeys() {
       const rem = k.availableAt - Date.now();
       badge = `<span class="badge badge-ratelimited">RATE-LTD ${rem > 0 ? fmtCountdown(rem) : ''}</span>`;
     }
+    const pri = k.priority || 2;
     return `<div class="card">
       <button class="card-remove" onclick="removeKey('${esc(k.maskedKey)}')" title="Remove key">&times;</button>
       <div class="card-label ${cc}"><span onclick="renameKey('${esc(k.maskedKey)}')" class="editable" title="Click to rename">${esc(k.label)}</span></div>
@@ -395,6 +402,11 @@ function renderKeys() {
         ${k.stats.rateLimitHits > 0 ? ` &nbsp;<span class="c-dim">${k.stats.rateLimitHits} rate-limits</span>` : ''}
         ${k.stats.errors > 0 ? ` &nbsp;<span class="c-red">${k.stats.errors} errors</span>` : ''}
       </div>
+      <select class="priority-select" onchange="updateKeyPriority('${esc(k.maskedKey)}', Number(this.value))" title="Selection priority">
+        <option value="1"${pri === 1 ? ' selected' : ''}>Preferred</option>
+        <option value="2"${pri === 2 ? ' selected' : ''}>Normal</option>
+        <option value="3"${pri === 3 ? ' selected' : ''}>Fallback</option>
+      </select>
     </div>`;
   }).join('');
 }
@@ -575,6 +587,15 @@ async function renameKey(maskedKey) {
     refreshKeys();
   } catch (err) {
     alert('Failed to rename: ' + err.message);
+  }
+}
+
+async function updateKeyPriority(maskedKey, priority) {
+  try {
+    await api('POST', '/admin/keys/update', { maskedKey, priority });
+    refreshKeys();
+  } catch (err) {
+    alert('Failed to update priority: ' + err.message);
   }
 }
 

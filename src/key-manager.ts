@@ -39,6 +39,7 @@ interface KeyRow {
   total_cache_read: number;
   total_cache_creation: number;
   available_at: number;
+  priority: number;
 }
 
 interface TokenRow {
@@ -93,6 +94,7 @@ export class KeyManager {
     this.db.exec("PRAGMA busy_timeout = 5000");
 
     this.initSchema();
+    this.migrateSchema();
     this.migrateFromJson(dataDir);
     this.loadFromDb();
 
@@ -189,6 +191,17 @@ export class KeyManager {
     }
   }
 
+  // ── Schema migrations ──────────────────────────────────────────
+
+  private migrateSchema(): void {
+    // Add priority column (added in v2)
+    try {
+      this.db.exec("ALTER TABLE api_keys ADD COLUMN priority INTEGER NOT NULL DEFAULT 2");
+    } catch {
+      // Column already exists — ignore
+    }
+  }
+
   // ── Migration from legacy state.json ────────────────────────────
 
   private migrateFromJson(dataDir: string): void {
@@ -263,7 +276,11 @@ export class KeyManager {
     const currentTime = now();
     const available = this.keys
       .filter((k) => k.availableAt <= currentTime)
-      .sort((a, b) => (b.stats.lastUsedAt ?? 0) - (a.stats.lastUsedAt ?? 0));
+      .sort((a, b) => {
+        // Sort by priority first (lower = preferred), then LRU within same tier
+        if (a.priority !== b.priority) return a.priority - b.priority;
+        return (b.stats.lastUsedAt ?? 0) - (a.stats.lastUsedAt ?? 0);
+      });
 
     if (available.length > 0) return available[0]!;
     return null;
@@ -348,6 +365,7 @@ export class KeyManager {
       label: asKeyLabel(label ?? `key-${this.keys.length + 1}`),
       stats: freshStats(),
       availableAt: unixMs(0),
+      priority: 2,
     };
 
     this.keys.push(entry);
@@ -367,6 +385,24 @@ export class KeyManager {
     (entry as { label: KeyLabel }).label = asKeyLabel(newLabel);
     this.db.run("UPDATE api_keys SET label = ? WHERE key = ?", [newLabel, rawKey]);
     log("info", "Key label updated", { label: newLabel });
+    return true;
+  }
+
+  updateKeyPriority(rawKey: string, priority: number): boolean {
+    const entry = this.keys.find((k) => k.key === rawKey);
+    if (!entry) return false;
+    entry.priority = priority;
+    this.db.run("UPDATE api_keys SET priority = ? WHERE key = ?", [priority, rawKey]);
+    log("info", "Key priority updated", { label: entry.label, priority });
+    return true;
+  }
+
+  updateKeyPriorityByMask(masked: string, priority: number): boolean {
+    const entry = this.keys.find((k) => maskKey(k.key) === masked);
+    if (!entry) return false;
+    entry.priority = priority;
+    this.db.run("UPDATE api_keys SET priority = ? WHERE key = ?", [priority, entry.key]);
+    log("info", "Key priority updated", { label: entry.label, priority });
     return true;
   }
 
@@ -406,6 +442,7 @@ export class KeyManager {
         stats: k.stats,
         availableAt: k.availableAt,
         isAvailable: k.availableAt <= currentTime,
+        priority: k.priority,
       })
     );
   }
@@ -724,6 +761,7 @@ function rowToKeyEntry(r: KeyRow): ApiKeyEntry {
       totalCacheCreation: r.total_cache_creation ?? 0,
     },
     availableAt: r.available_at as UnixMs,
+    priority: r.priority,
   };
 }
 

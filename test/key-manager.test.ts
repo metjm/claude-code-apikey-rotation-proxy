@@ -691,6 +691,87 @@ describe("Key label updates", () => {
   });
 });
 
+describe("Key priority", () => {
+  test("new keys default to priority 2 (Normal)", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "a");
+    const listed = km.listKeys();
+    expect(listed[0]!.priority).toBe(2);
+  });
+
+  test("updateKeyPriority changes priority in memory and DB", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "a");
+    const result = km.updateKeyPriority(VALID_KEY_1, 1);
+    expect(result).toBe(true);
+    expect(km.listKeys()[0]!.priority).toBe(1);
+    // Verify persisted
+    const km2 = new KeyManager(tempDir);
+    expect(km2.listKeys()[0]!.priority).toBe(1);
+  });
+
+  test("updateKeyPriority returns false for unknown key", () => {
+    const km = create();
+    expect(km.updateKeyPriority("sk-ant-api03-nonexistent", 1)).toBe(false);
+  });
+
+  test("updateKeyPriorityByMask changes priority via masked key", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "a");
+    const masked = km.listKeys()[0]!.maskedKey;
+    const result = km.updateKeyPriorityByMask(masked, 3);
+    expect(result).toBe(true);
+    expect(km.listKeys()[0]!.priority).toBe(3);
+  });
+
+  test("getNextAvailableKey() prefers lower priority number", () => {
+    const km = create();
+    const k1 = km.addKey(VALID_KEY_1, "fallback");
+    km.addKey(VALID_KEY_2, "preferred");
+    // Make k1 more recently used so it would normally be selected first
+    km.recordRequest(k1);
+    // Set k1 to Fallback, k2 to Preferred
+    km.updateKeyPriority(VALID_KEY_1, 3);
+    km.updateKeyPriority(VALID_KEY_2, 1);
+    const selected = km.getNextAvailableKey();
+    expect(selected).not.toBeNull();
+    expect(selected!.key).toBe(VALID_KEY_2);
+  });
+
+  test("getNextAvailableKey() falls back to lower-priority keys when higher are rate-limited", () => {
+    const km = create();
+    const k1 = km.addKey(VALID_KEY_1, "preferred");
+    km.addKey(VALID_KEY_2, "fallback");
+    km.updateKeyPriority(VALID_KEY_1, 1);
+    km.updateKeyPriority(VALID_KEY_2, 3);
+    // Rate-limit the preferred key
+    km.recordRateLimit(k1, 99999);
+    const selected = km.getNextAvailableKey();
+    expect(selected).not.toBeNull();
+    expect(selected!.key).toBe(VALID_KEY_2);
+  });
+
+  test("within same priority, LRU ordering is preserved", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "a");
+    const k2 = km.addKey(VALID_KEY_2, "b");
+    // Both at same priority (default 2)
+    // Use k2 so it becomes most recently used
+    km.recordRequest(k2);
+    const selected = km.getNextAvailableKey();
+    expect(selected).not.toBeNull();
+    expect(selected!.key).toBe(VALID_KEY_2);
+  });
+
+  test("priority persists across reload", () => {
+    const km1 = create();
+    km1.addKey(VALID_KEY_1, "a");
+    km1.updateKeyPriority(VALID_KEY_1, 3);
+    const km2 = new KeyManager(tempDir);
+    expect(km2.listKeys()[0]!.priority).toBe(3);
+  });
+});
+
 describe("Token label updates", () => {
   test("updateTokenLabel changes the label in memory and DB", () => {
     const km = create();

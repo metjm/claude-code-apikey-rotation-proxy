@@ -159,27 +159,50 @@ async function handleUpdateKey(
   req: Request,
   keyManager: KeyManager,
 ): Promise<Response> {
-  const body = await parseJsonBody<{ key?: string; maskedKey?: string; label: string }>(req);
-  if (body === null || typeof body.label !== "string") {
-    return json({ error: "Invalid JSON body — need 'label' field" }, 400);
-  }
-  if (body.label.length === 0) {
-    return json({ error: "'label' must not be empty" }, 400);
+  const body = await parseJsonBody<{ key?: string; maskedKey?: string; label?: string; priority?: number }>(req);
+  if (body === null) {
+    return json({ error: "Invalid JSON body" }, 400);
   }
 
-  let updated = false;
-  if (typeof body.maskedKey === "string") {
-    updated = keyManager.updateKeyLabelByMasked(body.maskedKey, body.label);
-  } else if (typeof body.key === "string") {
-    updated = keyManager.updateKeyLabel(body.key, body.label);
-  } else {
+  const hasKey = typeof body.key === "string";
+  const hasMaskedKey = typeof body.maskedKey === "string";
+  if (!hasKey && !hasMaskedKey) {
     return json({ error: "Need 'key' or 'maskedKey' field" }, 400);
   }
 
-  if (!updated) {
-    return json({ error: "Key not found" }, 404);
+  const hasLabel = typeof body.label === "string";
+  const hasPriority = typeof body.priority === "number";
+  if (!hasLabel && !hasPriority) {
+    return json({ error: "Need 'label' and/or 'priority' field" }, 400);
   }
-  return json({ updated: true, label: body.label });
+
+  if (hasLabel && body.label!.length === 0) {
+    return json({ error: "'label' must not be empty" }, 400);
+  }
+  if (hasPriority && (body.priority! < 1 || body.priority! > 3)) {
+    return json({ error: "'priority' must be 1, 2, or 3" }, 400);
+  }
+
+  // Update label (accepts full key or masked key)
+  if (hasLabel) {
+    let updated = false;
+    if (hasMaskedKey) {
+      updated = keyManager.updateKeyLabelByMasked(body.maskedKey!, body.label!);
+    } else if (hasKey) {
+      updated = keyManager.updateKeyLabel(body.key!, body.label!);
+    }
+    if (!updated) return json({ error: "Key not found" }, 404);
+  }
+
+  // Update priority (accepts full key or masked key)
+  if (hasPriority) {
+    const updated = hasKey
+      ? keyManager.updateKeyPriority(body.key!, body.priority!)
+      : keyManager.updateKeyPriorityByMask(body.maskedKey!, body.priority!);
+    if (!updated) return json({ error: "Key not found" }, 404);
+  }
+
+  return json({ updated: true, ...(hasLabel ? { label: body.label } : {}), ...(hasPriority ? { priority: body.priority } : {}) });
 }
 
 // ── Token handlers ────────────────────────────────────────────────
