@@ -131,12 +131,20 @@ async function handleRemoveKey(
   req: Request,
   keyManager: KeyManager,
 ): Promise<Response> {
-  const body = await parseJsonBody<{ key: string }>(req);
-  if (body === null || typeof body.key !== "string") {
-    return json({ error: "Invalid JSON body — need 'key' field" }, 400);
+  const body = await parseJsonBody<{ key?: string; maskedKey?: string }>(req);
+  if (body === null) {
+    return json({ error: "Invalid JSON body" }, 400);
   }
 
-  const removed = keyManager.removeKey(body.key);
+  let removed = false;
+  if (typeof body.maskedKey === "string") {
+    removed = keyManager.removeKeyByMasked(body.maskedKey);
+  } else if (typeof body.key === "string") {
+    removed = keyManager.removeKey(body.key);
+  } else {
+    return json({ error: "Need 'key' or 'maskedKey' field" }, 400);
+  }
+
   if (!removed) {
     return json({ error: "Key not found" }, 404);
   }
@@ -147,14 +155,23 @@ async function handleUpdateKey(
   req: Request,
   keyManager: KeyManager,
 ): Promise<Response> {
-  const body = await parseJsonBody<{ key: string; label: string }>(req);
-  if (body === null || typeof body.key !== "string" || typeof body.label !== "string") {
-    return json({ error: "Invalid JSON body — need 'key' and 'label' fields" }, 400);
+  const body = await parseJsonBody<{ key?: string; maskedKey?: string; label: string }>(req);
+  if (body === null || typeof body.label !== "string") {
+    return json({ error: "Invalid JSON body — need 'label' field" }, 400);
   }
   if (body.label.length === 0) {
     return json({ error: "'label' must not be empty" }, 400);
   }
-  const updated = keyManager.updateKeyLabel(body.key, body.label);
+
+  let updated = false;
+  if (typeof body.maskedKey === "string") {
+    updated = keyManager.updateKeyLabelByMasked(body.maskedKey, body.label);
+  } else if (typeof body.key === "string") {
+    updated = keyManager.updateKeyLabel(body.key, body.label);
+  } else {
+    return json({ error: "Need 'key' or 'maskedKey' field" }, 400);
+  }
+
   if (!updated) {
     return json({ error: "Key not found" }, 404);
   }
@@ -205,12 +222,20 @@ async function handleRemoveToken(
   req: Request,
   keyManager: KeyManager,
 ): Promise<Response> {
-  const body = await parseJsonBody<{ token: string }>(req);
-  if (body === null || typeof body.token !== "string") {
-    return json({ error: "Invalid JSON body — need 'token' field" }, 400);
+  const body = await parseJsonBody<{ token?: string; maskedToken?: string }>(req);
+  if (body === null) {
+    return json({ error: "Invalid JSON body" }, 400);
   }
 
-  const removed = keyManager.removeToken(body.token);
+  let removed = false;
+  if (typeof body.maskedToken === "string") {
+    removed = keyManager.removeTokenByMasked(body.maskedToken);
+  } else if (typeof body.token === "string") {
+    removed = keyManager.removeToken(body.token);
+  } else {
+    return json({ error: "Need 'token' or 'maskedToken' field" }, 400);
+  }
+
   if (!removed) {
     return json({ error: "Token not found" }, 404);
   }
@@ -221,14 +246,23 @@ async function handleUpdateToken(
   req: Request,
   keyManager: KeyManager,
 ): Promise<Response> {
-  const body = await parseJsonBody<{ token: string; label: string }>(req);
-  if (body === null || typeof body.token !== "string" || typeof body.label !== "string") {
-    return json({ error: "Invalid JSON body — need 'token' and 'label' fields" }, 400);
+  const body = await parseJsonBody<{ token?: string; maskedToken?: string; label: string }>(req);
+  if (body === null || typeof body.label !== "string") {
+    return json({ error: "Invalid JSON body — need 'label' field" }, 400);
   }
   if (body.label.length === 0) {
     return json({ error: "'label' must not be empty" }, 400);
   }
-  const updated = keyManager.updateTokenLabel(body.token, body.label);
+
+  let updated = false;
+  if (typeof body.maskedToken === "string") {
+    updated = keyManager.updateTokenLabelByMasked(body.maskedToken, body.label);
+  } else if (typeof body.token === "string") {
+    updated = keyManager.updateTokenLabel(body.token, body.label);
+  } else {
+    return json({ error: "Need 'token' or 'maskedToken' field" }, 400);
+  }
+
   if (!updated) {
     return json({ error: "Token not found" }, 404);
   }

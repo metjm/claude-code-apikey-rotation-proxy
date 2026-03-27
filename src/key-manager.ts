@@ -302,6 +302,24 @@ export class KeyManager {
     return true;
   }
 
+  removeKeyByMasked(masked: string): boolean {
+    const idx = this.keys.findIndex((k) => maskKey(k.key) === masked);
+    if (idx === -1) return false;
+    const removed = this.keys.splice(idx, 1)[0]!;
+    this.db.run("DELETE FROM api_keys WHERE key = ?", [removed.key]);
+    log("info", "Key removed", { label: removed.label });
+    return true;
+  }
+
+  updateKeyLabelByMasked(masked: string, newLabel: string): boolean {
+    const entry = this.keys.find((k) => maskKey(k.key) === masked);
+    if (!entry) return false;
+    (entry as { label: KeyLabel }).label = asKeyLabel(newLabel);
+    this.db.run("UPDATE api_keys SET label = ? WHERE key = ?", [newLabel, entry.key]);
+    log("info", "Key label updated", { label: newLabel });
+    return true;
+  }
+
   listKeys(): readonly MaskedKeyEntry[] {
     const currentTime = now();
     return this.keys.map(
@@ -356,6 +374,24 @@ export class KeyManager {
     const removed = this.tokens.splice(idx, 1)[0]!;
     this.db.run("DELETE FROM proxy_tokens WHERE token = ?", [removed.token]);
     log("info", "Proxy token removed", { label: removed.label });
+    return true;
+  }
+
+  removeTokenByMasked(masked: string): boolean {
+    const idx = this.tokens.findIndex((t) => maskToken(t.token) === masked);
+    if (idx === -1) return false;
+    const removed = this.tokens.splice(idx, 1)[0]!;
+    this.db.run("DELETE FROM proxy_tokens WHERE token = ?", [removed.token]);
+    log("info", "Proxy token removed", { label: removed.label });
+    return true;
+  }
+
+  updateTokenLabelByMasked(masked: string, newLabel: string): boolean {
+    const entry = this.tokens.find((t) => maskToken(t.token) === masked);
+    if (!entry) return false;
+    (entry as { label: string }).label = newLabel;
+    this.db.run("UPDATE proxy_tokens SET label = ? WHERE token = ?", [newLabel, entry.token]);
+    log("info", "Token label updated", { label: newLabel });
     return true;
   }
 

@@ -513,11 +513,9 @@ async function addKey() {
 }
 
 async function removeKey(maskedKey) {
-  // We need the actual key to remove — prompt the user
-  const actual = prompt(`Enter the full API key to remove (masked: ${maskedKey}):`);
-  if (!actual) return;
+  if (!confirm(`Remove key ${maskedKey}?`)) return;
   try {
-    await api('POST', '/admin/keys/remove', { key: actual });
+    await api('POST', '/admin/keys/remove', { maskedKey });
     refreshKeys();
   } catch (err) {
     alert('Failed to remove: ' + err.message);
@@ -536,10 +534,8 @@ async function refreshKeys() {
 async function renameKey(maskedKey) {
   const newLabel = prompt(`New label for key (${maskedKey}):`);
   if (!newLabel) return;
-  const actual = prompt(`Enter the full API key to confirm (masked: ${maskedKey}):`);
-  if (!actual) return;
   try {
-    await api('POST', '/admin/keys/update', { key: actual, label: newLabel });
+    await api('POST', '/admin/keys/update', { maskedKey, label: newLabel });
     refreshKeys();
   } catch (err) {
     alert('Failed to rename: ' + err.message);
@@ -567,10 +563,9 @@ async function addToken() {
 }
 
 async function removeToken(maskedToken) {
-  const actual = prompt(`Enter the full proxy token to remove (masked: ${maskedToken}):`);
-  if (!actual) return;
+  if (!confirm(`Remove token ${maskedToken}?`)) return;
   try {
-    await api('POST', '/admin/tokens/remove', { token: actual });
+    await api('POST', '/admin/tokens/remove', { maskedToken });
     refreshTokens();
   } catch (err) {
     alert('Failed to remove: ' + err.message);
@@ -580,10 +575,8 @@ async function removeToken(maskedToken) {
 async function renameToken(maskedToken) {
   const newLabel = prompt(`New label for token (${maskedToken}):`);
   if (!newLabel) return;
-  const actual = prompt(`Enter the full proxy token to confirm (masked: ${maskedToken}):`);
-  if (!actual) return;
   try {
-    await api('POST', '/admin/tokens/update', { token: actual, label: newLabel });
+    await api('POST', '/admin/tokens/update', { maskedToken, label: newLabel });
     refreshTokens();
   } catch (err) {
     alert('Failed to rename: ' + err.message);
