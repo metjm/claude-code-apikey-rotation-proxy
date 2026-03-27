@@ -250,6 +250,12 @@ function parseRetryAfter(header: string | null): number {
 interface AnthropicUsage {
   readonly input_tokens?: number;
   readonly output_tokens?: number;
+  readonly cache_creation_input_tokens?: number;
+  readonly cache_read_input_tokens?: number;
+}
+
+function totalInputTokens(usage: AnthropicUsage): number {
+  return (usage.input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0);
 }
 
 interface AnthropicResponse {
@@ -270,7 +276,7 @@ function extractTokensFromJson(
 ): void {
   try {
     const parsed = JSON.parse(text) as AnthropicResponse;
-    const input = parsed.usage?.input_tokens ?? 0;
+    const input = parsed.usage ? totalInputTokens(parsed.usage) : 0;
     const output = parsed.usage?.output_tokens ?? 0;
     keyManager.recordSuccess(entry, input, output);
     if (proxyUser) keyManager.recordTokenSuccess(proxyUser, input, output);
@@ -319,7 +325,7 @@ function createTokenTrackingStream(
         try {
           const event = JSON.parse(json) as AnthropicStreamDelta;
           if (event.type === "message_start" && event.message?.usage) {
-            inputTokens += event.message.usage.input_tokens ?? 0;
+            inputTokens += totalInputTokens(event.message.usage);
           }
           if (event.type === "message_delta" && event.usage) {
             outputTokens += event.usage.output_tokens ?? 0;
