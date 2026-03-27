@@ -370,6 +370,8 @@ function esc(s) { const d = document.createElement('div'); d.textContent = s; re
 
 // ── Render keys ────────────────────────────────────────────────
 function renderKeys() {
+  // Don't nuke the DOM while a dropdown is open
+  if (document.activeElement && document.activeElement.classList.contains('priority-select')) return;
   const el = document.getElementById('key-cards');
   if (keys.length === 0) {
     el.innerHTML = '<div class="empty-state">No API keys configured</div>';
