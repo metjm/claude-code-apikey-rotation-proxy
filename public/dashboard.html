@@ -88,6 +88,7 @@
   .add-form input:focus { outline: none; border-color: var(--blue); }
   .add-form .btn-submit { padding: 6px 14px; background: var(--green); color: var(--bg); border: none; border-radius: 4px; font-family: var(--font); font-size: 12px; cursor: pointer; font-weight: 600; white-space: nowrap; }
   .add-form .btn-cancel { padding: 6px 10px; }
+  .token-readonly { background: var(--bg3) !important; color: var(--text-dim) !important; cursor: text; user-select: all; font-size: 11px !important; }
   .form-error { color: var(--red); font-size: 11px; margin-bottom: 8px; display: none; }
   .form-error.visible { display: block; }
 
@@ -176,13 +177,13 @@
         <button class="btn" onclick="toggleForm('token')">+ Add</button>
       </div>
       <div class="add-form" id="token-form">
-        <div class="field">
-          <label>Token</label>
-          <input type="password" id="token-input" placeholder="min 8 characters">
+        <div class="field" style="max-width:160px">
+          <label>Label (e.g. email)</label>
+          <input type="text" id="token-label" placeholder="alice@company.com">
         </div>
-        <div class="field" style="max-width:120px">
-          <label>Label</label>
-          <input type="text" id="token-label" placeholder="e.g. alice">
+        <div class="field">
+          <label>Generated Token</label>
+          <input type="text" id="token-input" readonly class="token-readonly">
         </div>
         <button class="btn-submit" onclick="addToken()">Add</button>
         <button class="btn btn-cancel" onclick="toggleForm('token')">Cancel</button>
@@ -510,10 +511,14 @@ async function addToken() {
   const tokenVal = document.getElementById('token-input').value.trim();
   const label = document.getElementById('token-label').value.trim() || undefined;
 
+  if (!label) { showError('token-error', 'Label is required'); return; }
   if (!tokenVal) { showError('token-error', 'Token is required'); return; }
 
   try {
     await api('POST', '/admin/tokens', { token: tokenVal, label });
+    // Show the token so the user can copy it before it disappears
+    const copyMsg = `Token created for ${label}. Copy it now — it won't be shown again:\n\n${tokenVal}`;
+    prompt(copyMsg, tokenVal);
     document.getElementById('token-input').value = '';
     document.getElementById('token-label').value = '';
     toggleForm('token');
@@ -556,10 +561,21 @@ async function refreshTokens() {
 }
 
 // ── UI helpers ─────────────────────────────────────────────────
+function generateToken() {
+  const bytes = new Uint8Array(24);
+  crypto.getRandomValues(bytes);
+  const hex = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+  return `sk-ant-oat01-${hex}`;
+}
+
 function toggleForm(type) {
   const el = document.getElementById(type + '-form');
   el.classList.toggle('open');
   document.getElementById(type + '-error').classList.remove('visible');
+  // Auto-generate a fresh token when opening the token form
+  if (type === 'token' && el.classList.contains('open')) {
+    document.getElementById('token-input').value = generateToken();
+  }
 }
 
 function showError(id, msg) {

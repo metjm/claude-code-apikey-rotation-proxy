@@ -110,20 +110,17 @@ function startServer(): void {
           return result.response;
 
         case "no_keys":
-          return errorResponse(
-            503,
-            "No API keys configured. Add keys via POST /admin/keys.",
-          );
+          return proxyUser
+            ? errorResponse(503, "No API keys configured. Add keys via the admin API.")
+            : errorResponse(503, "Service not available.");
 
         case "all_exhausted": {
           const waitSecs = Math.ceil(
             Math.max(0, result.earliestAvailableAt - (Date.now() as UnixMs)) / 1000,
           );
-          return errorResponse(
-            429,
-            `All API keys are rate-limited. Earliest available in ${waitSecs}s.`,
-            { "retry-after": String(waitSecs) },
-          );
+          return proxyUser
+            ? errorResponse(429, `All API keys are rate-limited. Retry in ${waitSecs}s.`, { "retry-after": String(waitSecs) })
+            : errorResponse(429, "Too many requests.", { "retry-after": String(waitSecs) });
         }
 
         case "error":

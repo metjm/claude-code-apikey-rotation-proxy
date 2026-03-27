@@ -173,8 +173,9 @@ function startProxy(opts: {
             JSON.stringify({
               error: {
                 type: "proxy_error",
-                message:
-                  "No API keys configured. Add keys via POST /admin/keys.",
+                message: proxyUser
+                  ? "No API keys configured. Add keys via the admin API."
+                  : "Service not available.",
               },
             }),
             { status: 503, headers: { "content-type": "application/json" } },
@@ -187,7 +188,9 @@ function startProxy(opts: {
             JSON.stringify({
               error: {
                 type: "proxy_error",
-                message: `All API keys are rate-limited. Earliest available in ${waitSecs}s.`,
+                message: proxyUser
+                  ? `All API keys are rate-limited. Retry in ${waitSecs}s.`
+                  : "Too many requests.",
               },
             }),
             {
@@ -1280,7 +1283,7 @@ describe("Rate Limit Rotation End-to-End", () => {
 
     const body = await res.json();
     expect(body.error.type).toBe("proxy_error");
-    expect(body.error.message).toContain("rate-limited");
+    expect(body.error.message).toBe("Too many requests.");
 
     proxy2.stop();
     allLimited.stop();
@@ -1465,7 +1468,7 @@ describe("Error Responses", () => {
     expect(res.status).toBe(503);
     const body = await res.json();
     expect(body.error.type).toBe("proxy_error");
-    expect(body.error.message).toContain("No API keys configured");
+    expect(body.error.message).toBe("Service not available.");
 
     p.stop();
     up.stop();
