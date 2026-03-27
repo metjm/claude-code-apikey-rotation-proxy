@@ -227,7 +227,12 @@ function buildUpstreamHeaders(incoming: Headers, apiKey: string): Headers {
     }
   }
 
-  headers.set("x-api-key", apiKey);
+  if (apiKey.startsWith("sk-ant-oat")) {
+    headers.set("authorization", `Bearer ${apiKey}`);
+  } else {
+    headers.set("x-api-key", apiKey);
+  }
+
   headers.set("anthropic-version", incoming.get("anthropic-version") ?? "2023-06-01");
   return headers;
 }
