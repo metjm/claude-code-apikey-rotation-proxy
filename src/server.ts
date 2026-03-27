@@ -4,9 +4,10 @@ import { KeyManager } from "./key-manager.ts";
 import { handleAdminRoute } from "./admin.ts";
 import { proxyRequest } from "./proxy.ts";
 import { log } from "./logger.ts";
+import { join } from "node:path";
 import { serviceInstall, serviceStatus, serviceUninstall } from "./service.ts";
 import { claudeConfigInstall, claudeConfigUninstall, claudeConfigStatus } from "./claude-config.ts";
-import type { UnixMs } from "./types.ts";
+import type { ProxyTokenEntry, UnixMs } from "./types.ts";
 
 const subcommand = process.argv[2];
 
@@ -62,7 +63,8 @@ Environment:
   PORT              Listen port (default: 4080)
   UPSTREAM_URL      Anthropic API URL (default: https://api.anthropic.com)
   ADMIN_TOKEN       Bearer token for /admin/* endpoints (optional)
-  DATA_DIR          Where to store key state (default: ./data)
+  DATA_DIR          Where to store the database (default: ./data)
+  DB_PATH           Full path to SQLite database (overrides DATA_DIR; default: DATA_DIR/state.db)
   MAX_RETRIES       Max key rotation attempts per request (default: 10)
   LOG_LEVEL         debug | info | warn | error (default: info)`);
 } else {
@@ -77,12 +79,31 @@ function startServer(): void {
     port: config.port,
 
     async fetch(req: Request): Promise<Response> {
+      // Serve dashboard
+      const url = new URL(req.url);
+      if (url.pathname === "/dashboard" || url.pathname === "/dashboard/") {
+        return new Response(Bun.file(join(import.meta.dir, "../public/dashboard.html")));
+      }
+
       const adminResponse = handleAdminRoute(req, keyManager, config);
       if (adminResponse !== null) {
         return adminResponse;
       }
 
-      const result = await proxyRequest(req, keyManager, config);
+      // Auth gate: if proxy tokens are configured, require a valid one
+      let proxyUser: ProxyTokenEntry | null = null;
+      if (keyManager.hasTokens()) {
+        const incoming = extractProxyToken(req);
+        if (incoming === null) {
+          return errorResponse(401, "Proxy authentication required. Set your API key to a valid proxy token.");
+        }
+        proxyUser = keyManager.validateToken(incoming);
+        if (proxyUser === null) {
+          return errorResponse(401, "Invalid proxy token.");
+        }
+      }
+
+      const result = await proxyRequest(req, keyManager, config, proxyUser);
 
       switch (result.kind) {
         case "success":
@@ -129,6 +150,16 @@ function startServer(): void {
     keys: keyManager.totalCount(),
     availableKeys: keyManager.availableCount(),
   });
+}
+
+function extractProxyToken(req: Request): string | null {
+  const xApiKey = req.headers.get("x-api-key");
+  if (xApiKey) return xApiKey;
+
+  const auth = req.headers.get("authorization");
+  if (auth && auth.startsWith("Bearer ")) return auth.slice(7);
+
+  return null;
 }
 
 function errorResponse(

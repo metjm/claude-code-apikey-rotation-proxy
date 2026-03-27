@@ -1,0 +1,1782 @@
+import { describe, test, expect, afterEach, beforeEach } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { Server } from "bun";
+
+import { KeyManager } from "../src/key-manager.ts";
+import { proxyRequest } from "../src/proxy.ts";
+import { subscribe, type ProxyEvent } from "../src/events.ts";
+import type { ProxyConfig, ProxyTokenEntry } from "../src/types.ts";
+
+// ── Helpers ────────────────────────────────────────────────────────
+
+/** Valid fake key that satisfies the sk-ant- prefix requirement. */
+const FAKE_KEY_A = "sk-ant-api03-test-key-AAAAAAAAAAAAAAAA";
+const FAKE_KEY_B = "sk-ant-api03-test-key-BBBBBBBBBBBBBBBB";
+const FAKE_KEY_C = "sk-ant-api03-test-key-CCCCCCCCCCCCCCCC";
+const FAKE_OAUTH = "sk-ant-oat-test-oauth-AAAAAAAAAAAAAAAA";
+
+interface TestSetup {
+  km: KeyManager;
+  tmpDir: string;
+  cleanup: () => void;
+}
+
+function createTestSetup(): TestSetup {
+  const tmpDir = mkdtempSync(join(tmpdir(), "proxy-test-"));
+  const km = new KeyManager(tmpDir);
+  return { km, tmpDir, cleanup: () => rmSync(tmpDir, { recursive: true, force: true }) };
+}
+
+interface MockUpstream {
+  url: string;
+  server: Server;
+  stop: () => void;
+}
+
+function startMockUpstream(
+  handler: (req: Request) => Response | Promise<Response>,
+): MockUpstream {
+  const server = Bun.serve({ port: 0, fetch: handler });
+  return {
+    url: `http://localhost:${server.port}`,
+    server,
+    stop: () => server.stop(true),
+  };
+}
+
+function makeConfig(upstream: string, overrides?: Partial<ProxyConfig>): ProxyConfig {
+  return {
+    port: 0,
+    upstream,
+    adminToken: null,
+    dataDir: "/tmp",
+    maxRetriesPerRequest: 10,
+    ...overrides,
+  };
+}
+
+/** Build a Request aimed at the proxy (the host doesn't matter for proxyRequest). */
+function makeRequest(
+  path: string,
+  opts?: RequestInit & { baseUrl?: string },
+): Request {
+  const base = opts?.baseUrl ?? "http://proxy.local";
+  return new Request(`${base}${path}`, opts);
+}
+
+/**
+ * Collect all emitted events during a callback.
+ * Returns [result, collectedEvents].
+ */
+async function collectEvents<T>(
+  fn: () => Promise<T>,
+): Promise<[T, ProxyEvent[]]> {
+  const events: ProxyEvent[] = [];
+  const unsub = subscribe((e) => events.push(e));
+  try {
+    const result = await fn();
+    return [result, events];
+  } finally {
+    unsub();
+  }
+}
+
+// ── Lifecycle ──────────────────────────────────────────────────────
+
+let setups: TestSetup[] = [];
+let upstreams: MockUpstream[] = [];
+
+afterEach(() => {
+  for (const u of upstreams) u.stop();
+  upstreams = [];
+  for (const s of setups) s.cleanup();
+  setups = [];
+});
+
+/** Convenience: create setup + track for cleanup. */
+function setup(): TestSetup {
+  const s = createTestSetup();
+  setups.push(s);
+  return s;
+}
+
+/** Convenience: create upstream + track for cleanup. */
+function upstream(
+  handler: (req: Request) => Response | Promise<Response>,
+): MockUpstream {
+  const u = startMockUpstream(handler);
+  upstreams.push(u);
+  return u;
+}
+
+// ────────────────────────────────────────────────────────────────────
+// TESTS
+// ────────────────────────────────────────────────────────────────────
+
+describe("Basic Proxying", () => {
+  test("returns no_keys when no keys registered", async () => {
+    const { km } = setup();
+    const mock = upstream(() => new Response("should not reach"));
+    const config = makeConfig(mock.url);
+
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config);
+    expect(result.kind).toBe("no_keys");
+  });
+
+  test("successfully proxies GET request", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    const mock = upstream((req) => {
+      expect(req.method).toBe("GET");
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+
+    const config = makeConfig(mock.url);
+    const result = await proxyRequest(makeRequest("/v1/models", { method: "GET" }), km, config);
+
+    expect(result.kind).toBe("success");
+    if (result.kind === "success") {
+      expect(result.response.status).toBe(200);
+      const body = await result.response.json();
+      expect(body).toEqual({ ok: true });
+    }
+  });
+
+  test("successfully proxies POST request with body", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    let receivedBody: unknown = null;
+    const mock = upstream(async (req) => {
+      expect(req.method).toBe("POST");
+      receivedBody = await req.json();
+      return new Response(JSON.stringify({ id: "msg_123", usage: { input_tokens: 10, output_tokens: 5 } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+
+    const config = makeConfig(mock.url);
+    const payload = { model: "claude-sonnet-4-20250514", messages: [{ role: "user", content: "Hello" }] };
+    const result = await proxyRequest(
+      makeRequest("/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(payload),
+      }),
+      km,
+      config,
+    );
+
+    expect(result.kind).toBe("success");
+    expect(receivedBody).toEqual(payload);
+  });
+
+  test("preserves query string in upstream URL", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    let receivedUrl = "";
+    const mock = upstream((req) => {
+      receivedUrl = req.url;
+      return new Response("ok");
+    });
+
+    const config = makeConfig(mock.url);
+    await proxyRequest(makeRequest("/v1/messages?beta=true&version=2"), km, config);
+
+    const parsed = new URL(receivedUrl);
+    expect(parsed.pathname).toBe("/v1/messages");
+    expect(parsed.searchParams.get("beta")).toBe("true");
+    expect(parsed.searchParams.get("version")).toBe("2");
+  });
+
+  test("returns upstream response status and body", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    const mock = upstream(() =>
+      new Response(JSON.stringify({ result: "done" }), {
+        status: 201,
+        statusText: "Created",
+        headers: { "content-type": "application/json" },
+      }),
+    );
+
+    const config = makeConfig(mock.url);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config);
+
+    expect(result.kind).toBe("success");
+    if (result.kind === "success") {
+      expect(result.response.status).toBe(201);
+      const body = await result.response.json();
+      expect(body).toEqual({ result: "done" });
+    }
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────
+
+describe("Header Handling", () => {
+  test("strips x-api-key from outgoing request", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    let receivedHeaders: Headers | null = null;
+    const mock = upstream((req) => {
+      receivedHeaders = req.headers;
+      return new Response("ok");
+    });
+
+    const config = makeConfig(mock.url);
+    await proxyRequest(
+      makeRequest("/v1/messages", {
+        headers: { "x-api-key": "client-supplied-key" },
+      }),
+      km,
+      config,
+    );
+
+    // The x-api-key should be the proxy's key, not the client-supplied one
+    expect(receivedHeaders!.get("x-api-key")).toBe(FAKE_KEY_A);
+    expect(receivedHeaders!.get("x-api-key")).not.toBe("client-supplied-key");
+  });
+
+  test("strips authorization from outgoing request", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    let receivedHeaders: Headers | null = null;
+    const mock = upstream((req) => {
+      receivedHeaders = req.headers;
+      return new Response("ok");
+    });
+
+    const config = makeConfig(mock.url);
+    await proxyRequest(
+      makeRequest("/v1/messages", {
+        headers: { authorization: "Bearer client-token" },
+      }),
+      km,
+      config,
+    );
+
+    // For a non-OAuth key, there should be no authorization header
+    expect(receivedHeaders!.get("authorization")).toBeNull();
+  });
+
+  test("strips host, connection, keep-alive, transfer-encoding from client headers", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    let receivedHeaders: Headers | null = null;
+    const mock = upstream((req) => {
+      receivedHeaders = req.headers;
+      return new Response("ok");
+    });
+
+    const config = makeConfig(mock.url);
+    await proxyRequest(
+      makeRequest("/v1/messages", {
+        headers: {
+          host: "evil.com",
+          connection: "keep-alive",
+          "keep-alive": "timeout=5",
+          "transfer-encoding": "chunked",
+          "x-marker": "test-value",
+        },
+      }),
+      km,
+      config,
+    );
+
+    // The proxy strips client-supplied hop-by-hop headers from the built
+    // headers object. fetch() itself may re-add "host" and "connection" at
+    // the transport layer (these are not the original client values).
+    // Verify the client's evil.com host was NOT forwarded:
+    expect(receivedHeaders!.get("host")).not.toBe("evil.com");
+    // keep-alive custom header should be stripped:
+    expect(receivedHeaders!.get("keep-alive")).toBeNull();
+    // Non-stripped headers should still be forwarded:
+    expect(receivedHeaders!.get("x-marker")).toBe("test-value");
+  });
+
+  test("adds x-api-key for regular API keys", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    let receivedHeaders: Headers | null = null;
+    const mock = upstream((req) => {
+      receivedHeaders = req.headers;
+      return new Response("ok");
+    });
+
+    const config = makeConfig(mock.url);
+    await proxyRequest(makeRequest("/v1/messages"), km, config);
+
+    expect(receivedHeaders!.get("x-api-key")).toBe(FAKE_KEY_A);
+    expect(receivedHeaders!.get("authorization")).toBeNull();
+  });
+
+  test("adds Authorization: Bearer for OAuth tokens (sk-ant-oat-*)", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_OAUTH, "oauth-key");
+
+    let receivedHeaders: Headers | null = null;
+    const mock = upstream((req) => {
+      receivedHeaders = req.headers;
+      return new Response("ok");
+    });
+
+    const config = makeConfig(mock.url);
+    await proxyRequest(makeRequest("/v1/messages"), km, config);
+
+    expect(receivedHeaders!.get("authorization")).toBe(`Bearer ${FAKE_OAUTH}`);
+    expect(receivedHeaders!.get("x-api-key")).toBeNull();
+  });
+
+  test("sets anthropic-version from incoming or defaults to 2023-06-01", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    // Test default
+    let receivedVersion: string | null = null;
+    const mock = upstream((req) => {
+      receivedVersion = req.headers.get("anthropic-version");
+      return new Response("ok");
+    });
+
+    const config = makeConfig(mock.url);
+    await proxyRequest(makeRequest("/v1/messages"), km, config);
+    expect(receivedVersion).toBe("2023-06-01");
+
+    // Test custom version preserved
+    await proxyRequest(
+      makeRequest("/v1/messages", {
+        headers: { "anthropic-version": "2024-01-01" },
+      }),
+      km,
+      config,
+    );
+    expect(receivedVersion).toBe("2024-01-01");
+  });
+
+  test("preserves custom client headers (e.g. content-type, user-agent)", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    let receivedHeaders: Headers | null = null;
+    const mock = upstream((req) => {
+      receivedHeaders = req.headers;
+      return new Response("ok");
+    });
+
+    const config = makeConfig(mock.url);
+    await proxyRequest(
+      makeRequest("/v1/messages", {
+        headers: {
+          "content-type": "application/json",
+          "user-agent": "my-test-client/1.0",
+          "x-custom-header": "preserved",
+        },
+      }),
+      km,
+      config,
+    );
+
+    expect(receivedHeaders!.get("content-type")).toBe("application/json");
+    expect(receivedHeaders!.get("user-agent")).toBe("my-test-client/1.0");
+    expect(receivedHeaders!.get("x-custom-header")).toBe("preserved");
+  });
+
+  test("strips content-encoding, content-length, transfer-encoding from response", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    // Use "identity" content-encoding (no-op) so fetch() does not try to
+    // decompress the body. The proxy code strips the header regardless of
+    // its value. We also include content-length and connection to verify
+    // the full STRIPPED_RESPONSE_HEADERS set.
+    const mock = upstream(() =>
+      new Response("ok", {
+        headers: {
+          "content-encoding": "identity",
+          "content-length": "2",
+          "x-request-id": "abc123",
+          "connection": "keep-alive",
+          "keep-alive": "timeout=5",
+        },
+      }),
+    );
+
+    const config = makeConfig(mock.url);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config);
+
+    expect(result.kind).toBe("success");
+    if (result.kind === "success") {
+      expect(result.response.headers.get("content-encoding")).toBeNull();
+      expect(result.response.headers.get("content-length")).toBeNull();
+      expect(result.response.headers.get("connection")).toBeNull();
+      expect(result.response.headers.get("keep-alive")).toBeNull();
+      // Non-stripped headers are preserved
+      expect(result.response.headers.get("x-request-id")).toBe("abc123");
+    }
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────
+
+describe("Rate Limit Handling (429)", () => {
+  test("detects 429 and rotates to next key", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    km.addKey(FAKE_KEY_B, "key-b");
+
+    let callCount = 0;
+    const mock = upstream((req) => {
+      callCount++;
+      const key = req.headers.get("x-api-key");
+      if (key === FAKE_KEY_A) {
+        return new Response("rate limited", {
+          status: 429,
+          headers: { "retry-after": "30" },
+        });
+      }
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+
+    const config = makeConfig(mock.url);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config);
+
+    expect(result.kind).toBe("success");
+    expect(callCount).toBe(2);
+  });
+
+  test("parses Retry-After header", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    km.addKey(FAKE_KEY_B, "key-b");
+
+    const mock = upstream((req) => {
+      const key = req.headers.get("x-api-key");
+      if (key === FAKE_KEY_A) {
+        return new Response("rate limited", {
+          status: 429,
+          headers: { "retry-after": "120" },
+        });
+      }
+      return new Response("ok");
+    });
+
+    const config = makeConfig(mock.url);
+    await proxyRequest(makeRequest("/v1/messages"), km, config);
+
+    // key-a should be unavailable for ~120s
+    const keys = km.listKeys();
+    const keyA = keys.find((k) => k.label === "key-a")!;
+    // availableAt should be roughly now + 120s
+    const expectedMin = Date.now() + 119_000;
+    const expectedMax = Date.now() + 121_000;
+    expect(keyA.availableAt).toBeGreaterThanOrEqual(expectedMin);
+    expect(keyA.availableAt).toBeLessThanOrEqual(expectedMax);
+  });
+
+  test("defaults retry to 60s when header missing", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    km.addKey(FAKE_KEY_B, "key-b");
+
+    const mock = upstream((req) => {
+      const key = req.headers.get("x-api-key");
+      if (key === FAKE_KEY_A) {
+        // No retry-after header
+        return new Response("rate limited", { status: 429 });
+      }
+      return new Response("ok");
+    });
+
+    const config = makeConfig(mock.url);
+    await proxyRequest(makeRequest("/v1/messages"), km, config);
+
+    const keys = km.listKeys();
+    const keyA = keys.find((k) => k.label === "key-a")!;
+    const expectedMin = Date.now() + 59_000;
+    const expectedMax = Date.now() + 61_000;
+    expect(keyA.availableAt).toBeGreaterThanOrEqual(expectedMin);
+    expect(keyA.availableAt).toBeLessThanOrEqual(expectedMax);
+  });
+
+  test("marks key unavailable for retry period", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    km.addKey(FAKE_KEY_B, "key-b");
+
+    const mock = upstream((req) => {
+      const key = req.headers.get("x-api-key");
+      if (key === FAKE_KEY_A) {
+        return new Response("rate limited", {
+          status: 429,
+          headers: { "retry-after": "300" },
+        });
+      }
+      return new Response("ok");
+    });
+
+    const config = makeConfig(mock.url);
+    await proxyRequest(makeRequest("/v1/messages"), km, config);
+
+    const keys = km.listKeys();
+    const keyA = keys.find((k) => k.label === "key-a")!;
+    expect(keyA.isAvailable).toBe(false);
+
+    const keyB = keys.find((k) => k.label === "key-b")!;
+    expect(keyB.isAvailable).toBe(true);
+  });
+
+  test("returns all_exhausted when all keys rate-limited", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    km.addKey(FAKE_KEY_B, "key-b");
+
+    const mock = upstream(() =>
+      new Response("rate limited", {
+        status: 429,
+        headers: { "retry-after": "60" },
+      }),
+    );
+
+    const config = makeConfig(mock.url);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config);
+
+    expect(result.kind).toBe("all_exhausted");
+    if (result.kind === "all_exhausted") {
+      expect(result.earliestAvailableAt).toBeGreaterThan(Date.now());
+    }
+  });
+
+  test("tracks rateLimitHits stat", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    km.addKey(FAKE_KEY_B, "key-b");
+
+    const mock = upstream((req) => {
+      const key = req.headers.get("x-api-key");
+      if (key === FAKE_KEY_A) {
+        return new Response("rate limited", {
+          status: 429,
+          headers: { "retry-after": "30" },
+        });
+      }
+      return new Response("ok");
+    });
+
+    const config = makeConfig(mock.url);
+    await proxyRequest(makeRequest("/v1/messages"), km, config);
+
+    const keys = km.listKeys();
+    const keyA = keys.find((k) => k.label === "key-a")!;
+    expect(keyA.stats.rateLimitHits).toBe(1);
+  });
+
+  test("emits rate_limit event with user label", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    km.addKey(FAKE_KEY_B, "key-b");
+    const proxyUser = km.addToken("test-token-12345678", "alice");
+
+    const mock = upstream((req) => {
+      const key = req.headers.get("x-api-key");
+      if (key === FAKE_KEY_A) {
+        return new Response("rate limited", {
+          status: 429,
+          headers: { "retry-after": "45" },
+        });
+      }
+      return new Response("ok");
+    });
+
+    const config = makeConfig(mock.url);
+    const [, events] = await collectEvents(() =>
+      proxyRequest(makeRequest("/v1/messages"), km, config, proxyUser),
+    );
+
+    const rlEvents = events.filter((e) => e.type === "rate_limit");
+    expect(rlEvents.length).toBe(1);
+    expect(rlEvents[0]!.user).toBe("alice");
+    expect(rlEvents[0]!.retryAfter).toBe(45);
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────
+
+describe("Error Handling", () => {
+  test("returns 502 on upstream connection failure", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    // Point at a port that is not listening
+    const config = makeConfig("http://localhost:1");
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config);
+
+    expect(result.kind).toBe("error");
+    if (result.kind === "error") {
+      expect(result.status).toBe(502);
+      expect(result.body).toContain("Upstream connection failed");
+    }
+  });
+
+  test("returns upstream error status for 4xx/5xx (not 429)", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    const errorBody = JSON.stringify({ error: { type: "invalid_request_error", message: "bad model" } });
+    const mock = upstream(() =>
+      new Response(errorBody, {
+        status: 400,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+
+    const config = makeConfig(mock.url);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config);
+
+    expect(result.kind).toBe("error");
+    if (result.kind === "error") {
+      expect(result.status).toBe(400);
+      expect(JSON.parse(result.body)).toEqual({
+        error: { type: "invalid_request_error", message: "bad model" },
+      });
+    }
+  });
+
+  test("returns upstream 500 error as-is", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    const mock = upstream(() =>
+      new Response("internal server error", { status: 500 }),
+    );
+
+    const config = makeConfig(mock.url);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config);
+
+    expect(result.kind).toBe("error");
+    if (result.kind === "error") {
+      expect(result.status).toBe(500);
+    }
+  });
+
+  test("does not retry on non-429 errors", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    km.addKey(FAKE_KEY_B, "key-b");
+
+    let callCount = 0;
+    const mock = upstream(() => {
+      callCount++;
+      return new Response("forbidden", { status: 403 });
+    });
+
+    const config = makeConfig(mock.url);
+    await proxyRequest(makeRequest("/v1/messages"), km, config);
+
+    // Should only hit once -- no retry on 403
+    expect(callCount).toBe(1);
+  });
+
+  test("records error stats on key and token", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    const proxyUser = km.addToken("test-token-12345678", "alice");
+
+    const mock = upstream(() =>
+      new Response("forbidden", { status: 403 }),
+    );
+
+    const config = makeConfig(mock.url);
+    await proxyRequest(makeRequest("/v1/messages"), km, config, proxyUser);
+
+    const keys = km.listKeys();
+    expect(keys[0]!.stats.errors).toBe(1);
+
+    const tokens = km.listTokens();
+    expect(tokens[0]!.stats.errors).toBe(1);
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────
+
+describe("Token Tracking - Non-Streaming", () => {
+  test("extracts usage.input_tokens from JSON response", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    const mock = upstream(() =>
+      new Response(
+        JSON.stringify({
+          id: "msg_123",
+          type: "message",
+          usage: { input_tokens: 150, output_tokens: 42 },
+        }),
+        { headers: { "content-type": "application/json" } },
+      ),
+    );
+
+    const config = makeConfig(mock.url);
+    await proxyRequest(makeRequest("/v1/messages"), km, config);
+
+    const keys = km.listKeys();
+    expect(keys[0]!.stats.totalTokensIn).toBe(150);
+  });
+
+  test("extracts usage.output_tokens from JSON response", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    const mock = upstream(() =>
+      new Response(
+        JSON.stringify({
+          id: "msg_123",
+          usage: { input_tokens: 100, output_tokens: 250 },
+        }),
+        { headers: { "content-type": "application/json" } },
+      ),
+    );
+
+    const config = makeConfig(mock.url);
+    await proxyRequest(makeRequest("/v1/messages"), km, config);
+
+    const keys = km.listKeys();
+    expect(keys[0]!.stats.totalTokensOut).toBe(250);
+  });
+
+  test("defaults to 0 when usage missing", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    const mock = upstream(() =>
+      new Response(JSON.stringify({ id: "msg_123" }), {
+        headers: { "content-type": "application/json" },
+      }),
+    );
+
+    const config = makeConfig(mock.url);
+    await proxyRequest(makeRequest("/v1/messages"), km, config);
+
+    const keys = km.listKeys();
+    expect(keys[0]!.stats.totalTokensIn).toBe(0);
+    expect(keys[0]!.stats.totalTokensOut).toBe(0);
+    expect(keys[0]!.stats.successfulRequests).toBe(1);
+  });
+
+  test("records token stats on key", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    const mock = upstream(() =>
+      new Response(
+        JSON.stringify({ usage: { input_tokens: 50, output_tokens: 75 } }),
+        { headers: { "content-type": "application/json" } },
+      ),
+    );
+
+    const config = makeConfig(mock.url);
+    // Two requests to accumulate
+    await proxyRequest(makeRequest("/v1/messages"), km, config);
+    await proxyRequest(makeRequest("/v1/messages"), km, config);
+
+    const keys = km.listKeys();
+    expect(keys[0]!.stats.totalTokensIn).toBe(100);
+    expect(keys[0]!.stats.totalTokensOut).toBe(150);
+    expect(keys[0]!.stats.successfulRequests).toBe(2);
+  });
+
+  test("records token stats on proxy user", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    const proxyUser = km.addToken("test-token-12345678", "alice");
+
+    const mock = upstream(() =>
+      new Response(
+        JSON.stringify({ usage: { input_tokens: 200, output_tokens: 300 } }),
+        { headers: { "content-type": "application/json" } },
+      ),
+    );
+
+    const config = makeConfig(mock.url);
+    await proxyRequest(makeRequest("/v1/messages"), km, config, proxyUser);
+
+    const tokens = km.listTokens();
+    const alice = tokens.find((t) => t.label === "alice")!;
+    expect(alice.stats.totalTokensIn).toBe(200);
+    expect(alice.stats.totalTokensOut).toBe(300);
+    expect(alice.stats.successfulRequests).toBe(1);
+  });
+
+  test("emits tokens event", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    const mock = upstream(() =>
+      new Response(
+        JSON.stringify({ usage: { input_tokens: 10, output_tokens: 20 } }),
+        { headers: { "content-type": "application/json" } },
+      ),
+    );
+
+    const config = makeConfig(mock.url);
+    const [, events] = await collectEvents(() =>
+      proxyRequest(makeRequest("/v1/messages"), km, config),
+    );
+
+    const tokenEvents = events.filter((e) => e.type === "tokens");
+    expect(tokenEvents.length).toBe(1);
+    expect(tokenEvents[0]!.input).toBe(10);
+    expect(tokenEvents[0]!.output).toBe(20);
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────
+
+describe("Token Tracking - Streaming (SSE)", () => {
+  function makeSSEBody(events: string[]): ReadableStream<Uint8Array> {
+    const encoder = new TextEncoder();
+    return new ReadableStream({
+      start(controller) {
+        for (const e of events) {
+          controller.enqueue(encoder.encode(e));
+        }
+        controller.close();
+      },
+    });
+  }
+
+  test("detects text/event-stream content-type", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    const sseData = [
+      'data: {"type":"message_start","message":{"usage":{"input_tokens":10}}}\n\n',
+      'data: {"type":"content_block_delta","delta":{"text":"Hi"}}\n\n',
+      'data: {"type":"message_delta","usage":{"output_tokens":5}}\n\n',
+      "data: [DONE]\n\n",
+    ];
+
+    const mock = upstream(() =>
+      new Response(makeSSEBody(sseData), {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }),
+    );
+
+    const config = makeConfig(mock.url);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config);
+
+    expect(result.kind).toBe("success");
+    if (result.kind === "success") {
+      // Must consume the stream to trigger flush
+      await result.response.text();
+
+      const keys = km.listKeys();
+      expect(keys[0]!.stats.totalTokensIn).toBe(10);
+      expect(keys[0]!.stats.totalTokensOut).toBe(5);
+    }
+  });
+
+  test("passes stream data through unchanged to client", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    const sseChunks = [
+      'data: {"type":"message_start","message":{"usage":{"input_tokens":5}}}\n\n',
+      'data: {"type":"content_block_delta","delta":{"text":"Hello world"}}\n\n',
+      'data: {"type":"message_delta","usage":{"output_tokens":3}}\n\n',
+    ];
+
+    const mock = upstream(() =>
+      new Response(makeSSEBody(sseChunks), {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }),
+    );
+
+    const config = makeConfig(mock.url);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config);
+
+    expect(result.kind).toBe("success");
+    if (result.kind === "success") {
+      const body = await result.response.text();
+      // All original data should be present
+      expect(body).toContain("message_start");
+      expect(body).toContain("content_block_delta");
+      expect(body).toContain("Hello world");
+      expect(body).toContain("message_delta");
+    }
+  });
+
+  test("extracts input tokens from message_start event", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    const sseData = [
+      'data: {"type":"message_start","message":{"usage":{"input_tokens":500}}}\n\n',
+      'data: {"type":"message_delta","usage":{"output_tokens":0}}\n\n',
+    ];
+
+    const mock = upstream(() =>
+      new Response(makeSSEBody(sseData), {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }),
+    );
+
+    const config = makeConfig(mock.url);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config);
+
+    expect(result.kind).toBe("success");
+    if (result.kind === "success") {
+      await result.response.text();
+      const keys = km.listKeys();
+      expect(keys[0]!.stats.totalTokensIn).toBe(500);
+    }
+  });
+
+  test("extracts output tokens from message_delta event", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    const sseData = [
+      'data: {"type":"message_start","message":{"usage":{"input_tokens":0}}}\n\n',
+      'data: {"type":"message_delta","usage":{"output_tokens":999}}\n\n',
+    ];
+
+    const mock = upstream(() =>
+      new Response(makeSSEBody(sseData), {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }),
+    );
+
+    const config = makeConfig(mock.url);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config);
+
+    expect(result.kind).toBe("success");
+    if (result.kind === "success") {
+      await result.response.text();
+      const keys = km.listKeys();
+      expect(keys[0]!.stats.totalTokensOut).toBe(999);
+    }
+  });
+
+  test("accumulates tokens across multiple events", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    const sseData = [
+      'data: {"type":"message_start","message":{"usage":{"input_tokens":100}}}\n\n',
+      'data: {"type":"content_block_delta","delta":{"text":"chunk1"}}\n\n',
+      'data: {"type":"content_block_delta","delta":{"text":"chunk2"}}\n\n',
+      'data: {"type":"message_delta","usage":{"output_tokens":50}}\n\n',
+    ];
+
+    const mock = upstream(() =>
+      new Response(makeSSEBody(sseData), {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }),
+    );
+
+    const config = makeConfig(mock.url);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config);
+
+    expect(result.kind).toBe("success");
+    if (result.kind === "success") {
+      await result.response.text();
+      const keys = km.listKeys();
+      expect(keys[0]!.stats.totalTokensIn).toBe(100);
+      expect(keys[0]!.stats.totalTokensOut).toBe(50);
+      expect(keys[0]!.stats.successfulRequests).toBe(1);
+    }
+  });
+
+  test("records stats on flush (stream end)", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    const proxyUser = km.addToken("test-token-12345678", "alice");
+
+    const sseData = [
+      'data: {"type":"message_start","message":{"usage":{"input_tokens":77}}}\n\n',
+      'data: {"type":"message_delta","usage":{"output_tokens":33}}\n\n',
+    ];
+
+    const mock = upstream(() =>
+      new Response(makeSSEBody(sseData), {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }),
+    );
+
+    const config = makeConfig(mock.url);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config, proxyUser);
+
+    expect(result.kind).toBe("success");
+    if (result.kind === "success") {
+      // Before consuming: stats should NOT yet be recorded (flush hasn't run)
+      const keysBefore = km.listKeys();
+      // successfulRequests is only recorded on flush
+      expect(keysBefore[0]!.stats.successfulRequests).toBe(0);
+
+      // Now consume the stream to trigger flush
+      await result.response.text();
+
+      const keysAfter = km.listKeys();
+      expect(keysAfter[0]!.stats.successfulRequests).toBe(1);
+      expect(keysAfter[0]!.stats.totalTokensIn).toBe(77);
+      expect(keysAfter[0]!.stats.totalTokensOut).toBe(33);
+
+      const tokens = km.listTokens();
+      const alice = tokens.find((t) => t.label === "alice")!;
+      expect(alice.stats.successfulRequests).toBe(1);
+      expect(alice.stats.totalTokensIn).toBe(77);
+      expect(alice.stats.totalTokensOut).toBe(33);
+    }
+  });
+
+  test("handles invalid JSON in stream events gracefully", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    const sseData = [
+      'data: {"type":"message_start","message":{"usage":{"input_tokens":10}}}\n\n',
+      "data: {this is not valid json}\n\n",
+      "data: BROKEN\n\n",
+      'data: {"type":"message_delta","usage":{"output_tokens":5}}\n\n',
+    ];
+
+    const mock = upstream(() =>
+      new Response(makeSSEBody(sseData), {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }),
+    );
+
+    const config = makeConfig(mock.url);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config);
+
+    expect(result.kind).toBe("success");
+    if (result.kind === "success") {
+      // Should not throw, should still extract valid tokens
+      const body = await result.response.text();
+      expect(body).toContain("BROKEN");
+
+      const keys = km.listKeys();
+      expect(keys[0]!.stats.totalTokensIn).toBe(10);
+      expect(keys[0]!.stats.totalTokensOut).toBe(5);
+    }
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────
+
+describe("Key Rotation", () => {
+  test("tries multiple keys on successive 429s", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    km.addKey(FAKE_KEY_B, "key-b");
+    km.addKey(FAKE_KEY_C, "key-c");
+
+    const keysUsed: string[] = [];
+    const mock = upstream((req) => {
+      const key = req.headers.get("x-api-key")!;
+      keysUsed.push(key);
+      if (key === FAKE_KEY_A || key === FAKE_KEY_B) {
+        return new Response("rate limited", {
+          status: 429,
+          headers: { "retry-after": "60" },
+        });
+      }
+      return new Response("ok");
+    });
+
+    const config = makeConfig(mock.url);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config);
+
+    expect(result.kind).toBe("success");
+    expect(keysUsed.length).toBe(3);
+    // All three keys should have been tried
+    expect(new Set(keysUsed).size).toBe(3);
+  });
+
+  test("stops when a key succeeds", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    km.addKey(FAKE_KEY_B, "key-b");
+    km.addKey(FAKE_KEY_C, "key-c");
+
+    let callCount = 0;
+    const mock = upstream((req) => {
+      callCount++;
+      const key = req.headers.get("x-api-key")!;
+      if (key === FAKE_KEY_A) {
+        return new Response("rate limited", {
+          status: 429,
+          headers: { "retry-after": "60" },
+        });
+      }
+      // key-b succeeds
+      return new Response("ok");
+    });
+
+    const config = makeConfig(mock.url);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config);
+
+    expect(result.kind).toBe("success");
+    // Should stop at 2 (key-a 429, key-b success), not try key-c
+    expect(callCount).toBe(2);
+  });
+
+  test("stops at max retries", async () => {
+    const { km } = setup();
+    // Add many keys but set low max retries
+    km.addKey(FAKE_KEY_A, "key-a");
+    km.addKey(FAKE_KEY_B, "key-b");
+    km.addKey(FAKE_KEY_C, "key-c");
+
+    let callCount = 0;
+    const mock = upstream(() => {
+      callCount++;
+      return new Response("rate limited", {
+        status: 429,
+        headers: { "retry-after": "60" },
+      });
+    });
+
+    const config = makeConfig(mock.url, { maxRetriesPerRequest: 2 });
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config);
+
+    // Should stop after 2 attempts
+    expect(callCount).toBe(2);
+    expect(result.kind).toBe("all_exhausted");
+  });
+
+  test("does not retry same key twice", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    let callCount = 0;
+    const mock = upstream(() => {
+      callCount++;
+      return new Response("rate limited", {
+        status: 429,
+        headers: { "retry-after": "60" },
+      });
+    });
+
+    const config = makeConfig(mock.url, { maxRetriesPerRequest: 10 });
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config);
+
+    // With only 1 key, it should be tried exactly once, then all_exhausted
+    expect(callCount).toBe(1);
+    expect(result.kind).toBe("all_exhausted");
+  });
+
+  test("returns all_exhausted after all keys tried", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    km.addKey(FAKE_KEY_B, "key-b");
+
+    const mock = upstream(() =>
+      new Response("rate limited", {
+        status: 429,
+        headers: { "retry-after": "60" },
+      }),
+    );
+
+    const config = makeConfig(mock.url);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config);
+
+    expect(result.kind).toBe("all_exhausted");
+    if (result.kind === "all_exhausted") {
+      // earliestAvailableAt should be in the future
+      expect(result.earliestAvailableAt).toBeGreaterThan(Date.now());
+    }
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────
+
+describe("Proxy User Attribution", () => {
+  test("records token request once per top-level request (not per retry)", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    km.addKey(FAKE_KEY_B, "key-b");
+    const proxyUser = km.addToken("test-token-12345678", "alice");
+
+    const mock = upstream((req) => {
+      const key = req.headers.get("x-api-key");
+      if (key === FAKE_KEY_A) {
+        return new Response("rate limited", {
+          status: 429,
+          headers: { "retry-after": "30" },
+        });
+      }
+      return new Response(
+        JSON.stringify({ usage: { input_tokens: 10, output_tokens: 5 } }),
+        { headers: { "content-type": "application/json" } },
+      );
+    });
+
+    const config = makeConfig(mock.url);
+    await proxyRequest(makeRequest("/v1/messages"), km, config, proxyUser);
+
+    const tokens = km.listTokens();
+    const alice = tokens.find((t) => t.label === "alice")!;
+    // recordTokenRequest is called once at the top, not per retry
+    expect(alice.stats.totalRequests).toBe(1);
+  });
+
+  test("records token success with correct token counts", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    const proxyUser = km.addToken("test-token-12345678", "bob");
+
+    const mock = upstream(() =>
+      new Response(
+        JSON.stringify({ usage: { input_tokens: 500, output_tokens: 1000 } }),
+        { headers: { "content-type": "application/json" } },
+      ),
+    );
+
+    const config = makeConfig(mock.url);
+    await proxyRequest(makeRequest("/v1/messages"), km, config, proxyUser);
+
+    const tokens = km.listTokens();
+    const bob = tokens.find((t) => t.label === "bob")!;
+    expect(bob.stats.successfulRequests).toBe(1);
+    expect(bob.stats.totalTokensIn).toBe(500);
+    expect(bob.stats.totalTokensOut).toBe(1000);
+  });
+
+  test("records token error on failure", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    const proxyUser = km.addToken("test-token-12345678", "charlie");
+
+    const mock = upstream(() =>
+      new Response("forbidden", { status: 403 }),
+    );
+
+    const config = makeConfig(mock.url);
+    await proxyRequest(makeRequest("/v1/messages"), km, config, proxyUser);
+
+    const tokens = km.listTokens();
+    const charlie = tokens.find((t) => t.label === "charlie")!;
+    expect(charlie.stats.errors).toBe(1);
+    expect(charlie.stats.totalRequests).toBe(1);
+  });
+
+  test("records token error on all-keys-exhausted", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    const proxyUser = km.addToken("test-token-12345678", "diana");
+
+    const mock = upstream(() =>
+      new Response("rate limited", {
+        status: 429,
+        headers: { "retry-after": "60" },
+      }),
+    );
+
+    const config = makeConfig(mock.url);
+    await proxyRequest(makeRequest("/v1/messages"), km, config, proxyUser);
+
+    const tokens = km.listTokens();
+    const diana = tokens.find((t) => t.label === "diana")!;
+    expect(diana.stats.errors).toBe(1);
+  });
+
+  test("records token error on upstream connection failure", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    const proxyUser = km.addToken("test-token-12345678", "eve");
+
+    const config = makeConfig("http://localhost:1");
+    await proxyRequest(makeRequest("/v1/messages"), km, config, proxyUser);
+
+    const tokens = km.listTokens();
+    const eve = tokens.find((t) => t.label === "eve")!;
+    expect(eve.stats.errors).toBe(1);
+  });
+
+  test("includes user label in all emitted events", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    const proxyUser = km.addToken("test-token-12345678", "frank");
+
+    const mock = upstream(() =>
+      new Response(
+        JSON.stringify({ usage: { input_tokens: 10, output_tokens: 5 } }),
+        { headers: { "content-type": "application/json" } },
+      ),
+    );
+
+    const config = makeConfig(mock.url);
+    const [, events] = await collectEvents(() =>
+      proxyRequest(makeRequest("/v1/messages"), km, config, proxyUser),
+    );
+
+    // All events should have user set
+    for (const event of events) {
+      // "keys" type events from emitWithKeys may not have user, so skip those
+      if (event.type !== "keys") {
+        expect(event.user).toBe("frank");
+      }
+    }
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────
+
+describe("Event Emission", () => {
+  test("emits request event with method, path, attempt, user", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    const proxyUser = km.addToken("test-token-12345678", "alice");
+
+    const mock = upstream(() => new Response("ok"));
+
+    const config = makeConfig(mock.url);
+    const [, events] = await collectEvents(() =>
+      proxyRequest(
+        makeRequest("/v1/messages", { method: "POST" }),
+        km,
+        config,
+        proxyUser,
+      ),
+    );
+
+    const reqEvents = events.filter((e) => e.type === "request");
+    expect(reqEvents.length).toBe(1);
+    expect(reqEvents[0]!.method).toBe("POST");
+    expect(reqEvents[0]!.path).toBe("/v1/messages");
+    expect(reqEvents[0]!.attempt).toBe(1);
+    expect(reqEvents[0]!.user).toBe("alice");
+    expect(reqEvents[0]!.ts).toBeDefined();
+  });
+
+  test("emits response event with status and user", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    const proxyUser = km.addToken("test-token-12345678", "bob");
+
+    const mock = upstream(() =>
+      new Response("ok", { status: 200 }),
+    );
+
+    const config = makeConfig(mock.url);
+    const [, events] = await collectEvents(() =>
+      proxyRequest(makeRequest("/v1/messages"), km, config, proxyUser),
+    );
+
+    const resEvents = events.filter((e) => e.type === "response");
+    expect(resEvents.length).toBe(1);
+    expect(resEvents[0]!.status).toBe(200);
+    expect(resEvents[0]!.user).toBe("bob");
+  });
+
+  test("emits error event with details and user", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    const proxyUser = km.addToken("test-token-12345678", "charlie");
+
+    // Use an unreachable port to trigger a connection error
+    const config = makeConfig("http://localhost:1");
+    const [, events] = await collectEvents(() =>
+      proxyRequest(makeRequest("/v1/messages"), km, config, proxyUser),
+    );
+
+    const errEvents = events.filter((e) => e.type === "error");
+    expect(errEvents.length).toBe(1);
+    expect(errEvents[0]!.user).toBe("charlie");
+    expect(errEvents[0]!.error).toBeDefined();
+  });
+
+  test("emits error event for non-429 upstream errors", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    const proxyUser = km.addToken("test-token-12345678", "diana");
+
+    const mock = upstream(() =>
+      new Response("bad request", { status: 400 }),
+    );
+
+    const config = makeConfig(mock.url);
+    const [, events] = await collectEvents(() =>
+      proxyRequest(makeRequest("/v1/messages"), km, config, proxyUser),
+    );
+
+    const errEvents = events.filter((e) => e.type === "error");
+    expect(errEvents.length).toBe(1);
+    expect(errEvents[0]!.status).toBe(400);
+    expect(errEvents[0]!.user).toBe("diana");
+  });
+
+  test("emits rate_limit event with retryAfter and user", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    km.addKey(FAKE_KEY_B, "key-b");
+    const proxyUser = km.addToken("test-token-12345678", "eve");
+
+    const mock = upstream((req) => {
+      const key = req.headers.get("x-api-key");
+      if (key === FAKE_KEY_A) {
+        return new Response("rate limited", {
+          status: 429,
+          headers: { "retry-after": "90" },
+        });
+      }
+      return new Response("ok");
+    });
+
+    const config = makeConfig(mock.url);
+    const [, events] = await collectEvents(() =>
+      proxyRequest(makeRequest("/v1/messages"), km, config, proxyUser),
+    );
+
+    const rlEvents = events.filter((e) => e.type === "rate_limit");
+    expect(rlEvents.length).toBe(1);
+    expect(rlEvents[0]!.retryAfter).toBe(90);
+    expect(rlEvents[0]!.user).toBe("eve");
+    expect(rlEvents[0]!.availableKeys).toBeDefined();
+  });
+
+  test("emits tokens event with input/output counts and user", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    const proxyUser = km.addToken("test-token-12345678", "frank");
+
+    const mock = upstream(() =>
+      new Response(
+        JSON.stringify({ usage: { input_tokens: 42, output_tokens: 88 } }),
+        { headers: { "content-type": "application/json" } },
+      ),
+    );
+
+    const config = makeConfig(mock.url);
+    const [, events] = await collectEvents(() =>
+      proxyRequest(makeRequest("/v1/messages"), km, config, proxyUser),
+    );
+
+    const tokenEvents = events.filter((e) => e.type === "tokens");
+    expect(tokenEvents.length).toBe(1);
+    expect(tokenEvents[0]!.input).toBe(42);
+    expect(tokenEvents[0]!.output).toBe(88);
+    expect(tokenEvents[0]!.user).toBe("frank");
+    expect(tokenEvents[0]!.label).toBe("key-a");
+  });
+
+  test("emits request events for each retry attempt", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    km.addKey(FAKE_KEY_B, "key-b");
+    km.addKey(FAKE_KEY_C, "key-c");
+
+    const mock = upstream((req) => {
+      const key = req.headers.get("x-api-key");
+      if (key === FAKE_KEY_A || key === FAKE_KEY_B) {
+        return new Response("rate limited", {
+          status: 429,
+          headers: { "retry-after": "30" },
+        });
+      }
+      return new Response("ok");
+    });
+
+    const config = makeConfig(mock.url);
+    const [, events] = await collectEvents(() =>
+      proxyRequest(makeRequest("/v1/messages"), km, config),
+    );
+
+    const reqEvents = events.filter((e) => e.type === "request");
+    expect(reqEvents.length).toBe(3);
+    expect(reqEvents[0]!.attempt).toBe(1);
+    expect(reqEvents[1]!.attempt).toBe(2);
+    expect(reqEvents[2]!.attempt).toBe(3);
+  });
+
+  test("emits response event for each upstream response including 429s", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    km.addKey(FAKE_KEY_B, "key-b");
+
+    const mock = upstream((req) => {
+      const key = req.headers.get("x-api-key");
+      if (key === FAKE_KEY_A) {
+        return new Response("rate limited", {
+          status: 429,
+          headers: { "retry-after": "30" },
+        });
+      }
+      return new Response("ok", { status: 200 });
+    });
+
+    const config = makeConfig(mock.url);
+    const [, events] = await collectEvents(() =>
+      proxyRequest(makeRequest("/v1/messages"), km, config),
+    );
+
+    const resEvents = events.filter((e) => e.type === "response");
+    expect(resEvents.length).toBe(2);
+    expect(resEvents[0]!.status).toBe(429);
+    expect(resEvents[1]!.status).toBe(200);
+  });
+
+  test("does not emit tokens event when usage is zero", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    const mock = upstream(() =>
+      new Response(JSON.stringify({ id: "msg_123" }), {
+        headers: { "content-type": "application/json" },
+      }),
+    );
+
+    const config = makeConfig(mock.url);
+    const [, events] = await collectEvents(() =>
+      proxyRequest(makeRequest("/v1/messages"), km, config),
+    );
+
+    const tokenEvents = events.filter((e) => e.type === "tokens");
+    expect(tokenEvents.length).toBe(0);
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────
+
+describe("Edge Cases", () => {
+  test("handles null upstream body", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    const mock = upstream(() =>
+      new Response(null, { status: 204 }),
+    );
+
+    const config = makeConfig(mock.url);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config);
+
+    expect(result.kind).toBe("success");
+    if (result.kind === "success") {
+      expect(result.response.status).toBe(204);
+      const keys = km.listKeys();
+      expect(keys[0]!.stats.successfulRequests).toBe(1);
+      expect(keys[0]!.stats.totalTokensIn).toBe(0);
+      expect(keys[0]!.stats.totalTokensOut).toBe(0);
+    }
+  });
+
+  test("handles non-JSON response body gracefully", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    const mock = upstream(() =>
+      new Response("plain text response", {
+        status: 200,
+        headers: { "content-type": "text/plain" },
+      }),
+    );
+
+    const config = makeConfig(mock.url);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config);
+
+    expect(result.kind).toBe("success");
+    if (result.kind === "success") {
+      const body = await result.response.text();
+      expect(body).toBe("plain text response");
+      // Should default to 0 tokens (JSON parse fails gracefully)
+      const keys = km.listKeys();
+      expect(keys[0]!.stats.totalTokensIn).toBe(0);
+      expect(keys[0]!.stats.totalTokensOut).toBe(0);
+      expect(keys[0]!.stats.successfulRequests).toBe(1);
+    }
+  });
+
+  test("handles SSE stream with [DONE] marker", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    const sseData = [
+      'data: {"type":"message_start","message":{"usage":{"input_tokens":25}}}\n\n',
+      'data: {"type":"message_delta","usage":{"output_tokens":15}}\n\n',
+      "data: [DONE]\n\n",
+    ];
+
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream({
+      start(controller) {
+        for (const chunk of sseData) {
+          controller.enqueue(encoder.encode(chunk));
+        }
+        controller.close();
+      },
+    });
+
+    const mock = upstream(() =>
+      new Response(stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }),
+    );
+
+    const config = makeConfig(mock.url);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config);
+
+    expect(result.kind).toBe("success");
+    if (result.kind === "success") {
+      await result.response.text();
+      const keys = km.listKeys();
+      expect(keys[0]!.stats.totalTokensIn).toBe(25);
+      expect(keys[0]!.stats.totalTokensOut).toBe(15);
+    }
+  });
+
+  test("maxRetriesPerRequest of 1 means only one attempt", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    km.addKey(FAKE_KEY_B, "key-b");
+
+    let callCount = 0;
+    const mock = upstream(() => {
+      callCount++;
+      return new Response("rate limited", {
+        status: 429,
+        headers: { "retry-after": "10" },
+      });
+    });
+
+    const config = makeConfig(mock.url, { maxRetriesPerRequest: 1 });
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config);
+
+    expect(callCount).toBe(1);
+    expect(result.kind).toBe("all_exhausted");
+  });
+
+  test("success result includes usedKey reference", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    const mock = upstream(() => new Response("ok"));
+
+    const config = makeConfig(mock.url);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config);
+
+    expect(result.kind).toBe("success");
+    if (result.kind === "success") {
+      expect(result.usedKey.key).toBe(FAKE_KEY_A);
+      expect(result.usedKey.label).toBe("key-a");
+    }
+  });
+
+  test("error result includes usedKey reference", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    const mock = upstream(() =>
+      new Response("bad", { status: 400 }),
+    );
+
+    const config = makeConfig(mock.url);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config);
+
+    expect(result.kind).toBe("error");
+    if (result.kind === "error") {
+      expect(result.usedKey.key).toBe(FAKE_KEY_A);
+      expect(result.usedKey.label).toBe("key-a");
+    }
+  });
+
+  test("streaming tokens event emitted with user label on flush", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    const proxyUser = km.addToken("test-token-12345678", "alice");
+
+    const sseData = [
+      'data: {"type":"message_start","message":{"usage":{"input_tokens":50}}}\n\n',
+      'data: {"type":"message_delta","usage":{"output_tokens":25}}\n\n',
+    ];
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream({
+      start(controller) {
+        for (const chunk of sseData) {
+          controller.enqueue(encoder.encode(chunk));
+        }
+        controller.close();
+      },
+    });
+
+    const mock = upstream(() =>
+      new Response(stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }),
+    );
+
+    const config = makeConfig(mock.url);
+
+    // We need to collect events including those during stream consumption
+    const events: ProxyEvent[] = [];
+    const unsub = subscribe((e) => events.push(e));
+
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config, proxyUser);
+    expect(result.kind).toBe("success");
+    if (result.kind === "success") {
+      await result.response.text();
+    }
+
+    unsub();
+
+    const tokenEvents = events.filter((e) => e.type === "tokens");
+    expect(tokenEvents.length).toBe(1);
+    expect(tokenEvents[0]!.input).toBe(50);
+    expect(tokenEvents[0]!.output).toBe(25);
+    expect(tokenEvents[0]!.user).toBe("alice");
+  });
+
+  test("properly increments totalRequests on key for each attempt", async () => {
+    const { km } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    km.addKey(FAKE_KEY_B, "key-b");
+
+    const mock = upstream((req) => {
+      const key = req.headers.get("x-api-key");
+      if (key === FAKE_KEY_A) {
+        return new Response("rate limited", {
+          status: 429,
+          headers: { "retry-after": "60" },
+        });
+      }
+      return new Response("ok");
+    });
+
+    const config = makeConfig(mock.url);
+    await proxyRequest(makeRequest("/v1/messages"), km, config);
+
+    const keys = km.listKeys();
+    const keyA = keys.find((k) => k.label === "key-a")!;
+    const keyB = keys.find((k) => k.label === "key-b")!;
+
+    expect(keyA.stats.totalRequests).toBe(1);
+    expect(keyA.stats.rateLimitHits).toBe(1);
+    expect(keyB.stats.totalRequests).toBe(1);
+    expect(keyB.stats.successfulRequests).toBe(1);
+  });
+});

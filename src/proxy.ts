@@ -1,5 +1,5 @@
 import type { KeyManager } from "./key-manager.ts";
-import type { ProxyConfig, ProxyResult } from "./types.ts";
+import type { ProxyConfig, ProxyResult, ProxyTokenEntry } from "./types.ts";
 import { log } from "./logger.ts";
 import { emitWithKeys } from "./events.ts";
 
@@ -42,10 +42,13 @@ export async function proxyRequest(
   req: Request,
   keyManager: KeyManager,
   config: ProxyConfig,
+  proxyUser?: ProxyTokenEntry | null,
 ): Promise<ProxyResult> {
   if (keyManager.totalCount() === 0) {
     return { kind: "no_keys" };
   }
+
+  if (proxyUser) keyManager.recordTokenRequest(proxyUser);
 
   const url = new URL(req.url);
 
@@ -56,10 +59,12 @@ export async function proxyRequest(
     const entry = keyManager.getNextAvailableKey();
 
     if (entry === null) {
+      if (proxyUser) keyManager.recordTokenError(proxyUser);
       return allExhaustedResult(keyManager);
     }
 
     if (triedKeys.has(entry.key)) {
+      if (proxyUser) keyManager.recordTokenError(proxyUser);
       return allExhaustedResult(keyManager);
     }
 
@@ -72,6 +77,7 @@ export async function proxyRequest(
 
     log("info", "Proxying request", {
       label: entry.label,
+      user: proxyUser?.label,
       method: req.method,
       path: url.pathname,
       attempt: attempts,
@@ -79,6 +85,7 @@ export async function proxyRequest(
     });
     emitWithKeys({
       type: "request", ts: new Date().toISOString(), label: entry.label,
+      user: proxyUser?.label,
       method: req.method, path: url.pathname, attempt: attempts,
     }, keyManager.listKeys());
 
@@ -87,13 +94,15 @@ export async function proxyRequest(
       upstream = await fetchUpstream(upstreamUrl, req.method, headers, req.body);
     } catch (err) {
       keyManager.recordError(entry);
+      if (proxyUser) keyManager.recordTokenError(proxyUser);
       log("error", "Upstream fetch failed", {
         label: entry.label,
+        user: proxyUser?.label,
         error: String(err),
       });
       emitWithKeys({
         type: "error", ts: new Date().toISOString(), label: entry.label,
-        error: String(err),
+        user: proxyUser?.label, error: String(err),
       }, keyManager.listKeys());
       return {
         kind: "error",
@@ -105,11 +114,12 @@ export async function proxyRequest(
 
     log("info", "Upstream responded", {
       label: entry.label,
+      user: proxyUser?.label,
       status: upstream.status,
     });
     emitWithKeys({
       type: "response", ts: new Date().toISOString(), label: entry.label,
-      status: upstream.status,
+      user: proxyUser?.label, status: upstream.status,
     }, keyManager.listKeys());
 
     if (upstream.status === RATE_LIMIT_STATUS) {
@@ -119,27 +129,30 @@ export async function proxyRequest(
 
       log("info", "Rate limited, trying next key", {
         label: entry.label,
+        user: proxyUser?.label,
         retryAfter,
         availableKeys: keyManager.availableCount(),
       });
       emitWithKeys({
         type: "rate_limit", ts: new Date().toISOString(), label: entry.label,
-        retryAfter, availableKeys: keyManager.availableCount(),
+        user: proxyUser?.label, retryAfter, availableKeys: keyManager.availableCount(),
       }, keyManager.listKeys());
       continue;
     }
 
     if (upstream.status >= 400) {
       keyManager.recordError(entry);
+      if (proxyUser) keyManager.recordTokenError(proxyUser);
       const body = await upstream.text();
       log("warn", "Upstream error", {
         label: entry.label,
+        user: proxyUser?.label,
         status: upstream.status,
         body: body.slice(0, 500),
       });
       emitWithKeys({
         type: "error", ts: new Date().toISOString(), label: entry.label,
-        status: upstream.status,
+        user: proxyUser?.label, status: upstream.status,
       }, keyManager.listKeys());
       return { kind: "error", status: upstream.status, body, usedKey: entry };
     }
@@ -155,13 +168,14 @@ export async function proxyRequest(
     let body: ReadableStream<Uint8Array> | string | null;
 
     if (isStreaming && upstream.body !== null) {
-      body = createTokenTrackingStream(upstream.body, entry, keyManager);
+      body = createTokenTrackingStream(upstream.body, entry, keyManager, proxyUser);
     } else if (upstream.body !== null) {
       const text = await upstream.text();
-      extractTokensFromJson(text, entry, keyManager);
+      extractTokensFromJson(text, entry, keyManager, proxyUser);
       body = text;
     } else {
       keyManager.recordSuccess(entry, 0, 0);
+      if (proxyUser) keyManager.recordTokenSuccess(proxyUser, 0, 0);
       body = null;
     }
 
@@ -174,6 +188,7 @@ export async function proxyRequest(
     return { kind: "success", response: proxiedResponse, usedKey: entry };
   }
 
+  if (proxyUser) keyManager.recordTokenError(proxyUser);
   return allExhaustedResult(keyManager);
 }
 
@@ -247,21 +262,24 @@ function extractTokensFromJson(
   text: string,
   entry: import("./types.ts").ApiKeyEntry,
   keyManager: KeyManager,
+  proxyUser?: ProxyTokenEntry | null,
 ): void {
   try {
     const parsed = JSON.parse(text) as AnthropicResponse;
     const input = parsed.usage?.input_tokens ?? 0;
     const output = parsed.usage?.output_tokens ?? 0;
     keyManager.recordSuccess(entry, input, output);
+    if (proxyUser) keyManager.recordTokenSuccess(proxyUser, input, output);
     if (input > 0 || output > 0) {
-      log("info", "Token usage", { label: entry.label, input, output });
+      log("info", "Token usage", { label: entry.label, user: proxyUser?.label, input, output });
       emitWithKeys({
         type: "tokens", ts: new Date().toISOString(), label: entry.label,
-        input, output,
+        user: proxyUser?.label, input, output,
       }, keyManager.listKeys());
     }
   } catch {
     keyManager.recordSuccess(entry, 0, 0);
+    if (proxyUser) keyManager.recordTokenSuccess(proxyUser, 0, 0);
   }
 }
 
@@ -274,6 +292,7 @@ function createTokenTrackingStream(
   source: ReadableStream<Uint8Array>,
   entry: import("./types.ts").ApiKeyEntry,
   keyManager: KeyManager,
+  proxyUser?: ProxyTokenEntry | null,
 ): ReadableStream<Uint8Array> {
   const decoder = new TextDecoder();
   let buffer = "";
@@ -309,15 +328,17 @@ function createTokenTrackingStream(
 
     flush() {
       keyManager.recordSuccess(entry, inputTokens, outputTokens);
+      if (proxyUser) keyManager.recordTokenSuccess(proxyUser, inputTokens, outputTokens);
       if (inputTokens > 0 || outputTokens > 0) {
         log("info", "Token usage (stream)", {
           label: entry.label,
+          user: proxyUser?.label,
           input: inputTokens,
           output: outputTokens,
         });
         emitWithKeys({
           type: "tokens", ts: new Date().toISOString(), label: entry.label,
-          input: inputTokens, output: outputTokens,
+          user: proxyUser?.label, input: inputTokens, output: outputTokens,
         }, keyManager.listKeys());
       }
     },

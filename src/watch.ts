@@ -138,7 +138,8 @@ function render(
   for (const e of visible) {
     const time = `${GRAY}${fmtTime(e.ts)}${RST}`;
     const lbl = e.label ? pad(`${keyColor(e.label)}${e.label}${RST}`, 10) : pad(`${DIM}system${RST}`, 10);
-    logLines.push(`  ${time}  ${lbl}  ${fmtEvent(e, cols)}`);
+    const usr = e["user"] ? pad(`${WHITE}${e["user"]}${RST}`, 10) : pad("", 10);
+    logLines.push(`  ${time}  ${lbl}  ${usr}  ${fmtEvent(e, cols)}`);
   }
   while (logLines.length < logRows) logLines.push("");
 

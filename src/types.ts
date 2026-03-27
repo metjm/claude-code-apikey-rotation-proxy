@@ -6,6 +6,7 @@ type Brand<T, B extends string> = T & { readonly [__brand]: B };
 
 export type ApiKey = Brand<string, "ApiKey">;
 export type KeyLabel = Brand<string, "KeyLabel">;
+export type ProxyToken = Brand<string, "ProxyToken">;
 export type UnixMs = Brand<number, "UnixMs">;
 
 export function asApiKey(raw: string): ApiKey {
@@ -17,6 +18,13 @@ export function asApiKey(raw: string): ApiKey {
 
 export function asKeyLabel(raw: string): KeyLabel {
   return raw as KeyLabel;
+}
+
+export function asProxyToken(raw: string): ProxyToken {
+  if (raw.length < 8) {
+    throw new TypeError("Proxy token must be at least 8 characters");
+  }
+  return raw as ProxyToken;
 }
 
 export function now(): UnixMs {
@@ -56,11 +64,36 @@ export interface MaskedKeyEntry {
   readonly isAvailable: boolean;
 }
 
+// ── Proxy token entry ─────────────────────────────────────────────
+
+export interface ProxyTokenStats {
+  readonly totalRequests: number;
+  readonly successfulRequests: number;
+  readonly errors: number;
+  readonly lastUsedAt: UnixMs | null;
+  readonly addedAt: UnixMs;
+  readonly totalTokensIn: number;
+  readonly totalTokensOut: number;
+}
+
+export interface ProxyTokenEntry {
+  readonly token: ProxyToken;
+  readonly label: string;
+  stats: ProxyTokenStats;
+}
+
+export interface MaskedTokenEntry {
+  readonly maskedToken: string;
+  readonly label: string;
+  readonly stats: ProxyTokenStats;
+}
+
 // ── Persisted state ───────────────────────────────────────────────
 
 export interface StoredState {
   readonly version: 1;
   readonly keys: readonly ApiKeyEntry[];
+  readonly tokens?: readonly ProxyTokenEntry[];
 }
 
 // ── Proxy result (discriminated union) ────────────────────────────
@@ -104,6 +137,11 @@ export type ProxyResult =
 
 export interface AddKeyRequest {
   readonly key: string;
+  readonly label?: string | undefined;
+}
+
+export interface AddTokenRequest {
+  readonly token: string;
   readonly label?: string | undefined;
 }
 

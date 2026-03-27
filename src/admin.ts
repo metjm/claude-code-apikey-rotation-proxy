@@ -1,5 +1,5 @@
 import type { KeyManager } from "./key-manager.ts";
-import type { ProxyConfig, AddKeyRequest } from "./types.ts";
+import type { ProxyConfig, AddKeyRequest, AddTokenRequest } from "./types.ts";
 import { log } from "./logger.ts";
 import { subscribe, type ProxyEvent } from "./events.ts";
 
@@ -19,6 +19,17 @@ const routes: ReadonlyMap<string, ReadonlyMap<string, RouteHandler>> = new Map([
   [
     "/admin/keys/remove",
     new Map<string, RouteHandler>([["POST", handleRemoveKey]]),
+  ],
+  [
+    "/admin/tokens",
+    new Map<string, RouteHandler>([
+      ["GET", handleListTokens],
+      ["POST", handleAddToken],
+    ]),
+  ],
+  [
+    "/admin/tokens/remove",
+    new Map<string, RouteHandler>([["POST", handleRemoveToken]]),
   ],
   [
     "/admin/stats",
@@ -124,6 +135,62 @@ async function handleRemoveKey(
   return json({ removed: true });
 }
 
+// ── Token handlers ────────────────────────────────────────────────
+
+function handleListTokens(
+  _req: Request,
+  keyManager: KeyManager,
+): Response {
+  return json({ tokens: keyManager.listTokens() });
+}
+
+async function handleAddToken(
+  req: Request,
+  keyManager: KeyManager,
+): Promise<Response> {
+  const body = await parseJsonBody<AddTokenRequest>(req);
+  if (body === null) {
+    return json({ error: "Invalid JSON body" }, 400);
+  }
+
+  if (typeof body.token !== "string" || body.token.length === 0) {
+    return json({ error: "Missing or empty 'token' field" }, 400);
+  }
+
+  if (body.label !== undefined && typeof body.label !== "string") {
+    return json({ error: "'label' must be a string" }, 400);
+  }
+
+  try {
+    const entry = keyManager.addToken(body.token, body.label);
+    return json({
+      added: {
+        label: entry.label,
+      },
+    }, 201);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    log("warn", "Failed to add token", { error: message });
+    return json({ error: message }, 400);
+  }
+}
+
+async function handleRemoveToken(
+  req: Request,
+  keyManager: KeyManager,
+): Promise<Response> {
+  const body = await parseJsonBody<{ token: string }>(req);
+  if (body === null || typeof body.token !== "string") {
+    return json({ error: "Invalid JSON body — need 'token' field" }, 400);
+  }
+
+  const removed = keyManager.removeToken(body.token);
+  if (!removed) {
+    return json({ error: "Token not found" }, 404);
+  }
+  return json({ removed: true });
+}
+
 function handleStats(
   _req: Request,
   keyManager: KeyManager,
@@ -164,7 +231,7 @@ function handleEvents(
     start(controller) {
       function sendKeys() {
         try {
-          const ev: ProxyEvent = { type: "keys", ts: new Date().toISOString(), keys: keyManager.listKeys() };
+          const ev: ProxyEvent = { type: "keys", ts: new Date().toISOString(), keys: keyManager.listKeys(), tokens: keyManager.listTokens() };
           controller.enqueue(`data: ${JSON.stringify(ev)}\n\n`);
         } catch {}
       }
