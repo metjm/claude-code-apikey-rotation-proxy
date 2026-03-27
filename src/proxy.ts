@@ -81,7 +81,7 @@ export async function proxyRequest(
       method: req.method,
       path: url.pathname,
       attempt: attempts,
-      authType: isOAuthToken(entry.key) ? "bearer" : "x-api-key",
+      authType: "x-api-key",
     });
     emitWithKeys({
       type: "request", ts: new Date().toISOString(), label: entry.label,
@@ -212,11 +212,6 @@ function fetchUpstream(
   return fetch(url, { method, headers, body, duplex: "half" } satisfies BunFetchRequestInit);
 }
 
-/** OAuth tokens (sk-ant-oat-*) use Bearer auth; regular API keys use x-api-key. */
-function isOAuthToken(key: string): boolean {
-  return key.startsWith("sk-ant-oat");
-}
-
 function buildUpstreamHeaders(incoming: Headers, apiKey: string): Headers {
   const headers = new Headers();
   for (const [key, value] of incoming.entries()) {
@@ -225,12 +220,7 @@ function buildUpstreamHeaders(incoming: Headers, apiKey: string): Headers {
     }
   }
 
-  if (isOAuthToken(apiKey)) {
-    headers.set("authorization", `Bearer ${apiKey}`);
-  } else {
-    headers.set("x-api-key", apiKey);
-  }
-
+  headers.set("x-api-key", apiKey);
   headers.set("anthropic-version", incoming.get("anthropic-version") ?? "2023-06-01");
   return headers;
 }
