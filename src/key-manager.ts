@@ -525,12 +525,22 @@ export class KeyManager {
 
   getCurrentBucket(): TimeseriesBucket {
     const bucket = currentBucketKey();
-    const key = `${bucket}|__all__|__all__`;
-    const acc = this.tsAccumulator.get(key);
-    if (!acc) {
-      return { bucket, requests: 0, successes: 0, errors: 0, rateLimits: 0, tokensIn: 0, tokensOut: 0 };
-    }
-    return { bucket, ...acc };
+
+    const row = this.db.query(
+      "SELECT requests, successes, errors, rate_limits, tokens_in, tokens_out FROM stats_timeseries WHERE bucket = ? AND key_label = '__all__' AND user_label = '__all__'"
+    ).get(bucket) as { requests: number; successes: number; errors: number; rate_limits: number; tokens_in: number; tokens_out: number } | null;
+
+    const acc = this.tsAccumulator.get(`${bucket}|__all__|__all__`);
+
+    return {
+      bucket,
+      requests:   (row?.requests ?? 0)     + (acc?.requests ?? 0),
+      successes:  (row?.successes ?? 0)    + (acc?.successes ?? 0),
+      errors:     (row?.errors ?? 0)       + (acc?.errors ?? 0),
+      rateLimits: (row?.rate_limits ?? 0)  + (acc?.rateLimits ?? 0),
+      tokensIn:   (row?.tokens_in ?? 0)    + (acc?.tokensIn ?? 0),
+      tokensOut:  (row?.tokens_out ?? 0)   + (acc?.tokensOut ?? 0),
+    };
   }
 
   queryTimeseries(opts: TimeseriesQuery): TimeseriesBucket[] {
