@@ -84,6 +84,11 @@ function startServer(): void {
       if (url.pathname === "/dashboard" || url.pathname === "/dashboard/") {
         return new Response(Bun.file(join(import.meta.dir, "../public/dashboard.html")));
       }
+      if (url.pathname === "/dashboard/chart.umd.min.js") {
+        return new Response(Bun.file(join(import.meta.dir, "../public/chart.umd.min.js")), {
+          headers: { "content-type": "application/javascript" },
+        });
+      }
 
       const adminResponse = handleAdminRoute(req, keyManager, config);
       if (adminResponse !== null) {

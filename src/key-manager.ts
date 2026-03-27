@@ -12,6 +12,8 @@ import {
   type ProxyTokenEntry,
   type ProxyTokenStats,
   type StoredState,
+  type TimeseriesBucket,
+  type TimeseriesQuery,
   type UnixMs,
   asApiKey,
   asKeyLabel,
@@ -51,12 +53,30 @@ interface TokenRow {
 
 // ── KeyManager ────────────────────────────────────────────────────
 
+interface BucketAccumulator {
+  requests: number;
+  successes: number;
+  errors: number;
+  rateLimits: number;
+  tokensIn: number;
+  tokensOut: number;
+}
+
+function emptyBucket(): BucketAccumulator {
+  return { requests: 0, successes: 0, errors: 0, rateLimits: 0, tokensIn: 0, tokensOut: 0 };
+}
+
+function currentBucketKey(): string {
+  return new Date().toISOString().slice(0, 13);
+}
+
 export class KeyManager {
   private keys: ApiKeyEntry[] = [];
   private tokens: ProxyTokenEntry[] = [];
   private readonly db: Database;
   private readonly dbPath: string;
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly tsAccumulator = new Map<string, BucketAccumulator>();
 
   constructor(dataDir: string, opts?: { registerShutdownHandler?: boolean }) {
     this.dbPath = process.env["DB_PATH"] ?? join(dataDir, "state.db");
@@ -69,6 +89,8 @@ export class KeyManager {
     this.initSchema();
     this.migrateFromJson(dataDir);
     this.loadFromDb();
+
+    setInterval(() => this.cleanupOldTimeseries(), 60 * 60 * 1000);
 
     if (opts?.registerShutdownHandler) {
       const flush = () => this.flushAndExit();
@@ -116,6 +138,21 @@ export class KeyManager {
         total_tokens_in INTEGER NOT NULL DEFAULT 0,
         total_tokens_out INTEGER NOT NULL DEFAULT 0
       );
+
+      CREATE TABLE IF NOT EXISTS stats_timeseries (
+        bucket       TEXT NOT NULL,
+        key_label    TEXT NOT NULL,
+        user_label   TEXT NOT NULL,
+        requests     INTEGER NOT NULL DEFAULT 0,
+        successes    INTEGER NOT NULL DEFAULT 0,
+        errors       INTEGER NOT NULL DEFAULT 0,
+        rate_limits  INTEGER NOT NULL DEFAULT 0,
+        tokens_in    INTEGER NOT NULL DEFAULT 0,
+        tokens_out   INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (bucket, key_label, user_label)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_stats_ts_bucket ON stats_timeseries(bucket);
     `);
   }
 
@@ -221,6 +258,7 @@ export class KeyManager {
       totalRequests: entry.stats.totalRequests + 1,
       lastUsedAt: now(),
     };
+    this.tsIncrement(entry.label, "__all__", "requests");
     this.scheduleSave();
   }
 
@@ -231,6 +269,8 @@ export class KeyManager {
       totalTokensIn: entry.stats.totalTokensIn + tokensIn,
       totalTokensOut: entry.stats.totalTokensOut + tokensOut,
     };
+    this.tsIncrement(entry.label, "__all__", "successes");
+    this.tsAddTokens(entry.label, "__all__", tokensIn, tokensOut);
     this.scheduleSave();
   }
 
@@ -241,6 +281,7 @@ export class KeyManager {
       rateLimitHits: entry.stats.rateLimitHits + 1,
     };
     entry.availableAt = unixMs(Date.now() + waitMs);
+    this.tsIncrement(entry.label, "__all__", "rateLimits");
     log("warn", "Key rate-limited", {
       label: entry.label,
       retryAfterSecs,
@@ -254,6 +295,7 @@ export class KeyManager {
       ...entry.stats,
       errors: entry.stats.errors + 1,
     };
+    this.tsIncrement(entry.label, "__all__", "errors");
     this.scheduleSave();
   }
 
@@ -421,6 +463,7 @@ export class KeyManager {
       totalRequests: entry.stats.totalRequests + 1,
       lastUsedAt: now(),
     };
+    this.tsIncrement("__all__", entry.label, "requests");
     this.scheduleSave();
   }
 
@@ -431,6 +474,8 @@ export class KeyManager {
       totalTokensIn: entry.stats.totalTokensIn + tokensIn,
       totalTokensOut: entry.stats.totalTokensOut + tokensOut,
     };
+    this.tsIncrement("__all__", entry.label, "successes");
+    this.tsAddTokens("__all__", entry.label, tokensIn, tokensOut);
     this.scheduleSave();
   }
 
@@ -439,7 +484,105 @@ export class KeyManager {
       ...entry.stats,
       errors: entry.stats.errors + 1,
     };
+    this.tsIncrement("__all__", entry.label, "errors");
     this.scheduleSave();
+  }
+
+  // ── Timeseries helpers ──────────────────────────────────────────
+
+  private tsIncrement(keyLabel: string, userLabel: string, field: keyof Omit<BucketAccumulator, "tokensIn" | "tokensOut">): void {
+    const bucket = currentBucketKey();
+    const mapKey = `${bucket}|${keyLabel}|${userLabel}`;
+    const acc = this.tsAccumulator.get(mapKey) ?? emptyBucket();
+    acc[field]++;
+    this.tsAccumulator.set(mapKey, acc);
+
+    const globalKey = `${bucket}|__all__|__all__`;
+    if (mapKey !== globalKey) {
+      const global = this.tsAccumulator.get(globalKey) ?? emptyBucket();
+      global[field]++;
+      this.tsAccumulator.set(globalKey, global);
+    }
+  }
+
+  private tsAddTokens(keyLabel: string, userLabel: string, tokensIn: number, tokensOut: number): void {
+    if (tokensIn === 0 && tokensOut === 0) return;
+    const bucket = currentBucketKey();
+    const mapKey = `${bucket}|${keyLabel}|${userLabel}`;
+    const acc = this.tsAccumulator.get(mapKey) ?? emptyBucket();
+    acc.tokensIn += tokensIn;
+    acc.tokensOut += tokensOut;
+    this.tsAccumulator.set(mapKey, acc);
+
+    const globalKey = `${bucket}|__all__|__all__`;
+    if (mapKey !== globalKey) {
+      const global = this.tsAccumulator.get(globalKey) ?? emptyBucket();
+      global.tokensIn += tokensIn;
+      global.tokensOut += tokensOut;
+      this.tsAccumulator.set(globalKey, global);
+    }
+  }
+
+  getCurrentBucket(): TimeseriesBucket {
+    const bucket = currentBucketKey();
+    const key = `${bucket}|__all__|__all__`;
+    const acc = this.tsAccumulator.get(key);
+    if (!acc) {
+      return { bucket, requests: 0, successes: 0, errors: 0, rateLimits: 0, tokensIn: 0, tokensOut: 0 };
+    }
+    return { bucket, ...acc };
+  }
+
+  queryTimeseries(opts: TimeseriesQuery): TimeseriesBucket[] {
+    const hours = Math.min(opts.hours ?? 24, 720);
+    const resolution = opts.resolution ?? "hour";
+    const cutoff = new Date(Date.now() - hours * 60 * 60 * 1000).toISOString().slice(0, 13);
+
+    const groupExpr = resolution === "day" ? "substr(bucket, 1, 10)" : "bucket";
+    const conditions = ["bucket >= ?"];
+    const params: (string | null)[] = [cutoff];
+
+    if (opts.keyLabel) {
+      conditions.push("key_label = ?");
+      params.push(opts.keyLabel);
+    }
+    if (opts.userLabel) {
+      conditions.push("user_label = ?");
+      params.push(opts.userLabel);
+    }
+    if (!opts.keyLabel && !opts.userLabel) {
+      conditions.push("key_label = '__all__' AND user_label = '__all__'");
+    }
+
+    const sql = `
+      SELECT ${groupExpr} AS b,
+        SUM(requests) AS requests, SUM(successes) AS successes,
+        SUM(errors) AS errors, SUM(rate_limits) AS rate_limits,
+        SUM(tokens_in) AS tokens_in, SUM(tokens_out) AS tokens_out
+      FROM stats_timeseries
+      WHERE ${conditions.join(" AND ")}
+      GROUP BY b ORDER BY b
+    `;
+
+    const rows = this.db.query(sql).all(...params) as Array<{
+      b: string; requests: number; successes: number; errors: number;
+      rate_limits: number; tokens_in: number; tokens_out: number;
+    }>;
+
+    return rows.map((r) => ({
+      bucket: r.b,
+      requests: r.requests,
+      successes: r.successes,
+      errors: r.errors,
+      rateLimits: r.rate_limits,
+      tokensIn: r.tokens_in,
+      tokensOut: r.tokens_out,
+    }));
+  }
+
+  private cleanupOldTimeseries(): void {
+    const cutoff = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 13);
+    this.db.run("DELETE FROM stats_timeseries WHERE bucket < ?", [cutoff]);
   }
 
   // ── Persistence ─────────────────────────────────────────────────
@@ -466,6 +609,17 @@ export class KeyManager {
         last_used_at = ?, total_tokens_in = ?, total_tokens_out = ?
       WHERE token = ?
     `);
+    const upsertTs = this.db.prepare(`
+      INSERT INTO stats_timeseries (bucket, key_label, user_label, requests, successes, errors, rate_limits, tokens_in, tokens_out)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(bucket, key_label, user_label) DO UPDATE SET
+        requests    = requests    + excluded.requests,
+        successes   = successes   + excluded.successes,
+        errors      = errors      + excluded.errors,
+        rate_limits = rate_limits + excluded.rate_limits,
+        tokens_in   = tokens_in   + excluded.tokens_in,
+        tokens_out  = tokens_out  + excluded.tokens_out
+    `);
 
     this.db.transaction(() => {
       for (const k of this.keys) {
@@ -482,6 +636,11 @@ export class KeyManager {
           t.token,
         );
       }
+      for (const [mapKey, acc] of this.tsAccumulator) {
+        const [bucket, keyLabel, userLabel] = mapKey.split("|");
+        upsertTs.run(bucket, keyLabel, userLabel, acc.requests, acc.successes, acc.errors, acc.rateLimits, acc.tokensIn, acc.tokensOut);
+      }
+      this.tsAccumulator.clear();
     })();
   }
 }

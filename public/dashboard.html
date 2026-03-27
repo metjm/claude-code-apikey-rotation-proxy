@@ -205,6 +205,28 @@
     </div>
   </div>
 
+  <!-- Charts -->
+  <div class="panels" id="charts-section">
+    <div class="panel" style="min-height:280px">
+      <div class="panel-header">
+        <span class="panel-title">Requests &amp; Errors</span>
+        <select id="chart-range" class="btn" onchange="loadCharts()" style="appearance:auto;padding-right:8px">
+          <option value="24">24h</option>
+          <option value="72">3d</option>
+          <option value="168">7d</option>
+          <option value="720">30d</option>
+        </select>
+      </div>
+      <div style="flex:1;position:relative;min-height:200px"><canvas id="chart-requests"></canvas></div>
+    </div>
+    <div class="panel" style="min-height:280px">
+      <div class="panel-header">
+        <span class="panel-title">Token Usage</span>
+      </div>
+      <div style="flex:1;position:relative;min-height:200px"><canvas id="chart-tokens"></canvas></div>
+    </div>
+  </div>
+
   <!-- Setup Instructions -->
   <div class="log-panel" style="margin-bottom:16px">
     <div class="log-header" style="cursor:pointer" onclick="document.getElementById('setup-body').classList.toggle('collapsed')">
@@ -245,7 +267,14 @@
   </div>
 </div>
 
+<script src="/dashboard/chart.umd.min.js"></script>
 <script>
+// ── Chart.js defaults (dark theme) ────────────────────────────
+Chart.defaults.color = '#8b949e';
+Chart.defaults.borderColor = '#30363d';
+Chart.defaults.font.family = "'SF Mono', 'Cascadia Code', monospace";
+Chart.defaults.font.size = 11;
+
 // ── State ──────────────────────────────────────────────────────
 let adminToken = sessionStorage.getItem('adminToken') || '';
 let keys = [];
@@ -484,6 +513,9 @@ function connectSSE() {
         tokens = event.tokens;
         renderTokens();
       }
+      if (event.currentBucket) {
+        updateChartLastBucket(event.currentBucket);
+      }
       // Log non-heartbeat events
       if (event.type !== 'keys') {
         addLogEntry(event);
@@ -654,12 +686,123 @@ new MutationObserver(() => {
 }).observe(document.getElementById('setup-body'), { attributes: true, attributeFilter: ['class'] });
 renderSetupSnippet();
 
+// ── Charts ─────────────────────────────────────────────────────
+let requestsChart = null;
+let tokensChart = null;
+
+function formatBucketLabel(bucket, resolution) {
+  if (resolution === 'day') return bucket;
+  const h = bucket.slice(11, 13);
+  const d = bucket.slice(5, 10);
+  return `${d} ${h}:00`;
+}
+
+function fillGaps(buckets, hours, resolution) {
+  const map = new Map(buckets.map(b => [b.bucket, b]));
+  const filled = [];
+  const now = new Date();
+
+  if (resolution === 'day') {
+    const days = Math.ceil(hours / 24);
+    for (let i = days - 1; i >= 0; i--) {
+      const d = new Date(now.getTime() - i * 86400000);
+      const key = d.toISOString().slice(0, 10);
+      filled.push(map.get(key) ?? { bucket: key, requests: 0, successes: 0, errors: 0, rateLimits: 0, tokensIn: 0, tokensOut: 0 });
+    }
+  } else {
+    for (let i = hours - 1; i >= 0; i--) {
+      const d = new Date(now.getTime() - i * 3600000);
+      const key = d.toISOString().slice(0, 13);
+      filled.push(map.get(key) ?? { bucket: key, requests: 0, successes: 0, errors: 0, rateLimits: 0, tokensIn: 0, tokensOut: 0 });
+    }
+  }
+  return filled;
+}
+
+async function loadCharts() {
+  const hours = Number(document.getElementById('chart-range').value);
+  const resolution = hours > 72 ? 'day' : 'hour';
+
+  let data;
+  try {
+    data = await api('GET', `/admin/stats/timeseries?hours=${hours}&resolution=${resolution}`);
+  } catch { return; }
+
+  const filled = fillGaps(data.buckets, hours, resolution);
+  const labels = filled.map(b => formatBucketLabel(b.bucket, resolution));
+
+  if (requestsChart) requestsChart.destroy();
+  if (tokensChart) tokensChart.destroy();
+
+  requestsChart = new Chart(document.getElementById('chart-requests'), {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [
+        { label: 'Successes', data: filled.map(b => b.successes), backgroundColor: '#3fb950' },
+        { label: 'Rate Limits', data: filled.map(b => b.rateLimits), backgroundColor: '#d29922' },
+        { label: 'Errors', data: filled.map(b => b.errors), backgroundColor: '#f85149' },
+      ]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      scales: { x: { stacked: true, ticks: { maxRotation: 45, maxTicksLimit: 24 } }, y: { stacked: true, beginAtZero: true } },
+      plugins: { legend: { position: 'bottom', labels: { boxWidth: 12 } } }
+    }
+  });
+
+  tokensChart = new Chart(document.getElementById('chart-tokens'), {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [
+        { label: 'Tokens In', data: filled.map(b => b.tokensIn), borderColor: '#58a6ff', backgroundColor: 'rgba(88,166,255,0.1)', tension: 0.3, fill: true, pointRadius: 0 },
+        { label: 'Tokens Out', data: filled.map(b => b.tokensOut), borderColor: '#39d2c0', backgroundColor: 'rgba(57,210,192,0.1)', tension: 0.3, fill: true, pointRadius: 0 },
+      ]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      scales: { x: { ticks: { maxRotation: 45, maxTicksLimit: 24 } }, y: { beginAtZero: true } },
+      plugins: { legend: { position: 'bottom', labels: { boxWidth: 12 } } }
+    }
+  });
+}
+
+function updateChartLastBucket(bucket) {
+  if (!requestsChart || !tokensChart) return;
+  const hours = Number(document.getElementById('chart-range').value);
+  if (hours > 72) return;
+
+  const resolution = 'hour';
+  const labels = requestsChart.data.labels;
+  const bucketLabel = formatBucketLabel(bucket.bucket, resolution);
+  const lastLabel = labels[labels.length - 1];
+
+  if (lastLabel === bucketLabel) {
+    const i = labels.length - 1;
+    requestsChart.data.datasets[0].data[i] = bucket.successes;
+    requestsChart.data.datasets[1].data[i] = bucket.rateLimits;
+    requestsChart.data.datasets[2].data[i] = bucket.errors;
+    tokensChart.data.datasets[0].data[i] = bucket.tokensIn;
+    tokensChart.data.datasets[1].data[i] = bucket.tokensOut;
+  } else {
+    labels.push(bucketLabel);
+    requestsChart.data.datasets[0].data.push(bucket.successes);
+    requestsChart.data.datasets[1].data.push(bucket.rateLimits);
+    requestsChart.data.datasets[2].data.push(bucket.errors);
+    tokensChart.data.datasets[0].data.push(bucket.tokensIn);
+    tokensChart.data.datasets[1].data.push(bucket.tokensOut);
+  }
+  requestsChart.update('none');
+  tokensChart.update('none');
+}
+
 // ── Init ───────────────────────────────────────────────────────
 let countdownInterval = null;
 function init() {
   connectSSE();
   refreshTokens();
-  // Re-render keys every second to update countdowns
+  loadCharts();
   if (countdownInterval) clearInterval(countdownInterval);
   countdownInterval = setInterval(() => { renderKeys(); renderHeader(); }, 1000);
 }

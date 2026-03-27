@@ -155,6 +155,25 @@ export interface ProxyConfig {
   readonly maxRetriesPerRequest: number;
 }
 
+// ── Timeseries statistics ────────────────────────────────────────
+
+export interface TimeseriesBucket {
+  readonly bucket: string;
+  readonly requests: number;
+  readonly successes: number;
+  readonly errors: number;
+  readonly rateLimits: number;
+  readonly tokensIn: number;
+  readonly tokensOut: number;
+}
+
+export interface TimeseriesQuery {
+  readonly hours?: number;
+  readonly keyLabel?: string;
+  readonly userLabel?: string;
+  readonly resolution?: "hour" | "day";
+}
+
 // ── Logging ───────────────────────────────────────────────────────
 
 export type LogLevel = "info" | "warn" | "error" | "debug";

@@ -44,6 +44,10 @@ const routes: ReadonlyMap<string, ReadonlyMap<string, RouteHandler>> = new Map([
     new Map<string, RouteHandler>([["GET", handleStats]]),
   ],
   [
+    "/admin/stats/timeseries",
+    new Map<string, RouteHandler>([["GET", handleTimeseriesStats]]),
+  ],
+  [
     "/admin/health",
     new Map<string, RouteHandler>([["GET", handleHealth]]),
   ],
@@ -301,6 +305,20 @@ function handleStats(
   });
 }
 
+function handleTimeseriesStats(
+  req: Request,
+  keyManager: KeyManager,
+): Response {
+  const url = new URL(req.url);
+  const hours = Math.min(Number(url.searchParams.get("hours") ?? 24), 720);
+  const resolution = url.searchParams.get("resolution") === "day" ? "day" as const : "hour" as const;
+  const keyLabel = url.searchParams.get("key") ?? undefined;
+  const userLabel = url.searchParams.get("user") ?? undefined;
+
+  const buckets = keyManager.queryTimeseries({ hours, resolution, keyLabel, userLabel });
+  return json({ resolution, buckets });
+}
+
 function handleEvents(
   _req: Request,
   keyManager: KeyManager,
@@ -309,7 +327,11 @@ function handleEvents(
     start(controller) {
       function sendKeys() {
         try {
-          const ev: ProxyEvent = { type: "keys", ts: new Date().toISOString(), keys: keyManager.listKeys(), tokens: keyManager.listTokens() };
+          const ev: ProxyEvent = {
+            type: "keys", ts: new Date().toISOString(),
+            keys: keyManager.listKeys(), tokens: keyManager.listTokens(),
+            currentBucket: keyManager.getCurrentBucket(),
+          };
           controller.enqueue(`data: ${JSON.stringify(ev)}\n\n`);
         } catch {}
       }
