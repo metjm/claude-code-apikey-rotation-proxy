@@ -370,18 +370,28 @@ function esc(s) { const d = document.createElement('div'); d.textContent = s; re
 
 // ── Render keys ────────────────────────────────────────────────
 function renderKeys() {
-  // Don't nuke the DOM while a dropdown is open
-  if (document.activeElement && document.activeElement.classList.contains('priority-select')) return;
   const el = document.getElementById('key-cards');
   if (keys.length === 0) {
     el.innerHTML = '<div class="empty-state">No API keys configured</div>';
     return;
   }
   const totalReqs = keys.reduce((s, k) => s + k.stats.totalRequests, 0);
-  el.innerHTML = keys.map(k => {
+  const wantedKeys = new Set(keys.map(k => k.maskedKey));
+
+  // Remove cards for keys that no longer exist
+  for (const card of [...el.querySelectorAll('.card')]) {
+    if (!wantedKeys.has(card.dataset.key)) card.remove();
+  }
+
+  // Remove empty-state placeholder if present
+  const empty = el.querySelector('.empty-state');
+  if (empty) empty.remove();
+
+  keys.forEach(k => {
     const ratio = totalReqs > 0 ? k.stats.totalRequests / totalReqs : 0;
     const cc = keyColor(k.label);
     const isAvail = k.isAvailable;
+    const pri = k.priority || 2;
     let badge;
     if (isAvail) {
       badge = '<span class="badge badge-ok">OK</span>';
@@ -389,28 +399,58 @@ function renderKeys() {
       const rem = k.availableAt - Date.now();
       badge = `<span class="badge badge-ratelimited">RATE-LTD ${rem > 0 ? fmtCountdown(rem) : ''}</span>`;
     }
-    const pri = k.priority || 2;
-    return `<div class="card">
-      <button class="card-remove" onclick="removeKey('${esc(k.maskedKey)}')" title="Remove key">&times;</button>
-      <div class="card-label ${cc}"><span onclick="renameKey('${esc(k.maskedKey)}')" class="editable" title="Click to rename">${esc(k.label)}</span></div>
-      <div class="card-masked">${esc(k.maskedKey)}</div>
-      <div class="card-bar"><div class="card-bar-fill" style="width:${(ratio * 100).toFixed(1)}%;background:var(--${isAvail ? 'green' : 'yellow'})"></div></div>
-      <div class="card-stats">
-        <b>${fmtNum(k.stats.totalRequests)}</b> req &nbsp;
-        <b>${fmtNum(k.stats.totalTokensIn)}</b> in / <b>${fmtNum(k.stats.totalTokensOut)}</b> out
-        ${(k.stats.totalCacheRead || 0) > 0 ? ` &nbsp;<span class="c-dim">${fmtNum(k.stats.totalCacheRead)} cached</span>` : ''}
-        ${(k.stats.totalCacheCreation || 0) > 0 ? ` &nbsp;<span class="c-dim">${fmtNum(k.stats.totalCacheCreation)} cache-write</span>` : ''}<br>
-        ${badge}
-        ${k.stats.rateLimitHits > 0 ? ` &nbsp;<span class="c-dim">${k.stats.rateLimitHits} rate-limits</span>` : ''}
-        ${k.stats.errors > 0 ? ` &nbsp;<span class="c-red">${k.stats.errors} errors</span>` : ''}
-      </div>
-      <select class="priority-select" onchange="updateKeyPriority('${esc(k.maskedKey)}', Number(this.value))" title="Selection priority">
-        <option value="1"${pri === 1 ? ' selected' : ''}>Preferred</option>
-        <option value="2"${pri === 2 ? ' selected' : ''}>Normal</option>
-        <option value="3"${pri === 3 ? ' selected' : ''}>Fallback</option>
-      </select>
-    </div>`;
-  }).join('');
+
+    let card = el.querySelector(`.card[data-key="${CSS.escape(k.maskedKey)}"]`);
+    if (!card) {
+      // Create new card
+      card = document.createElement('div');
+      card.className = 'card';
+      card.dataset.key = k.maskedKey;
+      card.innerHTML = `
+        <button class="card-remove" title="Remove key">&times;</button>
+        <div class="card-label"><span class="editable" title="Click to rename"></span></div>
+        <div class="card-masked"></div>
+        <div class="card-bar"><div class="card-bar-fill"></div></div>
+        <div class="card-stats"></div>
+        <select class="priority-select" title="Selection priority">
+          <option value="1">Preferred</option>
+          <option value="2">Normal</option>
+          <option value="3">Fallback</option>
+        </select>`;
+      card.querySelector('.card-remove').onclick = () => removeKey(k.maskedKey);
+      card.querySelector('.editable').onclick = () => renameKey(k.maskedKey);
+      card.querySelector('.priority-select').onchange = function() { updateKeyPriority(k.maskedKey, Number(this.value)); };
+      el.appendChild(card);
+    }
+
+    // Patch changing values
+    const labelSpan = card.querySelector('.editable');
+    if (labelSpan.textContent !== k.label) {
+      labelSpan.textContent = k.label;
+      card.querySelector('.card-label').className = 'card-label ' + cc;
+    }
+    const maskedDiv = card.querySelector('.card-masked');
+    if (maskedDiv.textContent !== k.maskedKey) maskedDiv.textContent = k.maskedKey;
+
+    const fill = card.querySelector('.card-bar-fill');
+    fill.style.width = (ratio * 100).toFixed(1) + '%';
+    fill.style.background = `var(--${isAvail ? 'green' : 'yellow'})`;
+
+    let statsHtml = `<b>${fmtNum(k.stats.totalRequests)}</b> req &nbsp;`
+      + `<b>${fmtNum(k.stats.totalTokensIn)}</b> in / <b>${fmtNum(k.stats.totalTokensOut)}</b> out`
+      + ((k.stats.totalCacheRead || 0) > 0 ? ` &nbsp;<span class="c-dim">${fmtNum(k.stats.totalCacheRead)} cached</span>` : '')
+      + ((k.stats.totalCacheCreation || 0) > 0 ? ` &nbsp;<span class="c-dim">${fmtNum(k.stats.totalCacheCreation)} cache-write</span>` : '')
+      + '<br>' + badge
+      + (k.stats.rateLimitHits > 0 ? ` &nbsp;<span class="c-dim">${k.stats.rateLimitHits} rate-limits</span>` : '')
+      + (k.stats.errors > 0 ? ` &nbsp;<span class="c-red">${k.stats.errors} errors</span>` : '');
+    card.querySelector('.card-stats').innerHTML = statsHtml;
+
+    // Update priority dropdown only if user isn't interacting with it
+    const sel = card.querySelector('.priority-select');
+    if (document.activeElement !== sel && Number(sel.value) !== pri) {
+      sel.value = pri;
+    }
+  });
 }
 
 // ── Render tokens ──────────────────────────────────────────────
@@ -421,22 +461,49 @@ function renderTokens() {
     return;
   }
   const totalReqs = tokens.reduce((s, t) => s + t.stats.totalRequests, 0);
-  el.innerHTML = tokens.map(t => {
+  const wantedTokens = new Set(tokens.map(t => t.maskedToken));
+
+  for (const card of [...el.querySelectorAll('.card')]) {
+    if (!wantedTokens.has(card.dataset.token)) card.remove();
+  }
+  const empty = el.querySelector('.empty-state');
+  if (empty) empty.remove();
+
+  tokens.forEach(t => {
     const ratio = totalReqs > 0 ? t.stats.totalRequests / totalReqs : 0;
-    return `<div class="card">
-      <button class="card-remove" onclick="removeToken('${esc(t.maskedToken)}')" title="Remove token">&times;</button>
-      <div class="card-label"><span onclick="renameToken('${esc(t.maskedToken)}')" class="editable" title="Click to rename">${esc(t.label)}</span></div>
-      <div class="card-masked">${esc(t.maskedToken)}</div>
-      <div class="card-bar"><div class="card-bar-fill" style="width:${(ratio * 100).toFixed(1)}%;background:var(--blue)"></div></div>
-      <div class="card-stats">
-        <b>${fmtNum(t.stats.totalRequests)}</b> req &nbsp;
-        <b>${fmtNum(t.stats.totalTokensIn)}</b> in / <b>${fmtNum(t.stats.totalTokensOut)}</b> out
-        ${(t.stats.totalCacheRead || 0) > 0 ? ` &nbsp;<span class="c-dim">${fmtNum(t.stats.totalCacheRead)} cached</span>` : ''}
-        ${(t.stats.totalCacheCreation || 0) > 0 ? ` &nbsp;<span class="c-dim">${fmtNum(t.stats.totalCacheCreation)} cache-write</span>` : ''}
-        ${t.stats.errors > 0 ? `<br><span class="c-red">${t.stats.errors} errors</span>` : ''}
-      </div>
-    </div>`;
-  }).join('');
+
+    let card = el.querySelector(`.card[data-token="${CSS.escape(t.maskedToken)}"]`);
+    if (!card) {
+      card = document.createElement('div');
+      card.className = 'card';
+      card.dataset.token = t.maskedToken;
+      card.innerHTML = `
+        <button class="card-remove" title="Remove token">&times;</button>
+        <div class="card-label"><span class="editable" title="Click to rename"></span></div>
+        <div class="card-masked"></div>
+        <div class="card-bar"><div class="card-bar-fill"></div></div>
+        <div class="card-stats"></div>`;
+      card.querySelector('.card-remove').onclick = () => removeToken(t.maskedToken);
+      card.querySelector('.editable').onclick = () => renameToken(t.maskedToken);
+      el.appendChild(card);
+    }
+
+    const labelSpan = card.querySelector('.editable');
+    if (labelSpan.textContent !== t.label) labelSpan.textContent = t.label;
+    const maskedDiv = card.querySelector('.card-masked');
+    if (maskedDiv.textContent !== t.maskedToken) maskedDiv.textContent = t.maskedToken;
+
+    const fill = card.querySelector('.card-bar-fill');
+    fill.style.width = (ratio * 100).toFixed(1) + '%';
+    fill.style.background = 'var(--blue)';
+
+    card.querySelector('.card-stats').innerHTML =
+      `<b>${fmtNum(t.stats.totalRequests)}</b> req &nbsp;`
+      + `<b>${fmtNum(t.stats.totalTokensIn)}</b> in / <b>${fmtNum(t.stats.totalTokensOut)}</b> out`
+      + ((t.stats.totalCacheRead || 0) > 0 ? ` &nbsp;<span class="c-dim">${fmtNum(t.stats.totalCacheRead)} cached</span>` : '')
+      + ((t.stats.totalCacheCreation || 0) > 0 ? ` &nbsp;<span class="c-dim">${fmtNum(t.stats.totalCacheCreation)} cache-write</span>` : '')
+      + (t.stats.errors > 0 ? `<br><span class="c-red">${t.stats.errors} errors</span>` : '');
+  });
 }
 
 // ── Render header ──────────────────────────────────────────────
