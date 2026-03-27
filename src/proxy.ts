@@ -325,9 +325,11 @@ function createTokenTrackingStream(
         try {
           const event = JSON.parse(json) as AnthropicStreamDelta;
           if (event.type === "message_start" && event.message?.usage) {
+            log("info", "Stream usage (message_start)", { usage: event.message.usage });
             inputTokens += totalInputTokens(event.message.usage);
           }
           if (event.type === "message_delta" && event.usage) {
+            log("info", "Stream usage (message_delta)", { usage: event.usage });
             outputTokens += event.usage.output_tokens ?? 0;
           }
         } catch {
