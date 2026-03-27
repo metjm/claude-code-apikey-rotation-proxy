@@ -707,13 +707,13 @@ function fillGaps(buckets, hours, resolution) {
     for (let i = days - 1; i >= 0; i--) {
       const d = new Date(now.getTime() - i * 86400000);
       const key = d.toISOString().slice(0, 10);
-      filled.push(map.get(key) ?? { bucket: key, requests: 0, successes: 0, errors: 0, rateLimits: 0, tokensIn: 0, tokensOut: 0 });
+      filled.push(map.get(key) ?? { bucket: key, requests: 0, successes: 0, errors: 0, rateLimits: 0, tokensIn: 0, tokensOut: 0, cacheRead: 0, cacheCreation: 0 });
     }
   } else {
     for (let i = hours - 1; i >= 0; i--) {
       const d = new Date(now.getTime() - i * 3600000);
       const key = d.toISOString().slice(0, 13);
-      filled.push(map.get(key) ?? { bucket: key, requests: 0, successes: 0, errors: 0, rateLimits: 0, tokensIn: 0, tokensOut: 0 });
+      filled.push(map.get(key) ?? { bucket: key, requests: 0, successes: 0, errors: 0, rateLimits: 0, tokensIn: 0, tokensOut: 0, cacheRead: 0, cacheCreation: 0 });
     }
   }
   return filled;
@@ -756,8 +756,10 @@ async function loadCharts() {
     data: {
       labels,
       datasets: [
-        { label: 'Tokens In', data: filled.map(b => b.tokensIn), borderColor: '#58a6ff', backgroundColor: 'rgba(88,166,255,0.1)', tension: 0.3, fill: true, pointRadius: 0 },
-        { label: 'Tokens Out', data: filled.map(b => b.tokensOut), borderColor: '#39d2c0', backgroundColor: 'rgba(57,210,192,0.1)', tension: 0.3, fill: true, pointRadius: 0 },
+        { label: 'Input', data: filled.map(b => b.tokensIn), borderColor: '#58a6ff', backgroundColor: 'rgba(88,166,255,0.1)', tension: 0.3, fill: true, pointRadius: 0 },
+        { label: 'Output', data: filled.map(b => b.tokensOut), borderColor: '#39d2c0', backgroundColor: 'rgba(57,210,192,0.1)', tension: 0.3, fill: true, pointRadius: 0 },
+        { label: 'Cache Read', data: filled.map(b => b.cacheRead ?? 0), borderColor: '#d2a8ff', backgroundColor: 'rgba(210,168,255,0.1)', tension: 0.3, fill: true, pointRadius: 0 },
+        { label: 'Cache Write', data: filled.map(b => b.cacheCreation ?? 0), borderColor: '#ffa657', backgroundColor: 'rgba(255,166,87,0.1)', tension: 0.3, fill: true, pointRadius: 0 },
       ]
     },
     options: {
@@ -785,6 +787,8 @@ function updateChartLastBucket(bucket) {
     requestsChart.data.datasets[2].data[i] = bucket.errors;
     tokensChart.data.datasets[0].data[i] = bucket.tokensIn;
     tokensChart.data.datasets[1].data[i] = bucket.tokensOut;
+    tokensChart.data.datasets[2].data[i] = bucket.cacheRead ?? 0;
+    tokensChart.data.datasets[3].data[i] = bucket.cacheCreation ?? 0;
   } else {
     labels.push(bucketLabel);
     requestsChart.data.datasets[0].data.push(bucket.successes);
@@ -792,6 +796,8 @@ function updateChartLastBucket(bucket) {
     requestsChart.data.datasets[2].data.push(bucket.errors);
     tokensChart.data.datasets[0].data.push(bucket.tokensIn);
     tokensChart.data.datasets[1].data.push(bucket.tokensOut);
+    tokensChart.data.datasets[2].data.push(bucket.cacheRead ?? 0);
+    tokensChart.data.datasets[3].data.push(bucket.cacheCreation ?? 0);
   }
   requestsChart.update('none');
   tokensChart.update('none');

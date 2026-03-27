@@ -46,6 +46,8 @@ export interface ApiKeyStats {
   readonly addedAt: UnixMs;
   readonly totalTokensIn: number;
   readonly totalTokensOut: number;
+  readonly totalCacheRead: number;
+  readonly totalCacheCreation: number;
 }
 
 export interface ApiKeyEntry {
@@ -74,6 +76,8 @@ export interface ProxyTokenStats {
   readonly addedAt: UnixMs;
   readonly totalTokensIn: number;
   readonly totalTokensOut: number;
+  readonly totalCacheRead: number;
+  readonly totalCacheCreation: number;
 }
 
 export interface ProxyTokenEntry {
@@ -165,6 +169,8 @@ export interface TimeseriesBucket {
   readonly rateLimits: number;
   readonly tokensIn: number;
   readonly tokensOut: number;
+  readonly cacheRead: number;
+  readonly cacheCreation: number;
 }
 
 export interface TimeseriesQuery {

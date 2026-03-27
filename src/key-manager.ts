@@ -36,6 +36,8 @@ interface KeyRow {
   added_at: number;
   total_tokens_in: number;
   total_tokens_out: number;
+  total_cache_read: number;
+  total_cache_creation: number;
   available_at: number;
 }
 
@@ -49,6 +51,8 @@ interface TokenRow {
   added_at: number;
   total_tokens_in: number;
   total_tokens_out: number;
+  total_cache_read: number;
+  total_cache_creation: number;
 }
 
 // ── KeyManager ────────────────────────────────────────────────────
@@ -60,10 +64,12 @@ interface BucketAccumulator {
   rateLimits: number;
   tokensIn: number;
   tokensOut: number;
+  cacheRead: number;
+  cacheCreation: number;
 }
 
 function emptyBucket(): BucketAccumulator {
-  return { requests: 0, successes: 0, errors: 0, rateLimits: 0, tokensIn: 0, tokensOut: 0 };
+  return { requests: 0, successes: 0, errors: 0, rateLimits: 0, tokensIn: 0, tokensOut: 0, cacheRead: 0, cacheCreation: 0 };
 }
 
 function currentBucketKey(): string {
@@ -124,6 +130,8 @@ export class KeyManager {
         added_at INTEGER NOT NULL,
         total_tokens_in INTEGER NOT NULL DEFAULT 0,
         total_tokens_out INTEGER NOT NULL DEFAULT 0,
+        total_cache_read INTEGER NOT NULL DEFAULT 0,
+        total_cache_creation INTEGER NOT NULL DEFAULT 0,
         available_at INTEGER NOT NULL DEFAULT 0
       );
 
@@ -136,7 +144,9 @@ export class KeyManager {
         last_used_at INTEGER,
         added_at INTEGER NOT NULL,
         total_tokens_in INTEGER NOT NULL DEFAULT 0,
-        total_tokens_out INTEGER NOT NULL DEFAULT 0
+        total_tokens_out INTEGER NOT NULL DEFAULT 0,
+        total_cache_read INTEGER NOT NULL DEFAULT 0,
+        total_cache_creation INTEGER NOT NULL DEFAULT 0
       );
 
       CREATE TABLE IF NOT EXISTS stats_timeseries (
@@ -149,11 +159,34 @@ export class KeyManager {
         rate_limits  INTEGER NOT NULL DEFAULT 0,
         tokens_in    INTEGER NOT NULL DEFAULT 0,
         tokens_out   INTEGER NOT NULL DEFAULT 0,
+        cache_read   INTEGER NOT NULL DEFAULT 0,
+        cache_creation INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (bucket, key_label, user_label)
       );
 
       CREATE INDEX IF NOT EXISTS idx_stats_ts_bucket ON stats_timeseries(bucket);
     `);
+
+    // Migrate existing tables to add cache columns
+    const migrate = (table: string, col: string) => {
+      try { this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} INTEGER NOT NULL DEFAULT 0`); } catch {}
+    };
+    migrate("api_keys", "total_cache_read");
+    migrate("api_keys", "total_cache_creation");
+    migrate("proxy_tokens", "total_cache_read");
+    migrate("proxy_tokens", "total_cache_creation");
+    migrate("stats_timeseries", "cache_read");
+    migrate("stats_timeseries", "cache_creation");
+
+    // One-time reset: old token counts were inaccurate (missing cache tokens)
+    const marker = this.db.query("SELECT 1 FROM stats_timeseries WHERE key_label = '__reset_v2__'").get();
+    if (!marker) {
+      this.db.exec("UPDATE api_keys SET total_tokens_in = 0, total_tokens_out = 0, total_cache_read = 0, total_cache_creation = 0");
+      this.db.exec("UPDATE proxy_tokens SET total_tokens_in = 0, total_tokens_out = 0, total_cache_read = 0, total_cache_creation = 0");
+      this.db.exec("DELETE FROM stats_timeseries");
+      this.db.run("INSERT INTO stats_timeseries (bucket, key_label, user_label) VALUES ('__reset_v2__', '__reset_v2__', '__reset_v2__')");
+      log("info", "Reset token stats (v2: added cache tracking)");
+    }
   }
 
   // ── Migration from legacy state.json ────────────────────────────
@@ -262,15 +295,17 @@ export class KeyManager {
     this.scheduleSave();
   }
 
-  recordSuccess(entry: ApiKeyEntry, tokensIn: number, tokensOut: number): void {
+  recordSuccess(entry: ApiKeyEntry, tokensIn: number, tokensOut: number, cacheRead = 0, cacheCreation = 0): void {
     entry.stats = {
       ...entry.stats,
       successfulRequests: entry.stats.successfulRequests + 1,
       totalTokensIn: entry.stats.totalTokensIn + tokensIn,
       totalTokensOut: entry.stats.totalTokensOut + tokensOut,
+      totalCacheRead: entry.stats.totalCacheRead + cacheRead,
+      totalCacheCreation: entry.stats.totalCacheCreation + cacheCreation,
     };
     this.tsIncrement(entry.label, "__all__", "successes");
-    this.tsAddTokens(entry.label, "__all__", tokensIn, tokensOut);
+    this.tsAddTokens(entry.label, "__all__", tokensIn, tokensOut, cacheRead, cacheCreation);
     this.scheduleSave();
   }
 
@@ -467,15 +502,17 @@ export class KeyManager {
     this.scheduleSave();
   }
 
-  recordTokenSuccess(entry: ProxyTokenEntry, tokensIn: number, tokensOut: number): void {
+  recordTokenSuccess(entry: ProxyTokenEntry, tokensIn: number, tokensOut: number, cacheRead = 0, cacheCreation = 0): void {
     entry.stats = {
       ...entry.stats,
       successfulRequests: entry.stats.successfulRequests + 1,
       totalTokensIn: entry.stats.totalTokensIn + tokensIn,
       totalTokensOut: entry.stats.totalTokensOut + tokensOut,
+      totalCacheRead: entry.stats.totalCacheRead + cacheRead,
+      totalCacheCreation: entry.stats.totalCacheCreation + cacheCreation,
     };
     this.tsIncrement("__all__", entry.label, "successes");
-    this.tsAddTokens("__all__", entry.label, tokensIn, tokensOut);
+    this.tsAddTokens("__all__", entry.label, tokensIn, tokensOut, cacheRead, cacheCreation);
     this.scheduleSave();
   }
 
@@ -490,7 +527,7 @@ export class KeyManager {
 
   // ── Timeseries helpers ──────────────────────────────────────────
 
-  private tsIncrement(keyLabel: string, userLabel: string, field: keyof Omit<BucketAccumulator, "tokensIn" | "tokensOut">): void {
+  private tsIncrement(keyLabel: string, userLabel: string, field: keyof Omit<BucketAccumulator, "tokensIn" | "tokensOut" | "cacheRead" | "cacheCreation">): void {
     const bucket = currentBucketKey();
     const mapKey = `${bucket}|${keyLabel}|${userLabel}`;
     const acc = this.tsAccumulator.get(mapKey) ?? emptyBucket();
@@ -505,13 +542,15 @@ export class KeyManager {
     }
   }
 
-  private tsAddTokens(keyLabel: string, userLabel: string, tokensIn: number, tokensOut: number): void {
-    if (tokensIn === 0 && tokensOut === 0) return;
+  private tsAddTokens(keyLabel: string, userLabel: string, tokensIn: number, tokensOut: number, cacheRead = 0, cacheCreation = 0): void {
+    if (tokensIn === 0 && tokensOut === 0 && cacheRead === 0 && cacheCreation === 0) return;
     const bucket = currentBucketKey();
     const mapKey = `${bucket}|${keyLabel}|${userLabel}`;
     const acc = this.tsAccumulator.get(mapKey) ?? emptyBucket();
     acc.tokensIn += tokensIn;
     acc.tokensOut += tokensOut;
+    acc.cacheRead += cacheRead;
+    acc.cacheCreation += cacheCreation;
     this.tsAccumulator.set(mapKey, acc);
 
     const globalKey = `${bucket}|__all__|__all__`;
@@ -519,6 +558,8 @@ export class KeyManager {
       const global = this.tsAccumulator.get(globalKey) ?? emptyBucket();
       global.tokensIn += tokensIn;
       global.tokensOut += tokensOut;
+      global.cacheRead += cacheRead;
+      global.cacheCreation += cacheCreation;
       this.tsAccumulator.set(globalKey, global);
     }
   }
@@ -527,19 +568,21 @@ export class KeyManager {
     const bucket = currentBucketKey();
 
     const row = this.db.query(
-      "SELECT requests, successes, errors, rate_limits, tokens_in, tokens_out FROM stats_timeseries WHERE bucket = ? AND key_label = '__all__' AND user_label = '__all__'"
-    ).get(bucket) as { requests: number; successes: number; errors: number; rate_limits: number; tokens_in: number; tokens_out: number } | null;
+      "SELECT requests, successes, errors, rate_limits, tokens_in, tokens_out, cache_read, cache_creation FROM stats_timeseries WHERE bucket = ? AND key_label = '__all__' AND user_label = '__all__'"
+    ).get(bucket) as { requests: number; successes: number; errors: number; rate_limits: number; tokens_in: number; tokens_out: number; cache_read: number; cache_creation: number } | null;
 
     const acc = this.tsAccumulator.get(`${bucket}|__all__|__all__`);
 
     return {
       bucket,
-      requests:   (row?.requests ?? 0)     + (acc?.requests ?? 0),
-      successes:  (row?.successes ?? 0)    + (acc?.successes ?? 0),
-      errors:     (row?.errors ?? 0)       + (acc?.errors ?? 0),
-      rateLimits: (row?.rate_limits ?? 0)  + (acc?.rateLimits ?? 0),
-      tokensIn:   (row?.tokens_in ?? 0)    + (acc?.tokensIn ?? 0),
-      tokensOut:  (row?.tokens_out ?? 0)   + (acc?.tokensOut ?? 0),
+      requests:      (row?.requests ?? 0)       + (acc?.requests ?? 0),
+      successes:     (row?.successes ?? 0)      + (acc?.successes ?? 0),
+      errors:        (row?.errors ?? 0)         + (acc?.errors ?? 0),
+      rateLimits:    (row?.rate_limits ?? 0)    + (acc?.rateLimits ?? 0),
+      tokensIn:      (row?.tokens_in ?? 0)      + (acc?.tokensIn ?? 0),
+      tokensOut:     (row?.tokens_out ?? 0)     + (acc?.tokensOut ?? 0),
+      cacheRead:     (row?.cache_read ?? 0)     + (acc?.cacheRead ?? 0),
+      cacheCreation: (row?.cache_creation ?? 0) + (acc?.cacheCreation ?? 0),
     };
   }
 
@@ -568,7 +611,8 @@ export class KeyManager {
       SELECT ${groupExpr} AS b,
         SUM(requests) AS requests, SUM(successes) AS successes,
         SUM(errors) AS errors, SUM(rate_limits) AS rate_limits,
-        SUM(tokens_in) AS tokens_in, SUM(tokens_out) AS tokens_out
+        SUM(tokens_in) AS tokens_in, SUM(tokens_out) AS tokens_out,
+        SUM(cache_read) AS cache_read, SUM(cache_creation) AS cache_creation
       FROM stats_timeseries
       WHERE ${conditions.join(" AND ")}
       GROUP BY b ORDER BY b
@@ -577,6 +621,7 @@ export class KeyManager {
     const rows = this.db.query(sql).all(...params) as Array<{
       b: string; requests: number; successes: number; errors: number;
       rate_limits: number; tokens_in: number; tokens_out: number;
+      cache_read: number; cache_creation: number;
     }>;
 
     return rows.map((r) => ({
@@ -587,6 +632,8 @@ export class KeyManager {
       rateLimits: r.rate_limits,
       tokensIn: r.tokens_in,
       tokensOut: r.tokens_out,
+      cacheRead: r.cache_read,
+      cacheCreation: r.cache_creation,
     }));
   }
 
@@ -610,25 +657,28 @@ export class KeyManager {
       UPDATE api_keys SET
         total_requests = ?, successful_requests = ?, rate_limit_hits = ?,
         errors = ?, last_used_at = ?, total_tokens_in = ?, total_tokens_out = ?,
-        available_at = ?
+        total_cache_read = ?, total_cache_creation = ?, available_at = ?
       WHERE key = ?
     `);
     const updateToken = this.db.prepare(`
       UPDATE proxy_tokens SET
         total_requests = ?, successful_requests = ?, errors = ?,
-        last_used_at = ?, total_tokens_in = ?, total_tokens_out = ?
+        last_used_at = ?, total_tokens_in = ?, total_tokens_out = ?,
+        total_cache_read = ?, total_cache_creation = ?
       WHERE token = ?
     `);
     const upsertTs = this.db.prepare(`
-      INSERT INTO stats_timeseries (bucket, key_label, user_label, requests, successes, errors, rate_limits, tokens_in, tokens_out)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO stats_timeseries (bucket, key_label, user_label, requests, successes, errors, rate_limits, tokens_in, tokens_out, cache_read, cache_creation)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(bucket, key_label, user_label) DO UPDATE SET
-        requests    = requests    + excluded.requests,
-        successes   = successes   + excluded.successes,
-        errors      = errors      + excluded.errors,
-        rate_limits = rate_limits + excluded.rate_limits,
-        tokens_in   = tokens_in   + excluded.tokens_in,
-        tokens_out  = tokens_out  + excluded.tokens_out
+        requests       = requests       + excluded.requests,
+        successes      = successes      + excluded.successes,
+        errors         = errors         + excluded.errors,
+        rate_limits    = rate_limits    + excluded.rate_limits,
+        tokens_in      = tokens_in      + excluded.tokens_in,
+        tokens_out     = tokens_out     + excluded.tokens_out,
+        cache_read     = cache_read     + excluded.cache_read,
+        cache_creation = cache_creation + excluded.cache_creation
     `);
 
     this.db.transaction(() => {
@@ -636,19 +686,19 @@ export class KeyManager {
         updateKey.run(
           k.stats.totalRequests, k.stats.successfulRequests, k.stats.rateLimitHits,
           k.stats.errors, k.stats.lastUsedAt, k.stats.totalTokensIn, k.stats.totalTokensOut,
-          k.availableAt, k.key,
+          k.stats.totalCacheRead, k.stats.totalCacheCreation, k.availableAt, k.key,
         );
       }
       for (const t of this.tokens) {
         updateToken.run(
           t.stats.totalRequests, t.stats.successfulRequests, t.stats.errors,
           t.stats.lastUsedAt, t.stats.totalTokensIn, t.stats.totalTokensOut,
-          t.token,
+          t.stats.totalCacheRead, t.stats.totalCacheCreation, t.token,
         );
       }
       for (const [mapKey, acc] of this.tsAccumulator) {
         const [bucket, keyLabel, userLabel] = mapKey.split("|");
-        upsertTs.run(bucket, keyLabel, userLabel, acc.requests, acc.successes, acc.errors, acc.rateLimits, acc.tokensIn, acc.tokensOut);
+        upsertTs.run(bucket, keyLabel, userLabel, acc.requests, acc.successes, acc.errors, acc.rateLimits, acc.tokensIn, acc.tokensOut, acc.cacheRead, acc.cacheCreation);
       }
       this.tsAccumulator.clear();
     })();
@@ -670,6 +720,8 @@ function rowToKeyEntry(r: KeyRow): ApiKeyEntry {
       addedAt: r.added_at as UnixMs,
       totalTokensIn: r.total_tokens_in,
       totalTokensOut: r.total_tokens_out,
+      totalCacheRead: r.total_cache_read ?? 0,
+      totalCacheCreation: r.total_cache_creation ?? 0,
     },
     availableAt: r.available_at as UnixMs,
   };
@@ -687,6 +739,8 @@ function rowToTokenEntry(r: TokenRow): ProxyTokenEntry {
       addedAt: r.added_at as UnixMs,
       totalTokensIn: r.total_tokens_in,
       totalTokensOut: r.total_tokens_out,
+      totalCacheRead: r.total_cache_read ?? 0,
+      totalCacheCreation: r.total_cache_creation ?? 0,
     },
   };
 }
@@ -701,6 +755,8 @@ function freshStats(): ApiKeyStats {
     addedAt: now(),
     totalTokensIn: 0,
     totalTokensOut: 0,
+    totalCacheRead: 0,
+    totalCacheCreation: 0,
   };
 }
 
@@ -713,6 +769,8 @@ function freshTokenStats(): ProxyTokenStats {
     addedAt: now(),
     totalTokensIn: 0,
     totalTokensOut: 0,
+    totalCacheRead: 0,
+    totalCacheCreation: 0,
   };
 }
 

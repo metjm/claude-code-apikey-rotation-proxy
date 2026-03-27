@@ -254,9 +254,6 @@ interface AnthropicUsage {
   readonly cache_read_input_tokens?: number;
 }
 
-function totalInputTokens(usage: AnthropicUsage): number {
-  return (usage.input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0);
-}
 
 interface AnthropicResponse {
   readonly usage?: AnthropicUsage;
@@ -276,12 +273,14 @@ function extractTokensFromJson(
 ): void {
   try {
     const parsed = JSON.parse(text) as AnthropicResponse;
-    const input = parsed.usage ? totalInputTokens(parsed.usage) : 0;
+    const input = parsed.usage?.input_tokens ?? 0;
     const output = parsed.usage?.output_tokens ?? 0;
-    keyManager.recordSuccess(entry, input, output);
-    if (proxyUser) keyManager.recordTokenSuccess(proxyUser, input, output);
-    if (input > 0 || output > 0) {
-      log("info", "Token usage", { label: entry.label, user: proxyUser?.label, input, output });
+    const cacheRead = parsed.usage?.cache_read_input_tokens ?? 0;
+    const cacheCreation = parsed.usage?.cache_creation_input_tokens ?? 0;
+    keyManager.recordSuccess(entry, input, output, cacheRead, cacheCreation);
+    if (proxyUser) keyManager.recordTokenSuccess(proxyUser, input, output, cacheRead, cacheCreation);
+    if (input > 0 || output > 0 || cacheRead > 0) {
+      log("info", "Token usage", { label: entry.label, user: proxyUser?.label, input, output, cacheRead, cacheCreation });
       emitWithKeys({
         type: "tokens", ts: new Date().toISOString(), label: entry.label,
         user: proxyUser?.label, input, output,
@@ -308,6 +307,8 @@ function createTokenTrackingStream(
   let buffer = "";
   let inputTokens = 0;
   let outputTokens = 0;
+  let cacheReadTokens = 0;
+  let cacheCreationTokens = 0;
 
   return source.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
     transform(chunk, controller) {
@@ -325,11 +326,11 @@ function createTokenTrackingStream(
         try {
           const event = JSON.parse(json) as AnthropicStreamDelta;
           if (event.type === "message_start" && event.message?.usage) {
-            log("info", "Stream usage (message_start)", { usage: event.message.usage });
-            inputTokens += totalInputTokens(event.message.usage);
+            inputTokens += event.message.usage.input_tokens ?? 0;
+            cacheReadTokens += event.message.usage.cache_read_input_tokens ?? 0;
+            cacheCreationTokens += event.message.usage.cache_creation_input_tokens ?? 0;
           }
           if (event.type === "message_delta" && event.usage) {
-            log("info", "Stream usage (message_delta)", { usage: event.usage });
             outputTokens += event.usage.output_tokens ?? 0;
           }
         } catch {
@@ -339,18 +340,21 @@ function createTokenTrackingStream(
     },
 
     flush() {
-      keyManager.recordSuccess(entry, inputTokens, outputTokens);
-      if (proxyUser) keyManager.recordTokenSuccess(proxyUser, inputTokens, outputTokens);
-      if (inputTokens > 0 || outputTokens > 0) {
+      keyManager.recordSuccess(entry, inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens);
+      if (proxyUser) keyManager.recordTokenSuccess(proxyUser, inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens);
+      if (inputTokens > 0 || outputTokens > 0 || cacheReadTokens > 0) {
         log("info", "Token usage (stream)", {
           label: entry.label,
           user: proxyUser?.label,
           input: inputTokens,
           output: outputTokens,
+          cacheRead: cacheReadTokens,
+          cacheCreation: cacheCreationTokens,
         });
         emitWithKeys({
           type: "tokens", ts: new Date().toISOString(), label: entry.label,
           user: proxyUser?.label, input: inputTokens, output: outputTokens,
+          cacheRead: cacheReadTokens, cacheCreation: cacheCreationTokens,
         }, keyManager.listKeys());
       }
     },
