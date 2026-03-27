@@ -75,20 +75,18 @@ export async function proxyRequest(
     const upstreamUrl = `${config.upstream}${url.pathname}${url.search}`;
     const headers = buildUpstreamHeaders(req.headers, entry.key);
 
-    const sentXApiKey = headers.get("x-api-key");
-    const sentAuth = headers.get("authorization");
+    const allHeaders: Record<string, string> = {};
+    for (const [k, v] of headers.entries()) {
+      allHeaders[k] = k === "authorization" ? v.slice(0, 30) + "..." : v;
+    }
     log("info", "Proxying request", {
       label: entry.label,
       user: proxyUser?.label,
       method: req.method,
       path: url.pathname,
       attempt: attempts,
-      upstream: {
-        hasXApiKey: !!sentXApiKey,
-        xApiKeyPrefix: sentXApiKey?.slice(0, 20),
-        hasAuthorization: !!sentAuth,
-        authorizationPrefix: sentAuth?.slice(0, 30),
-      },
+      upstreamUrl,
+      headers: allHeaders,
     });
     emitWithKeys({
       type: "request", ts: new Date().toISOString(), label: entry.label,
