@@ -284,6 +284,15 @@ export class KeyManager {
     return entry;
   }
 
+  updateKeyLabel(rawKey: string, newLabel: string): boolean {
+    const entry = this.keys.find((k) => k.key === rawKey);
+    if (!entry) return false;
+    (entry as { label: KeyLabel }).label = asKeyLabel(newLabel);
+    this.db.run("UPDATE api_keys SET label = ? WHERE key = ?", [newLabel, rawKey]);
+    log("info", "Key label updated", { label: newLabel });
+    return true;
+  }
+
   removeKey(rawKey: string): boolean {
     const idx = this.keys.findIndex((k) => k.key === rawKey);
     if (idx === -1) return false;
@@ -330,6 +339,15 @@ export class KeyManager {
     );
     log("info", "Proxy token added", { label: entry.label });
     return entry;
+  }
+
+  updateTokenLabel(rawToken: string, newLabel: string): boolean {
+    const entry = this.tokens.find((t) => t.token === rawToken);
+    if (!entry) return false;
+    (entry as { label: string }).label = newLabel;
+    this.db.run("UPDATE proxy_tokens SET label = ? WHERE token = ?", [newLabel, rawToken]);
+    log("info", "Token label updated", { label: newLabel });
+    return true;
   }
 
   removeToken(rawToken: string): boolean {

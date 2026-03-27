@@ -658,6 +658,79 @@ describe("Token Stats Recording", () => {
   });
 });
 
+// ── Label Updates ───────────────────────────────────────────────────────────
+
+describe("Key label updates", () => {
+  test("updateKeyLabel changes the label in memory and DB", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "old-label");
+    const result = km.updateKeyLabel(VALID_KEY_1, "new-label");
+    expect(result).toBe(true);
+    const listed = km.listKeys();
+    expect(listed[0]!.label).toBe("new-label");
+    // Verify persisted in DB
+    const km2 = new KeyManager(tempDir);
+    expect(km2.listKeys()[0]!.label).toBe("new-label");
+  });
+
+  test("updateKeyLabel returns false for unknown key", () => {
+    const km = create();
+    expect(km.updateKeyLabel("sk-ant-api03-nonexistent", "label")).toBe(false);
+  });
+
+  test("updateKeyLabel preserves stats", () => {
+    const km = create();
+    const entry = km.addKey(VALID_KEY_1, "orig");
+    km.recordRequest(entry);
+    km.recordSuccess(entry, 100, 50);
+    km.updateKeyLabel(VALID_KEY_1, "renamed");
+    const listed = km.listKeys();
+    expect(listed[0]!.label).toBe("renamed");
+    expect(listed[0]!.stats.totalRequests).toBe(1);
+    expect(listed[0]!.stats.totalTokensIn).toBe(100);
+  });
+});
+
+describe("Token label updates", () => {
+  test("updateTokenLabel changes the label in memory and DB", () => {
+    const km = create();
+    km.addToken(VALID_TOKEN_1, "old-label");
+    const result = km.updateTokenLabel(VALID_TOKEN_1, "new-label");
+    expect(result).toBe(true);
+    const listed = km.listTokens();
+    expect(listed[0]!.label).toBe("new-label");
+    // Verify persisted
+    const km2 = new KeyManager(tempDir);
+    expect(km2.listTokens()[0]!.label).toBe("new-label");
+  });
+
+  test("updateTokenLabel returns false for unknown token", () => {
+    const km = create();
+    expect(km.updateTokenLabel("nonexistent-token-value", "label")).toBe(false);
+  });
+
+  test("updateTokenLabel preserves stats", () => {
+    const km = create();
+    const entry = km.addToken(VALID_TOKEN_1, "orig");
+    km.recordTokenRequest(entry);
+    km.recordTokenSuccess(entry, 200, 100);
+    km.updateTokenLabel(VALID_TOKEN_1, "renamed");
+    const listed = km.listTokens();
+    expect(listed[0]!.label).toBe("renamed");
+    expect(listed[0]!.stats.totalRequests).toBe(1);
+    expect(listed[0]!.stats.totalTokensIn).toBe(200);
+  });
+
+  test("updateTokenLabel is reflected in validateToken", () => {
+    const km = create();
+    km.addToken(VALID_TOKEN_1, "before");
+    km.updateTokenLabel(VALID_TOKEN_1, "after");
+    const entry = km.validateToken(VALID_TOKEN_1);
+    expect(entry).not.toBeNull();
+    expect(entry!.label).toBe("after");
+  });
+});
+
 // ── Persistence ─────────────────────────────────────────────────────────────
 
 describe("Persistence", () => {

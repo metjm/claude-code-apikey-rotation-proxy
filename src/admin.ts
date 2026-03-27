@@ -21,6 +21,10 @@ const routes: ReadonlyMap<string, ReadonlyMap<string, RouteHandler>> = new Map([
     new Map<string, RouteHandler>([["POST", handleRemoveKey]]),
   ],
   [
+    "/admin/keys/update",
+    new Map<string, RouteHandler>([["POST", handleUpdateKey]]),
+  ],
+  [
     "/admin/tokens",
     new Map<string, RouteHandler>([
       ["GET", handleListTokens],
@@ -30,6 +34,10 @@ const routes: ReadonlyMap<string, ReadonlyMap<string, RouteHandler>> = new Map([
   [
     "/admin/tokens/remove",
     new Map<string, RouteHandler>([["POST", handleRemoveToken]]),
+  ],
+  [
+    "/admin/tokens/update",
+    new Map<string, RouteHandler>([["POST", handleUpdateToken]]),
   ],
   [
     "/admin/stats",
@@ -135,6 +143,24 @@ async function handleRemoveKey(
   return json({ removed: true });
 }
 
+async function handleUpdateKey(
+  req: Request,
+  keyManager: KeyManager,
+): Promise<Response> {
+  const body = await parseJsonBody<{ key: string; label: string }>(req);
+  if (body === null || typeof body.key !== "string" || typeof body.label !== "string") {
+    return json({ error: "Invalid JSON body — need 'key' and 'label' fields" }, 400);
+  }
+  if (body.label.length === 0) {
+    return json({ error: "'label' must not be empty" }, 400);
+  }
+  const updated = keyManager.updateKeyLabel(body.key, body.label);
+  if (!updated) {
+    return json({ error: "Key not found" }, 404);
+  }
+  return json({ updated: true, label: body.label });
+}
+
 // ── Token handlers ────────────────────────────────────────────────
 
 function handleListTokens(
@@ -189,6 +215,24 @@ async function handleRemoveToken(
     return json({ error: "Token not found" }, 404);
   }
   return json({ removed: true });
+}
+
+async function handleUpdateToken(
+  req: Request,
+  keyManager: KeyManager,
+): Promise<Response> {
+  const body = await parseJsonBody<{ token: string; label: string }>(req);
+  if (body === null || typeof body.token !== "string" || typeof body.label !== "string") {
+    return json({ error: "Invalid JSON body — need 'token' and 'label' fields" }, 400);
+  }
+  if (body.label.length === 0) {
+    return json({ error: "'label' must not be empty" }, 400);
+  }
+  const updated = keyManager.updateTokenLabel(body.token, body.label);
+  if (!updated) {
+    return json({ error: "Token not found" }, 404);
+  }
+  return json({ updated: true, label: body.label });
 }
 
 function handleStats(

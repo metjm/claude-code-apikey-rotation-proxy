@@ -1005,6 +1005,101 @@ describe("POST /admin/tokens/remove", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════
+// POST /admin/keys/update
+// ═══════════════════════════════════════════════════════════════════
+
+describe("POST /admin/keys/update", () => {
+  const config = makeConfig();
+
+  test("returns 200 and updates label", async () => {
+    km.addKey("sk-ant-api03-key-to-rename-0000", "old-name");
+    const res = await handleAdminRoute(makeReq("POST", "/admin/keys/update", { key: "sk-ant-api03-key-to-rename-0000", label: "new-name" }), km, config)!;
+    expect(res!.status).toBe(200);
+    const body = await res!.json();
+    expect(body.updated).toBe(true);
+    expect(body.label).toBe("new-name");
+    // Verify it stuck
+    const keys = km.listKeys();
+    expect(keys.some(k => k.label === "new-name")).toBe(true);
+  });
+
+  test("returns 404 for unknown key", async () => {
+    const res = await handleAdminRoute(makeReq("POST", "/admin/keys/update", { key: "sk-ant-api03-nonexistent-999", label: "x" }), km, config)!;
+    expect(res!.status).toBe(404);
+  });
+
+  test("returns 400 for missing key field", async () => {
+    const res = await handleAdminRoute(makeReq("POST", "/admin/keys/update", { label: "x" }), km, config)!;
+    expect(res!.status).toBe(400);
+  });
+
+  test("returns 400 for missing label field", async () => {
+    const res = await handleAdminRoute(makeReq("POST", "/admin/keys/update", { key: "sk-ant-api03-x" }), km, config)!;
+    expect(res!.status).toBe(400);
+  });
+
+  test("returns 400 for empty label", async () => {
+    km.addKey("sk-ant-api03-empty-label-test-0", "something");
+    const res = await handleAdminRoute(makeReq("POST", "/admin/keys/update", { key: "sk-ant-api03-empty-label-test-0", label: "" }), km, config)!;
+    expect(res!.status).toBe(400);
+  });
+
+  test("returns 400 for non-string label", async () => {
+    const res = await handleAdminRoute(makeReq("POST", "/admin/keys/update", { key: "sk-ant-api03-x", label: 123 }), km, config)!;
+    expect(res!.status).toBe(400);
+  });
+
+  test("returns 400 for invalid JSON", async () => {
+    const req = new Request("http://localhost/admin/keys/update", { method: "POST", body: "not json", headers: { "content-type": "application/json" } });
+    const res = await handleAdminRoute(req, km, config)!;
+    expect(res!.status).toBe(400);
+  });
+});
+
+// POST /admin/tokens/update
+// ═══════════════════════════════════════════════════════════════════
+
+describe("POST /admin/tokens/update", () => {
+  const config = makeConfig();
+
+  test("returns 200 and updates label", async () => {
+    km.addToken("old-token-rename-test", "old-name");
+    const res = await handleAdminRoute(makeReq("POST", "/admin/tokens/update", { token: "old-token-rename-test", label: "alice@co.com" }), km, config)!;
+    expect(res!.status).toBe(200);
+    const body = await res!.json();
+    expect(body.updated).toBe(true);
+    expect(body.label).toBe("alice@co.com");
+    const tokens = km.listTokens();
+    expect(tokens.some(t => t.label === "alice@co.com")).toBe(true);
+  });
+
+  test("returns 404 for unknown token", async () => {
+    const res = await handleAdminRoute(makeReq("POST", "/admin/tokens/update", { token: "nonexistent-token-value", label: "x" }), km, config)!;
+    expect(res!.status).toBe(404);
+  });
+
+  test("returns 400 for missing token field", async () => {
+    const res = await handleAdminRoute(makeReq("POST", "/admin/tokens/update", { label: "x" }), km, config)!;
+    expect(res!.status).toBe(400);
+  });
+
+  test("returns 400 for missing label field", async () => {
+    const res = await handleAdminRoute(makeReq("POST", "/admin/tokens/update", { token: "something" }), km, config)!;
+    expect(res!.status).toBe(400);
+  });
+
+  test("returns 400 for empty label", async () => {
+    km.addToken("empty-label-token-test", "something");
+    const res = await handleAdminRoute(makeReq("POST", "/admin/tokens/update", { token: "empty-label-token-test", label: "" }), km, config)!;
+    expect(res!.status).toBe(400);
+  });
+
+  test("returns 400 for non-string label", async () => {
+    const res = await handleAdminRoute(makeReq("POST", "/admin/tokens/update", { token: "x", label: 42 }), km, config)!;
+    expect(res!.status).toBe(400);
+  });
+});
+
 // GET /admin/stats
 // ═══════════════════════════════════════════════════════════════════
 
