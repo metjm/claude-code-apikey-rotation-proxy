@@ -435,6 +435,7 @@ export class KeyManager {
 
   listKeys(): readonly MaskedKeyEntry[] {
     const currentTime = now();
+    const recentErrs = this.recentErrorsByDimension("key_label", "user_label", "__all__");
     return this.keys.map(
       (k): MaskedKeyEntry => ({
         maskedKey: maskKey(k.key),
@@ -443,6 +444,7 @@ export class KeyManager {
         availableAt: k.availableAt,
         isAvailable: k.availableAt <= currentTime,
         priority: k.priority,
+        recentErrors: recentErrs.get(k.label) ?? 0,
       })
     );
   }
@@ -510,11 +512,13 @@ export class KeyManager {
   }
 
   listTokens(): readonly MaskedTokenEntry[] {
+    const recentErrs = this.recentErrorsByDimension("user_label", "key_label", "__all__");
     return this.tokens.map(
       (t): MaskedTokenEntry => ({
         maskedToken: maskToken(t.token),
         label: t.label,
         stats: t.stats,
+        recentErrors: recentErrs.get(t.label) ?? 0,
       })
     );
   }
@@ -560,6 +564,42 @@ export class KeyManager {
     };
     this.tsIncrement("__all__", entry.label, "errors");
     this.scheduleSave();
+  }
+
+  // ── Recent error queries ────────────────────────────────────────
+
+  /**
+   * Returns errors in the last hour grouped by a dimension (key_label or user_label).
+   * Combines persisted DB rows with the in-memory accumulator for the current bucket.
+   */
+  private recentErrorsByDimension(
+    groupCol: "key_label" | "user_label",
+    filterCol: "key_label" | "user_label",
+    filterVal: string,
+  ): Map<string, number> {
+    const cutoff = new Date(Date.now() - 60 * 60 * 1000).toISOString().slice(0, 13);
+    const rows = this.db.query(
+      `SELECT ${groupCol} AS lbl, SUM(errors) AS errs FROM stats_timeseries
+       WHERE bucket >= ? AND ${filterCol} = ? AND ${groupCol} != '__all__'
+       GROUP BY ${groupCol}`
+    ).all(cutoff, filterVal) as { lbl: string; errs: number }[];
+
+    const result = new Map<string, number>();
+    for (const r of rows) result.set(r.lbl, r.errs);
+
+    // Add unflushed in-memory accumulator data for the current bucket
+    const bucket = currentBucketKey();
+    for (const [mapKey, acc] of this.tsAccumulator) {
+      if (acc.errors === 0) continue;
+      const [b, keyLabel, userLabel] = mapKey.split("|");
+      if (b !== bucket) continue;
+      const dim = groupCol === "key_label" ? keyLabel! : userLabel!;
+      const filter = filterCol === "key_label" ? keyLabel! : userLabel!;
+      if (filter !== filterVal || dim === "__all__") continue;
+      result.set(dim, (result.get(dim) ?? 0) + acc.errors);
+    }
+
+    return result;
   }
 
   // ── Timeseries helpers ──────────────────────────────────────────

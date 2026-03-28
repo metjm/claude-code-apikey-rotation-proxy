@@ -67,6 +67,7 @@ export interface MaskedKeyEntry {
   readonly availableAt: UnixMs;
   readonly isAvailable: boolean;
   readonly priority: number;
+  readonly recentErrors: number;
 }
 
 // ── Proxy token entry ─────────────────────────────────────────────
@@ -93,6 +94,7 @@ export interface MaskedTokenEntry {
   readonly maskedToken: string;
   readonly label: string;
   readonly stats: ProxyTokenStats;
+  readonly recentErrors: number;
 }
 
 // ── Persisted state ───────────────────────────────────────────────
