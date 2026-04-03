@@ -5,6 +5,10 @@ import { WebhookNotifier } from "./webhook-notifier.ts";
 const MAX_SAMPLE_VALUES = 50;
 const MAX_STRING_LENGTH_FOR_SAMPLE = 200;
 const MAX_FIELD_PATHS = 10_000;
+/** After this many unique string samples, check if the field looks like free-text. */
+const FREE_TEXT_CHECK_THRESHOLD = 10;
+/** If every sample so far is unique and average length exceeds this, treat as free-text. */
+const FREE_TEXT_AVG_LENGTH = 30;
 
 /** Headers whose new values should NOT trigger webhook notifications (high-cardinality / noisy). */
 const VALUE_NOTIFY_SUPPRESS_EXACT = new Set([
@@ -290,6 +294,10 @@ export class SchemaTracker {
             if (existing.sampleValues.size < MAX_SAMPLE_VALUES) {
               existing.sampleValues.add(strVal);
               changes.push({ type: "new_field_value", endpoint, context, path, value: strVal });
+              // Stop sampling early if this looks like free-text data
+              if (looksLikeFreeText(existing)) {
+                existing.valueOverflow = true;
+              }
             } else {
               existing.valueOverflow = true;
             }
@@ -447,4 +455,22 @@ function shouldSampleValue(value: unknown, jsonType: string): boolean {
   if (jsonType === "object" || jsonType === "array") return false;
   if (jsonType === "string" && typeof value === "string" && value.length > MAX_STRING_LENGTH_FOR_SAMPLE) return false;
   return true;
+}
+
+/**
+ * Returns true if a field's collected samples look like free-text/high-cardinality
+ * strings rather than a small enum. Checked after adding a new sample.
+ *
+ * Heuristic: if we've seen >= FREE_TEXT_CHECK_THRESHOLD unique values,
+ * every value seen so far is unique (no repeats — uniqueRatio = samples/hits is high),
+ * and the average sample length exceeds FREE_TEXT_AVG_LENGTH, it's likely free-text.
+ */
+function looksLikeFreeText(field: ObservedField): boolean {
+  if (field.sampleValues.size < FREE_TEXT_CHECK_THRESHOLD) return false;
+  // If we've seen many hits but still no duplicates, cardinality is high
+  const uniqueRatio = field.sampleValues.size / field.hitCount;
+  if (uniqueRatio < 0.8) return false; // Some repeats → probably enum-like
+  let totalLen = 0;
+  for (const v of field.sampleValues) totalLen += v.length;
+  return (totalLen / field.sampleValues.size) > FREE_TEXT_AVG_LENGTH;
 }

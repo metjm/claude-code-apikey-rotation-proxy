@@ -634,3 +634,68 @@ describe("Field-path Cap", () => {
     st.close();
   });
 });
+
+// ── Free-text detection ─────────────────────────────────────────
+
+describe("Free-text value sampling cutoff", () => {
+  test("stops sampling values for fields that look like free-text after enough unique long values", () => {
+    const st = createTracker();
+
+    // Feed 12 unique long strings (>30 chars avg) as message content
+    for (let i = 0; i < 12; i++) {
+      const msg = `This is a unique user message number ${i} with enough length to trigger the heuristic check`;
+      st.recordResponseJson("/v1/messages", JSON.stringify({
+        content: [{ type: "text", text: msg }],
+      }));
+    }
+
+    const fields = st.listFields();
+    const textField = fields.find((f) => f.path === "content[].text");
+    expect(textField).toBeDefined();
+    // Should have marked as overflow (stopped sampling) before reaching MAX_SAMPLE_VALUES (50)
+    expect(textField!.valueOverflow).toBe(true);
+    // Should have some samples but not all 12 (capped at ~10)
+    expect(textField!.sampleValues.length).toBeLessThanOrEqual(12);
+    expect(textField!.sampleValues.length).toBeGreaterThanOrEqual(10);
+
+    st.close();
+  });
+
+  test("continues sampling short enum-like values without triggering free-text cutoff", () => {
+    const st = createTracker();
+
+    // Feed 20 requests, but only a few unique short values (enum-like)
+    const types = ["text", "tool_use", "tool_result", "image"];
+    for (let i = 0; i < 20; i++) {
+      st.recordResponseJson("/v1/messages", JSON.stringify({
+        content: [{ type: types[i % types.length] }],
+      }));
+    }
+
+    const fields = st.listFields();
+    const typeField = fields.find((f) => f.path === "content[].type");
+    expect(typeField).toBeDefined();
+    // Should NOT overflow — few unique short values with lots of repeats
+    expect(typeField!.valueOverflow).toBe(false);
+    expect(typeField!.sampleValues.length).toBe(4);
+
+    st.close();
+  });
+
+  test("ID-like fields with unique long values are detected as free-text", () => {
+    const st = createTracker();
+
+    for (let i = 0; i < 12; i++) {
+      st.recordResponseJson("/v1/messages", JSON.stringify({
+        id: `msg_01ABCDEFGHIJKLMNOPQRSTUVWX${String(i).padStart(4, "0")}`,
+      }));
+    }
+
+    const fields = st.listFields();
+    const idField = fields.find((f) => f.path === "id");
+    expect(idField).toBeDefined();
+    expect(idField!.valueOverflow).toBe(true);
+
+    st.close();
+  });
+});
