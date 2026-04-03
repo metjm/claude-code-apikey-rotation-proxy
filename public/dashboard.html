@@ -124,6 +124,22 @@
   .badge-row { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
   .metric-inline { color: var(--text-dim); font-size: 10px; line-height: 1.35; }
   .ops-table .badge { white-space: nowrap; }
+  .limit-summary { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+  .limit-driver { color: var(--text-dim); font-size: 10px; line-height: 1.2; }
+  .limit-matrix {
+    display: grid; grid-template-columns: 30px 44px 54px minmax(54px, 1fr);
+    gap: 3px 8px; align-items: center; font-size: 10px;
+  }
+  .limit-head {
+    color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.35px;
+    font-size: 9px;
+  }
+  .limit-label { color: var(--text-bright); font-weight: 600; }
+  .limit-value { color: var(--text); }
+  .limit-value-dim { color: var(--text-dim); }
+  .limit-state-ok { color: var(--green); }
+  .limit-state-warning { color: var(--yellow); }
+  .limit-state-unknown { color: var(--text-dim); }
 
   /* Cards */
   .cards { display: flex; flex-wrap: wrap; gap: 8px; flex: 1; align-content: flex-start; }
@@ -185,15 +201,6 @@
   .capacity-window-row.tone-unknown { border-color: rgba(139,148,158,0.35); }
   .capacity-window-name { color: var(--text-bright); font-weight: 600; }
   .capacity-window-detail { color: var(--text-dim); font-size: 10px; }
-  .window-pill-list { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 0; }
-  .window-pill {
-    display: inline-flex; gap: 5px; align-items: center; background: var(--bg3);
-    border: 1px solid var(--border); border-radius: 999px; padding: 2px 6px; font-size: 10px;
-  }
-  .window-pill strong { color: var(--text-bright); font-weight: 600; }
-  .window-pill.tone-ok { border-color: rgba(63,185,80,0.35); }
-  .window-pill.tone-warning { border-color: rgba(210,153,34,0.45); }
-  .window-pill.tone-unknown { border-color: rgba(139,148,158,0.35); }
   .card-note { color: var(--text-dim); font-size: 10px; margin-top: 4px; }
 
   /* Add forms */
@@ -736,6 +743,23 @@ function compactWindowStatus(window) {
   if (window.status === 'rejected') return 'mixed';
   return window.status || 'unknown';
 }
+function compactWindowStateLabel(window) {
+  if (!window) return '--';
+  if (window.surpassedThreshold) return 'Warn';
+  if (window.status === 'allowed_warning') return 'Close';
+  if (window.status === 'allowed') return 'OK';
+  if (window.status === 'rejected') return 'Mixed';
+  return 'Info';
+}
+function capacityWindow(key, windowName) {
+  return sortedCapacityWindows(key, { includeOverage: true }).find(window => window.windowName === windowName) || null;
+}
+function limitStateClass(window) {
+  const tone = windowTone(window);
+  if (tone === 'ok') return 'limit-state-ok';
+  if (tone === 'warning') return 'limit-state-warning';
+  return 'limit-state-unknown';
+}
 function telemetryCoverageSummary(key) {
   const responseCount = key.capacity?.responseCount || 0;
   const normalizedCount = key.capacity?.normalizedHeaderCount || 0;
@@ -1091,24 +1115,40 @@ function renderKeys() {
       (k.recentErrors || 0) > 0 ? `${fmtNum(k.recentErrors || 0)} err` : null,
       !k.isAvailable ? fmtCountdown(k.availableAt - Date.now()) : null,
     ].filter(Boolean).join(' · ');
-    const windows = sortedCapacityWindows(k);
-    const windowsHtml = windows.length > 0
-      ? `<div class="window-pill-list">${windows.slice(0, 3).map(window => {
-          const details = [];
-          if (window.utilization !== null && window.utilization !== undefined) details.push(fmtPct(window.utilization));
-          details.push(compactWindowStatus(window));
-          if (window.resetAt) details.push(fmtCountdown(window.resetAt - Date.now()));
-          return `<span class="window-pill tone-${esc(windowTone(window))}" title="${esc(summarizeWindow(window))}">
-            <strong>${esc(compactWindowName(window.windowName))}</strong>${esc(details.join(' · '))}
-          </span>`;
-        }).join('')}</div>`
-      : `<div class="table-sub" title="No active limit windows observed in recent telemetry.">No window telemetry</div>`;
-    const keyRef = JSON.stringify(k.maskedKey);
     const keyMetaTitle = [
       `Priority: ${humanizePriority(pri)}`,
       k.capacity?.organizationId ? `Organization: ${k.capacity.organizationId}` : null,
       `Primary limit driver: ${claim}`,
     ].filter(Boolean).join('\n');
+    const hasAnyWindow = sortedCapacityWindows(k).length > 0;
+    const limitRows = ['unified-5h', 'unified-7d'].map(windowName => {
+      const window = capacityWindow(k, windowName);
+      return {
+        label: compactWindowName(windowName),
+        utilization: window?.utilization !== null && window?.utilization !== undefined ? fmtPct(window.utilization) : '--',
+        state: compactWindowStateLabel(window),
+        reset: window?.resetAt ? fmtCountdown(window.resetAt - Date.now()) : '--',
+        title: window ? summarizeWindow(window) : `No ${friendlyWindowName(windowName).toLowerCase()} telemetry observed recently.`,
+        stateClass: limitStateClass(window),
+      };
+    });
+    const limitsHtml = `<div class="limit-summary">
+      <div class="limit-driver" title="${esc(keyMetaTitle)}">driver ${esc(claim)}</div>
+      <div class="limit-matrix">
+        <div class="limit-head">win</div>
+        <div class="limit-head">used</div>
+        <div class="limit-head">state</div>
+        <div class="limit-head">reset</div>
+        ${limitRows.map(row => `
+          <div class="limit-label" title="${esc(row.title)}">${esc(row.label)}</div>
+          <div class="limit-value${row.utilization === '--' ? '-dim' : ''}" title="${esc(row.title)}">${esc(row.utilization)}</div>
+          <div class="limit-value ${esc(row.stateClass)}" title="${esc(row.title)}">${esc(row.state)}</div>
+          <div class="limit-value${row.reset === '--' ? '-dim' : ''}" title="${esc(row.title)}">${esc(row.reset)}</div>
+        `).join('')}
+      </div>
+      ${hasAnyWindow ? '' : '<div class="table-sub">Awaiting limit headers</div>'}
+    </div>`;
+    const keyRef = JSON.stringify(k.maskedKey);
     const usageLines = [
       `<div><strong>${fmtNum(k.stats.totalRequests)}</strong> req · ${fmtNum(k.stats.totalTokensIn)} in / ${fmtNum(k.stats.totalTokensOut)} out</div>`,
     ];
@@ -1143,10 +1183,7 @@ function renderKeys() {
         </div>
       </td>
       <td>
-        <div class="table-stack">
-          ${windowsHtml}
-          <div class="table-sub">${windows.length > 0 ? esc(`driver ${claim}`) : 'Awaiting limit headers'}</div>
-        </div>
+        ${limitsHtml}
       </td>
       <td>
         <div class="table-metrics">
