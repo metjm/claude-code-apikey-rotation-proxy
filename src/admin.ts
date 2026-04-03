@@ -26,6 +26,10 @@ const routes: ReadonlyMap<string, ReadonlyMap<string, RouteHandler>> = new Map([
     new Map<string, RouteHandler>([["POST", handleUpdateKey]]),
   ],
   [
+    "/admin/keys/reset-cooldowns",
+    new Map<string, RouteHandler>([["POST", handleResetKeyCooldowns]]),
+  ],
+  [
     "/admin/tokens",
     new Map<string, RouteHandler>([
       ["GET", handleListTokens],
@@ -242,6 +246,18 @@ async function handleUpdateKey(
   }
 
   return json({ updated: true, ...(hasLabel ? { label: body.label } : {}), ...(hasPriority ? { priority: body.priority } : {}) });
+}
+
+function handleResetKeyCooldowns(
+  _req: Request,
+  keyManager: KeyManager,
+): Response {
+  const reset = keyManager.resetKeyCooldowns();
+  return json({
+    reset,
+    availableKeys: keyManager.availableCount(),
+    totalKeys: keyManager.totalCount(),
+  });
 }
 
 // ── Token handlers ────────────────────────────────────────────────

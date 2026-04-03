@@ -136,6 +136,17 @@ describe("Route Dispatch", () => {
     expect(res!.status).toBe(404);
   });
 
+  test("routes POST /admin/keys/reset-cooldowns", async () => {
+    km.addKey(VALID_KEY, "reset-route");
+    const req = makeReq("POST", "/admin/keys/reset-cooldowns");
+    const res = await handleAdminRoute(req, km, config, st);
+    expect(res).not.toBeNull();
+    expect(res!.status).toBe(200);
+    const body = await jsonBody(res!);
+    expect(body).toHaveProperty("reset");
+    expect(body).toHaveProperty("availableKeys");
+  });
+
   test("routes GET /admin/tokens", async () => {
     const req = makeReq("GET", "/admin/tokens");
     const res = await handleAdminRoute(req, km, config, st);
@@ -1149,6 +1160,24 @@ describe("POST /admin/keys/update", () => {
     const res = await handleAdminRoute(makeReq("POST", "/admin/keys/update", { maskedKey: masked, label: "new-lbl" }), km, config, st)!;
     expect(res!.status).toBe(200);
     expect(km.listKeys().find(k => k.label === "new-lbl")).toBeDefined();
+  });
+});
+
+describe("POST /admin/keys/reset-cooldowns", () => {
+  const config = makeConfig();
+
+  test("returns 200 and makes cooled keys available again", async () => {
+    const cooled = km.addKey("sk-ant-api03-cooldown-reset-test-0000", "cooled");
+    km.addKey("sk-ant-api03-cooldown-reset-test-1111", "ready");
+    km.recordRateLimit(cooled, 300);
+
+    const res = await handleAdminRoute(makeReq("POST", "/admin/keys/reset-cooldowns"), km, config, st)!;
+    expect(res!.status).toBe(200);
+    const body = await res!.json();
+    expect(body.reset).toBe(1);
+    expect(body.availableKeys).toBe(2);
+    expect(body.totalKeys).toBe(2);
+    expect(km.listKeys().every(k => k.isAvailable)).toBe(true);
   });
 });
 

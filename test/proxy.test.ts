@@ -2032,6 +2032,7 @@ describe("Capacity observation integration", () => {
     expect(key.capacity.signalCoverage.find((signal) => signal.signalName === "request_id")!.seenCount).toBe(1);
     expect(key.capacity.signalCoverage.find((signal) => signal.signalName === "windows")!.seenCount).toBe(1);
     expect(key.capacity.windows.find((w) => w.windowName === "unified-7d")!.utilization).toBe(0.92);
+    expect(key.capacity.windows.find((w) => w.windowName === "unified-overage")).toBeUndefined();
     expect(key.capacityHealth).toBe("warning");
   });
 
@@ -2139,6 +2140,7 @@ describe("Capacity observation integration", () => {
     expect(keyA.capacity.responseCount).toBe(1);
     expect(keyA.capacity.normalizedHeaderCount).toBe(1);
     expect(keyA.capacity.windows.find((w) => w.windowName === "unified")!.status).toBe("rejected");
+    expect(keyA.capacity.windows.find((w) => w.windowName === "unified-overage")).toBeUndefined();
     expect(keyA.isAvailable).toBe(false);
     expect(keyA.capacityHealth).toBe("cooling_down");
   });

@@ -373,6 +373,7 @@ function extractCapacityObservation(
 
     const [, rawWindowName, field] = match;
     if (!rawWindowName) continue;
+    if (rawWindowName.endsWith("-overage")) continue;
     observedSignals.add("windows");
 
     const current = windows.get(rawWindowName) ?? { windowName: rawWindowName };

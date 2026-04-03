@@ -72,6 +72,7 @@
     min-height: 200px; display: flex; flex-direction: column;
   }
   .panel-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+  .panel-actions { display: flex; align-items: center; gap: 6px; }
   .panel-title { font-size: 13px; font-weight: 600; color: var(--text-bright); text-transform: uppercase; letter-spacing: 0.5px; }
   .btn { padding: 4px 12px; border-radius: 4px; border: 1px solid var(--border); background: var(--bg3); color: var(--text); font-family: var(--font); font-size: 12px; cursor: pointer; }
   .btn:hover { border-color: var(--blue); color: var(--blue); }
@@ -244,7 +245,10 @@
     <div class="panel">
       <div class="panel-header">
         <span class="panel-title">API Keys</span>
-        <button class="btn" onclick="toggleForm('key')">+ Add</button>
+        <div class="panel-actions">
+          <button class="btn" onclick="resetKeyCooldowns()">Reset Cooldowns</button>
+          <button class="btn" onclick="toggleForm('key')">+ Add</button>
+        </div>
       </div>
       <div class="add-form" id="key-form">
         <div class="field">
@@ -585,16 +589,27 @@ function activeCapacityWindows(key) {
   const nowMs = Date.now();
   return (key.capacity?.windows || []).filter(window => window.resetAt === null || window.resetAt === undefined || window.resetAt > nowMs);
 }
-function healthBadge(key) {
-  const health = key.capacityHealth || 'unknown';
-  if (health === 'cooling_down') {
+function observedCapacityState(key) {
+  const windows = activeCapacityWindows(key);
+  if ((key.capacity?.overageStatus || '') === 'rejected') return 'rejected';
+  if (windows.some(window => window.status === 'rejected')) return 'rejected';
+  if (windows.some(window => window.status === 'allowed_warning')) return 'warning';
+  if (windows.some(window => window.status === 'allowed')) return 'healthy';
+  return 'unknown';
+}
+function routingBadge(key) {
+  if (!key.isAvailable) {
     const rem = key.availableAt - Date.now();
     return `<span class="badge badge-ratelimited">Cooling ${rem > 0 ? fmtCountdown(rem) : ''}</span>`;
   }
-  if (health === 'healthy') return '<span class="badge badge-ok">Healthy</span>';
-  if (health === 'warning') return '<span class="badge badge-warning">Warning</span>';
-  if (health === 'rejected') return '<span class="badge badge-rejected">Rejected</span>';
-  return '<span class="badge badge-unknown">Unknown</span>';
+  return '<span class="badge badge-ok">Available</span>';
+}
+function observedHealthBadge(key) {
+  const health = observedCapacityState(key);
+  if (health === 'healthy') return '<span class="badge badge-ok">Observed Healthy</span>';
+  if (health === 'warning') return '<span class="badge badge-warning">Observed Warning</span>';
+  if (health === 'rejected') return '<span class="badge badge-rejected">Observed Rejected</span>';
+  return '<span class="badge badge-unknown">No Signal</span>';
 }
 function renderCapacitySummary() {
   const grid = document.getElementById('capacity-summary-grid');
@@ -619,13 +634,13 @@ function renderCapacitySummary() {
   }
 
   const cards = [
-    { label: 'Healthy', value: capacitySummary.healthyKeys, sub: `${capacitySummary.warningKeys} warning / ${capacitySummary.rejectedKeys} rejected` },
-    { label: 'Cooling', value: capacitySummary.coolingDownKeys, sub: `${capacitySummary.unknownKeys} unknown` },
+    { label: 'Observed Healthy', value: capacitySummary.healthyKeys, sub: `${capacitySummary.warningKeys} observed warning / ${capacitySummary.rejectedKeys} observed rejected` },
+    { label: 'Cooling', value: capacitySummary.coolingDownKeys, sub: `${capacitySummary.unknownKeys} no signal` },
     { label: 'Organizations', value: capacitySummary.distinctOrganizations, sub: 'distinct org IDs seen' },
     { label: 'Responses', value: fmtNum(totalResponses), sub: 'upstream responses observed' },
     { label: 'Signals', value: normalizedPct, sub: `${fmtNum(normalizedResponses)} / ${fmtNum(totalResponses)} responses carried normalized signals` },
     { label: 'Fallback', value: capacitySummary.fallbackAvailableKeys, sub: 'keys with fallback available' },
-    { label: 'Overage', value: capacitySummary.overageRejectedKeys, sub: 'keys reporting overage rejection' },
+    { label: 'Overage', value: capacitySummary.overageRejectedKeys, sub: 'analytics only; not routing state' },
   ];
   grid.innerHTML = cards.map(card =>
     `<div class="summary-card"><div class="summary-card-label">${esc(card.label)}</div><div class="summary-card-value">${esc(String(card.value))}</div><div class="summary-card-sub">${esc(card.sub)}</div></div>`
@@ -677,7 +692,8 @@ function renderKeys() {
     const ratio = totalReqs > 0 ? k.stats.totalRequests / totalReqs : 0;
     const cc = keyColor(k.label);
     const pri = k.priority || 2;
-    const badge = healthBadge(k);
+    const badge = routingBadge(k);
+    const observedBadge = observedHealthBadge(k);
     const windows = activeCapacityWindows(k);
     const windowsHtml = windows.slice(0, 4).map(window => {
       const status = window.status || 'unknown';
@@ -739,7 +755,7 @@ function renderKeys() {
 
     const fill = card.querySelector('.card-bar-fill');
     fill.style.width = (ratio * 100).toFixed(1) + '%';
-    fill.style.background = k.capacityHealth === 'rejected' ? 'var(--red)' : k.capacityHealth === 'warning' ? 'var(--yellow)' : 'var(--green)';
+    fill.style.background = k.isAvailable ? 'var(--blue)' : 'var(--yellow)';
 
     let statsHtml = `<b>${fmtNum(k.stats.totalRequests)}</b> req &nbsp;`
       + `<b>${fmtNum(k.stats.totalTokensIn)}</b> in / <b>${fmtNum(k.stats.totalTokensOut)}</b> out`
@@ -751,6 +767,7 @@ function renderKeys() {
     card.querySelector('.card-stats').innerHTML = statsHtml;
     card.querySelector('.card-capacity').innerHTML = `
       <div class="card-capacity-head">
+        ${observedBadge}
         <span class="badge badge-blue">${esc(claim)}</span>
         ${k.capacity?.shouldRetry === true ? '<span class="badge badge-ok">retryable</span>' : ''}
         ${k.capacity?.shouldRetry === false ? '<span class="badge badge-rejected">no retry</span>' : ''}
@@ -886,6 +903,9 @@ function addLogEntry(event) {
       msg = `<span class="c-red">Error: ${esc(detail)}</span>`;
       break;
     }
+    case 'admin':
+      msg = `<span class="c-blue">${esc(String(event.detail || 'Admin action'))}</span>`;
+      break;
     default:
       msg = `<span class="c-dim">${esc(event.type)}</span>`;
   }
@@ -982,6 +1002,21 @@ async function refreshKeys() {
     renderKeys();
     renderHeader();
   } catch {}
+}
+
+async function resetKeyCooldowns() {
+  if (!confirm('Reset all key cooldowns and put every key back into rotation?')) return;
+  try {
+    const data = await api('POST', '/admin/keys/reset-cooldowns');
+    await refreshKeys();
+    addLogEntry({
+      type: 'admin',
+      ts: new Date().toISOString(),
+      detail: `Reset ${data.reset} key cooldown(s); ${data.availableKeys} / ${data.totalKeys} keys now available`,
+    });
+  } catch (err) {
+    alert('Failed to reset cooldowns: ' + err.message);
+  }
 }
 
 async function renameKey(maskedKey) {

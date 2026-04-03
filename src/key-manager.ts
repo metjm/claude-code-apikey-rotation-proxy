@@ -422,17 +422,8 @@ export class KeyManager {
     const available = this.keys
       .filter((k) => k.availableAt <= currentTime)
       .sort((a, b) => {
-        const healthRankDiff = capacityHealthRank(this.getCapacityHealth(a)) - capacityHealthRank(this.getCapacityHealth(b));
-        if (healthRankDiff !== 0) return healthRankDiff;
-        // Sort by priority within a health tier, then prefer lower utilization, then LRU.
+        // Hard routing still follows the original rules: priority first, then sticky reuse.
         if (a.priority !== b.priority) return a.priority - b.priority;
-        const utilA = representativeUtilization(a);
-        const utilB = representativeUtilization(b);
-        if (utilA !== utilB) {
-          if (!Number.isFinite(utilA)) return 1;
-          if (!Number.isFinite(utilB)) return -1;
-          return utilA - utilB;
-        }
         return (b.stats.lastUsedAt ?? 0) - (a.stats.lastUsedAt ?? 0);
       });
 
@@ -592,6 +583,18 @@ export class KeyManager {
       availableAt: new Date(entry.availableAt).toISOString(),
     });
     this.scheduleSave();
+  }
+
+  resetKeyCooldowns(): number {
+    const currentTime = now();
+    let reset = 0;
+    for (const entry of this.keys) {
+      if (entry.availableAt > currentTime) reset++;
+      entry.availableAt = unixMs(0);
+    }
+    this.db.run("UPDATE api_keys SET available_at = 0");
+    log("info", "Reset key cooldowns", { resetKeys: reset, totalKeys: this.keys.length });
+    return reset;
   }
 
   recordError(entry: ApiKeyEntry): void {
@@ -1438,9 +1441,8 @@ function stateToCapacity(
 
 function deriveCapacityHealth(entry: ApiKeyEntry): CapacityHealth {
   if (entry.availableAt > now()) return "cooling_down";
-  if (entry.capacity.overageStatus === "rejected") return "rejected";
   const windows = activeCapacityWindows(entry);
-  if (windows.some((window) => window.status === "rejected")) return "rejected";
+  if (windows.some((window) => window.status === "rejected")) return "warning";
   if (windows.some((window) => window.status === "allowed_warning")) return "warning";
   if (windows.some((window) => window.status === "allowed")) return "healthy";
   return "unknown";
@@ -1449,30 +1451,6 @@ function deriveCapacityHealth(entry: ApiKeyEntry): CapacityHealth {
 function activeCapacityWindows(entry: ApiKeyEntry): CapacityWindowSnapshot[] {
   const nowMs = now();
   return entry.capacity.windows.filter((window) => window.resetAt === null || window.resetAt > nowMs);
-}
-
-function representativeUtilization(entry: ApiKeyEntry): number {
-  const preferred = preferredCapacityWindow(entry);
-  if (preferred?.utilization !== null && preferred?.utilization !== undefined) return preferred.utilization;
-  const active = activeCapacityWindows(entry)
-    .map((window) => window.utilization)
-    .filter((value): value is number => value !== null);
-  return active.length > 0 ? Math.max(...active) : Number.POSITIVE_INFINITY;
-}
-
-function preferredCapacityWindow(entry: ApiKeyEntry): CapacityWindowSnapshot | undefined {
-  const claim = entry.capacity.representativeClaim;
-  if (claim === "five_hour") return entry.capacity.windows.find((window) => window.windowName.includes("5h"));
-  if (claim === "seven_day") return entry.capacity.windows.find((window) => window.windowName.includes("7d"));
-  return entry.capacity.windows[0];
-}
-
-function capacityHealthRank(health: CapacityHealth): number {
-  if (health === "healthy") return 0;
-  if (health === "warning") return 1;
-  if (health === "unknown") return 2;
-  if (health === "rejected") return 3;
-  return 4;
 }
 
 function boolToInt(value: boolean | null): number | null {

@@ -1499,6 +1499,7 @@ describe("Rate Limit Rotation End-to-End", () => {
     expect(limitedKey.capacity.overageDisabledReason).toBe("out_of_credits");
     expect(limitedKey.capacity.normalizedHeaderCount).toBeGreaterThanOrEqual(1);
     expect(limitedKey.capacity.windows.find((w: { windowName: string }) => w.windowName === "unified")!.status).toBe("rejected");
+    expect(limitedKey.capacity.windows.find((w: { windowName: string }) => w.windowName === "unified-overage")).toBeUndefined();
     expect(limitedKey.capacityHealth).toBe("cooling_down");
 
     expect(goodKey).toBeDefined();
@@ -1507,6 +1508,53 @@ describe("Rate Limit Rotation End-to-End", () => {
     // Totals should reflect both
     expect(body.totals.rateLimitHits).toBeGreaterThanOrEqual(1);
     expect(body.totals.successfulRequests).toBeGreaterThanOrEqual(1);
+  });
+
+  test("POST /admin/keys/reset-cooldowns puts cooled keys back into rotation", async () => {
+    let stats = await fetch(`${proxy.url}/admin/stats`);
+    let body = await stats.json();
+    let limitedKey = body.keys.find(
+      (k: { label: string }) => k.label === "limited-key",
+    );
+    expect(limitedKey).toBeDefined();
+
+    if (limitedKey.isAvailable) {
+      const prime = await fetch(`${proxy.url}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-3-haiku-20240307",
+          max_tokens: 100,
+          messages: [{ role: "user", content: "test" }],
+        }),
+      });
+      expect(prime.status).toBe(200);
+      stats = await fetch(`${proxy.url}/admin/stats`);
+      body = await stats.json();
+      limitedKey = body.keys.find(
+        (k: { label: string }) => k.label === "limited-key",
+      );
+      expect(limitedKey).toBeDefined();
+    }
+
+    expect(limitedKey.isAvailable).toBe(false);
+
+    const reset = await fetch(`${proxy.url}/admin/keys/reset-cooldowns`, {
+      method: "POST",
+    });
+    expect(reset.status).toBe(200);
+    const resetBody = await reset.json();
+    expect(resetBody.reset).toBeGreaterThanOrEqual(1);
+    expect(resetBody.availableKeys).toBe(2);
+
+    stats = await fetch(`${proxy.url}/admin/stats`);
+    body = await stats.json();
+    limitedKey = body.keys.find(
+      (k: { label: string }) => k.label === "limited-key",
+    );
+    expect(limitedKey).toBeDefined();
+    expect(limitedKey.isAvailable).toBe(true);
+    expect(limitedKey.availableAt).toBe(0);
   });
 
   test("all keys rate-limited returns 429 with retry-after", async () => {

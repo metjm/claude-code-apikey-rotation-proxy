@@ -491,6 +491,23 @@ describe("Key Stats Recording", () => {
     expect(entry2.availableAt).toBeLessThanOrEqual(after2 + 60_000);
   });
 
+  test("resetKeyCooldowns() clears cooldowns immediately and persists", () => {
+    const km = create();
+    const cooled = km.addKey(VALID_KEY_1, "cooled");
+    km.addKey(VALID_KEY_2, "ready");
+
+    km.recordRateLimit(cooled, 300);
+    expect(km.availableCount()).toBe(1);
+
+    expect(km.resetKeyCooldowns()).toBe(1);
+    expect(km.availableCount()).toBe(2);
+    expect(km.listKeys().every((key) => key.isAvailable)).toBe(true);
+
+    const reloaded = create();
+    expect(reloaded.availableCount()).toBe(2);
+    expect(reloaded.listKeys().every((key) => key.availableAt === 0)).toBe(true);
+  });
+
   test("recordError() increments errors", () => {
     const km = create();
     const entry = km.addKey(VALID_KEY_1, "err-test");
@@ -1102,7 +1119,7 @@ describe("Capacity telemetry", () => {
     const km = create();
     const healthy = km.addKey(VALID_KEY_1, "healthy");
     const warning = km.addKey(VALID_KEY_2, "warning");
-    const rejected = km.addKey(VALID_KEY_3, "rejected");
+    const observedRejected = km.addKey(VALID_KEY_3, "observed-rejected");
 
     km.recordCapacityObservation(healthy, {
       seenAt: unixMs(1_000),
@@ -1117,7 +1134,7 @@ describe("Capacity telemetry", () => {
       fallbackAvailable: true,
       windows: [{ windowName: "unified-5h", status: "allowed_warning", utilization: 0.86, resetAt: unixMs(Date.now() + 60_000) }],
     });
-    km.recordCapacityObservation(rejected, {
+    km.recordCapacityObservation(observedRejected, {
       seenAt: unixMs(1_200),
       httpStatus: 429,
       organizationId: "org-b",
@@ -1127,13 +1144,14 @@ describe("Capacity telemetry", () => {
 
     const summary = km.getCapacitySummary();
     expect(summary.healthyKeys).toBe(1);
-    expect(summary.warningKeys).toBe(1);
-    expect(summary.rejectedKeys).toBe(1);
+    expect(summary.warningKeys).toBe(2);
+    expect(summary.rejectedKeys).toBe(0);
     expect(summary.fallbackAvailableKeys).toBe(1);
     expect(summary.overageRejectedKeys).toBe(1);
     expect(summary.distinctOrganizations).toBe(2);
     expect(summary.windows[0]!.windowName).toBe("unified-5h");
     expect(summary.windows[0]!.warningKeys).toBe(1);
+    expect(summary.windows[0]!.rejectedKeys).toBe(1);
   });
 
   test("queryCapacityTimeseries returns per-window rollups", async () => {
@@ -1162,7 +1180,7 @@ describe("Capacity telemetry", () => {
     expect(buckets[0]!.maxUtilization).toBe(0.77);
   });
 
-  test("getNextAvailableKey prefers healthier keys over equally available warning keys", () => {
+  test("getNextAvailableKey ignores capacity analytics and keeps the original sticky selection logic", () => {
     const km = create();
     const warning = km.addKey(VALID_KEY_1, "warning-first");
     const healthy = km.addKey(VALID_KEY_2, "healthy-second");
@@ -1178,7 +1196,9 @@ describe("Capacity telemetry", () => {
       windows: [{ windowName: "unified", status: "allowed", utilization: 0.2, resetAt: unixMs(Date.now() + 60_000) }],
     });
 
-    expect(km.getNextAvailableKey()!.label).toBe(healthy.label);
+    km.recordRequest(warning);
+
+    expect(km.getNextAvailableKey()!.label).toBe(warning.label);
   });
 });
 
