@@ -71,12 +71,66 @@
     background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; padding: 16px;
     min-height: 200px; display: flex; flex-direction: column;
   }
+  .panel-full { margin-bottom: 16px; }
   .panel-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
   .panel-actions { display: flex; align-items: center; gap: 6px; }
   .panel-title { font-size: 13px; font-weight: 600; color: var(--text-bright); text-transform: uppercase; letter-spacing: 0.5px; }
   .btn { padding: 4px 12px; border-radius: 4px; border: 1px solid var(--border); background: var(--bg3); color: var(--text); font-family: var(--font); font-size: 12px; cursor: pointer; }
   .btn:hover { border-color: var(--blue); color: var(--blue); }
   .btn-danger:hover { border-color: var(--red); color: var(--red); }
+  .btn-link {
+    padding: 0; border: none; background: none; color: var(--text-dim);
+    font-family: var(--font); font-size: 11px; cursor: pointer;
+  }
+  .btn-link:hover { color: var(--blue); }
+
+  /* Tables */
+  .table-wrap {
+    flex: 1; overflow: auto; background: var(--bg); border: 1px solid var(--border);
+    border-radius: 6px;
+  }
+  .ops-table {
+    width: 100%; min-width: 1320px; border-collapse: collapse; font-size: 12px;
+  }
+  .ops-table th {
+    position: sticky; top: 0; z-index: 1;
+    text-align: left; padding: 10px 12px; background: var(--bg2); border-bottom: 1px solid var(--border);
+    color: var(--text-dim); font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600;
+  }
+  .ops-table td {
+    padding: 11px 12px; border-bottom: 1px solid rgba(48,54,61,0.4); vertical-align: top;
+  }
+  .ops-table tbody tr:hover td { background: rgba(88,166,255,0.04); }
+  .ops-table tbody tr.row-ok td:first-child { box-shadow: inset 3px 0 0 rgba(63,185,80,0.75); }
+  .ops-table tbody tr.row-warning td:first-child { box-shadow: inset 3px 0 0 rgba(210,153,34,0.85); }
+  .ops-table tbody tr.row-cooling td:first-child { box-shadow: inset 3px 0 0 rgba(210,153,34,0.95); }
+  .ops-table tbody tr.row-unknown td:first-child { box-shadow: inset 3px 0 0 rgba(139,148,158,0.55); }
+  .table-stack { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+  .table-title-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .table-title { color: var(--text-bright); font-size: 13px; font-weight: 600; }
+  .table-masked { color: var(--text-dim); font-size: 11px; }
+  .table-meta { color: var(--text-dim); font-size: 10px; line-height: 1.5; }
+  .table-body { color: var(--text); font-size: 12px; line-height: 1.5; }
+  .table-sub { color: var(--text-dim); font-size: 11px; line-height: 1.5; }
+  .table-metrics { display: flex; flex-direction: column; gap: 2px; }
+  .table-metrics strong { color: var(--text-bright); font-weight: 600; }
+  .window-list { display: flex; flex-direction: column; gap: 5px; }
+  .window-list-line {
+    display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: baseline;
+    background: var(--bg3); border: 1px solid var(--border); border-radius: 5px; padding: 4px 7px;
+  }
+  .window-list-line.tone-ok { border-color: rgba(63,185,80,0.35); }
+  .window-list-line.tone-warning { border-color: rgba(210,153,34,0.45); }
+  .window-list-line.tone-unknown { border-color: rgba(139,148,158,0.35); }
+  .window-list-name { color: var(--text-bright); font-weight: 600; font-size: 11px; }
+  .window-list-detail { color: var(--text-dim); font-size: 10px; }
+  .table-controls { display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
+  .key-priority-select {
+    min-width: 104px; background: var(--bg3); color: var(--text); border: 1px solid var(--border);
+    border-radius: 4px; font-family: var(--font); font-size: 11px; padding: 4px 6px; cursor: pointer;
+  }
+  .key-priority-select:focus { outline: none; border-color: var(--blue); }
+  .key-priority-select option { background: var(--bg2); color: var(--text); }
 
   /* Cards */
   .cards { display: flex; flex-wrap: wrap; gap: 8px; flex: 1; align-content: flex-start; }
@@ -262,57 +316,52 @@
     <div class="window-grid" id="capacity-window-summary"></div>
   </div>
 
-  <!-- Panels -->
-  <div class="panels">
-    <!-- API Keys -->
-    <div class="panel">
-      <div class="panel-header">
-        <span class="panel-title">API Keys</span>
-        <div class="panel-actions">
-          <button class="btn" onclick="resetKeyCooldowns()">Reset Cooldowns</button>
-          <button class="btn" onclick="toggleForm('key')">+ Add</button>
-        </div>
-      </div>
-      <div class="add-form" id="key-form">
-        <div class="field">
-          <label>API Key</label>
-          <input type="password" id="key-input" placeholder="sk-ant-api-...">
-        </div>
-        <div class="field" style="max-width:120px">
-          <label>Label</label>
-          <input type="text" id="key-label" placeholder="optional">
-        </div>
-        <button class="btn-submit" onclick="addKey()">Add</button>
-        <button class="btn btn-cancel" onclick="toggleForm('key')">Cancel</button>
-      </div>
-      <div class="form-error" id="key-error"></div>
-      <div class="cards" id="key-cards">
-        <div class="empty-state">No API keys configured</div>
+  <div class="panel panel-full">
+    <div class="panel-header">
+      <span class="panel-title">API Keys</span>
+      <div class="panel-actions">
+        <button class="btn" onclick="resetKeyCooldowns()">Reset Cooldowns</button>
+        <button class="btn" onclick="toggleForm('key')">+ Add</button>
       </div>
     </div>
+    <div class="add-form" id="key-form">
+      <div class="field">
+        <label>API Key</label>
+        <input type="password" id="key-input" placeholder="sk-ant-api-...">
+      </div>
+      <div class="field" style="max-width:120px">
+        <label>Label</label>
+        <input type="text" id="key-label" placeholder="optional">
+      </div>
+      <button class="btn-submit" onclick="addKey()">Add</button>
+      <button class="btn btn-cancel" onclick="toggleForm('key')">Cancel</button>
+    </div>
+    <div class="form-error" id="key-error"></div>
+    <div class="table-wrap" id="key-cards">
+      <div class="empty-state">No API keys configured</div>
+    </div>
+  </div>
 
-    <!-- Proxy Tokens -->
-    <div class="panel">
-      <div class="panel-header">
-        <span class="panel-title">Proxy Tokens (Users)</span>
-        <button class="btn" onclick="toggleForm('token')">+ Add</button>
+  <div class="panel" style="margin-bottom:16px">
+    <div class="panel-header">
+      <span class="panel-title">Proxy Tokens (Users)</span>
+      <button class="btn" onclick="toggleForm('token')">+ Add</button>
+    </div>
+    <div class="add-form" id="token-form">
+      <div class="field" style="max-width:160px">
+        <label>Label (e.g. email)</label>
+        <input type="text" id="token-label" placeholder="alice@company.com">
       </div>
-      <div class="add-form" id="token-form">
-        <div class="field" style="max-width:160px">
-          <label>Label (e.g. email)</label>
-          <input type="text" id="token-label" placeholder="alice@company.com">
-        </div>
-        <div class="field">
-          <label>Generated Token</label>
-          <input type="text" id="token-input" readonly class="token-readonly">
-        </div>
-        <button class="btn-submit" onclick="addToken()">Add</button>
-        <button class="btn btn-cancel" onclick="toggleForm('token')">Cancel</button>
+      <div class="field">
+        <label>Generated Token</label>
+        <input type="text" id="token-input" readonly class="token-readonly">
       </div>
-      <div class="form-error" id="token-error"></div>
-      <div class="cards" id="token-cards">
-        <div class="empty-state">No proxy tokens configured (proxy is open)</div>
-      </div>
+      <button class="btn-submit" onclick="addToken()">Add</button>
+      <button class="btn btn-cancel" onclick="toggleForm('token')">Cancel</button>
+    </div>
+    <div class="form-error" id="token-error"></div>
+    <div class="cards" id="token-cards">
+      <div class="empty-state">No proxy tokens configured (proxy is open)</div>
     </div>
   </div>
 
@@ -574,6 +623,11 @@ function humanizeClaim(claim) {
   if (claim === 'seven_day_opus') return '7d Opus window';
   return claim.replace(/_/g, ' ');
 }
+function humanizePriority(priority) {
+  if (Number(priority) === 1) return 'Preferred';
+  if (Number(priority) === 3) return 'Fallback';
+  return 'Normal';
+}
 function shortOrg(org) {
   if (!org) return '--';
   if (org.length <= 14) return org;
@@ -665,6 +719,13 @@ function summarizeWindow(window) {
   if (window.resetAt) bits.push(`resets in ${fmtCountdown(window.resetAt - Date.now())}`);
   return `${humanizeWindowName(window.windowName)}: ${bits.join(', ')}`;
 }
+function friendlyWindowName(windowName) {
+  if (windowName === 'unified') return 'Primary limit';
+  if (windowName === 'unified-5h') return '5h window';
+  if (windowName === 'unified-7d') return '7d window';
+  if (windowName === 'unified-overage') return 'Extra usage';
+  return humanizeWindowName(windowName);
+}
 function telemetryCoverageSummary(key) {
   const responseCount = key.capacity?.responseCount || 0;
   const normalizedCount = key.capacity?.normalizedHeaderCount || 0;
@@ -708,6 +769,23 @@ function overageNote(key) {
   if (key.capacity?.overageStatus !== 'rejected') return '';
   const reason = key.capacity?.overageDisabledReason || 'provider policy';
   return `Extra usage is blocked (${reason}). That does not remove the key from rotation by itself.`;
+}
+function telemetryCoverageLabel(key) {
+  const responseCount = key.capacity?.responseCount || 0;
+  const normalizedCount = key.capacity?.normalizedHeaderCount || 0;
+  if (responseCount === 0) return 'No upstream responses yet';
+  if (normalizedCount === 0) return 'Responses seen, but no supported limit headers';
+  const coreSignals = ['organization', 'representative_claim', 'windows', 'fallback', 'overage'];
+  let intermittent = false;
+  let missing = false;
+  for (const signalName of coreSignals) {
+    const seen = signalCoverage(key, signalName)?.seenCount || 0;
+    if (seen === 0) missing = true;
+    else if (seen < responseCount) intermittent = true;
+  }
+  if (!missing && !intermittent) return 'Coverage strong';
+  if (missing) return 'Coverage partial';
+  return 'Coverage intermittent';
 }
 function retryBadge(key) {
   if (key.capacity?.shouldRetry === true) return '<span class="badge badge-ok">auto-retry OK</span>';
@@ -785,6 +863,65 @@ function capacityHeadline(key) {
     subtitle: 'Use the detailed rows below for the raw window data.',
   };
 }
+function capacityTableSummary(key, telemetry) {
+  const windows = sortedCapacityWindows(key);
+  const conflictingWindow = windows.find(window => window.status === 'rejected');
+  const warningWindow = windows.find(window => window.surpassedThreshold || window.status === 'allowed_warning');
+  const healthyWindow = windows.find(window => window.status === 'allowed') || windows[0] || null;
+  if (!key.isAvailable) {
+    const rem = key.availableAt - Date.now();
+    return {
+      main: 'Real rate-limit cooldown is active.',
+      sub: rem > 0 ? `Routing resumes in ${fmtCountdown(rem)}.` : 'Routing should resume shortly.',
+    };
+  }
+  if ((key.capacity?.responseCount || 0) === 0) {
+    return {
+      main: 'The dashboard has not seen this key hit upstream yet.',
+      sub: 'Capacity signals appear after the first upstream response.',
+    };
+  }
+  if ((key.capacity?.normalizedHeaderCount || 0) === 0) {
+    return {
+      main: 'Responses were observed, but no supported limit headers were parsed.',
+      sub: 'Treat quota telemetry as unavailable for now.',
+    };
+  }
+  if (key.capacity?.retryAfterSecs && key.capacity.retryAfterSecs > 0) {
+    return {
+      main: 'Upstream asked clients to wait before retrying.',
+      sub: `Latest retry guidance is ${fmtCountdown(key.capacity.retryAfterSecs * 1000)}.`,
+    };
+  }
+  if (conflictingWindow) {
+    return {
+      main: `${friendlyWindowName(conflictingWindow.windowName)} reported a contradictory "reached" signal on a successful response.`,
+      sub: 'The key is still routable; treat this as analytics, not a block.',
+    };
+  }
+  if (warningWindow) {
+    return {
+      main: `${friendlyWindowName(warningWindow.windowName)} is the main pressure point.`,
+      sub: summarizeWindow(warningWindow),
+    };
+  }
+  if (healthyWindow) {
+    return {
+      main: 'Recent telemetry says this key still has usable headroom.',
+      sub: summarizeWindow(healthyWindow),
+    };
+  }
+  return {
+    main: telemetry.title,
+    sub: telemetry.subtitle,
+  };
+}
+function keyRowTone(key, telemetry) {
+  if (!key.isAvailable) return 'row-cooling';
+  if (telemetry.badgeClass === 'badge-warning' || telemetry.badgeClass === 'badge-ratelimited') return 'row-warning';
+  if (telemetry.badgeClass === 'badge-ok') return 'row-ok';
+  return 'row-unknown';
+}
 function renderCapacitySummary() {
   const grid = document.getElementById('capacity-summary-grid');
   const windowsEl = document.getElementById('capacity-window-summary');
@@ -846,39 +983,41 @@ function renderCapacitySummary() {
 // ── Render keys ────────────────────────────────────────────────
 function renderKeys() {
   const el = document.getElementById('key-cards');
+  const active = document.activeElement;
+  if (active && active.tagName === 'SELECT' && active.closest('#key-cards')) {
+    return;
+  }
   if (keys.length === 0) {
     el.innerHTML = '<div class="empty-state">No API keys configured</div>';
     return;
   }
-  const totalReqs = keys.reduce((s, k) => s + k.stats.totalRequests, 0);
-  const wantedKeys = new Set(keys.map(k => k.maskedKey));
+  const displayKeys = [...keys].sort((a, b) =>
+    (Number(a.priority || 2) - Number(b.priority || 2))
+    || String(a.label).localeCompare(String(b.label))
+  );
 
-  // Remove cards for keys that no longer exist
-  for (const card of [...el.querySelectorAll('.card')]) {
-    if (!wantedKeys.has(card.dataset.key)) card.remove();
-  }
+  let html = `<table class="ops-table">
+    <thead>
+      <tr>
+        <th>Key</th>
+        <th>Routing</th>
+        <th>Quota Summary</th>
+        <th>Recent Windows</th>
+        <th>Traffic</th>
+        <th>Telemetry</th>
+        <th>Fallback / Extra Usage</th>
+        <th>Controls</th>
+      </tr>
+    </thead>
+    <tbody>`;
 
-  // Remove empty-state placeholder if present
-  const empty = el.querySelector('.empty-state');
-  if (empty) empty.remove();
-
-  keys.forEach(k => {
-    const ratio = totalReqs > 0 ? k.stats.totalRequests / totalReqs : 0;
+  for (const k of displayKeys) {
     const cc = keyColor(k.label);
     const pri = k.priority || 2;
     const badge = routingBadge(k);
     const telemetry = capacityHeadline(k);
-    const windows = sortedCapacityWindows(k);
-    const windowsHtml = windows.slice(0, 4).map(window => {
-      const usage = window.utilization !== null && window.utilization !== undefined ? `${fmtPct(window.utilization)} used` : 'usage --';
-      const reset = window.resetAt ? `resets in ${fmtCountdown(window.resetAt - Date.now())}` : 'reset unknown';
-      return `<div class="capacity-window-row tone-${esc(windowTone(window))}">
-        <span class="capacity-window-name">${esc(humanizeWindowName(window.windowName))}</span>
-        <span class="capacity-window-detail">${esc(usage)}</span>
-        <span class="capacity-window-detail">${esc(readableWindowStatus(window))}</span>
-        <span class="capacity-window-detail">${esc(reset)}</span>
-      </div>`;
-    }).join('');
+    const summary = capacityTableSummary(k, telemetry);
+    const tone = keyRowTone(k, telemetry);
     const claim = k.capacity?.representativeClaim ? humanizeClaim(k.capacity.representativeClaim) : 'Unknown';
     const fallback = describeFallback(k);
     const overage = describeOverage(k);
@@ -887,91 +1026,89 @@ function renderKeys() {
     const normalizedCount = k.capacity?.normalizedHeaderCount || 0;
     const responseAge = k.capacity?.lastResponseAt ? fmtRelative(new Date(k.capacity.lastResponseAt).toISOString()) : '--';
     const signalAge = k.capacity?.lastHeaderAt ? fmtRelative(new Date(k.capacity.lastHeaderAt).toISOString()) : '--';
-    const coverageSummary = telemetryCoverageSummary(k);
-    const extraUsageNote = overageNote(k);
+    const retryGuidance = k.capacity?.retryAfterSecs && k.capacity.retryAfterSecs > 0 ? fmtCountdown(k.capacity.retryAfterSecs * 1000) : '--';
+    const windows = sortedCapacityWindows(k);
+    const windowsHtml = windows.length > 0
+      ? `<div class="window-list">${windows.slice(0, 4).map(window => {
+          const details = [];
+          if (window.utilization !== null && window.utilization !== undefined) details.push(`${fmtPct(window.utilization)} used`);
+          details.push(readableWindowStatus(window));
+          if (window.resetAt) details.push(`resets in ${fmtCountdown(window.resetAt - Date.now())}`);
+          return `<div class="window-list-line tone-${esc(windowTone(window))}">
+            <span class="window-list-name">${esc(friendlyWindowName(window.windowName))}</span>
+            ${details.map(detail => `<span class="window-list-detail">${esc(detail)}</span>`).join('')}
+          </div>`;
+        }).join('')}</div>`
+      : `<div class="table-sub">No active limit windows observed yet.</div>`;
+    const keyRef = JSON.stringify(k.maskedKey);
 
-    let card = el.querySelector(`.card[data-key="${CSS.escape(k.maskedKey)}"]`);
-    if (!card) {
-      // Create new card
-      card = document.createElement('div');
-      card.className = 'card';
-      card.dataset.key = k.maskedKey;
-      card.innerHTML = `
-        <button class="card-remove" title="Remove key">&times;</button>
-        <div class="card-label"><span class="editable" title="Click to rename"></span></div>
-        <div class="card-masked"></div>
-        <div class="card-bar"><div class="card-bar-fill"></div></div>
-        <div class="card-stats"></div>
-        <div class="card-capacity"></div>
-        <select class="priority-select" title="Selection priority">
-          <option value="1">Preferred</option>
-          <option value="2">Normal</option>
-          <option value="3">Fallback</option>
-        </select>`;
-      card.querySelector('.card-remove').onclick = () => removeKey(k.maskedKey);
-      card.querySelector('.editable').onclick = () => renameKey(k.maskedKey);
-      card.querySelector('.priority-select').onchange = function() { updateKeyPriority(k.maskedKey, Number(this.value)); };
-      el.appendChild(card);
-    }
-
-    // Patch changing values
-    const labelSpan = card.querySelector('.editable');
-    if (labelSpan.textContent !== k.label) {
-      labelSpan.textContent = k.label;
-      card.querySelector('.card-label').className = 'card-label ' + cc;
-    }
-    const maskedDiv = card.querySelector('.card-masked');
-    if (maskedDiv.textContent !== k.maskedKey) maskedDiv.textContent = k.maskedKey;
-
-    const fill = card.querySelector('.card-bar-fill');
-    fill.style.width = (ratio * 100).toFixed(1) + '%';
-    fill.style.background = k.isAvailable ? 'var(--blue)' : 'var(--yellow)';
-
-    let statsHtml = `<b>${fmtNum(k.stats.totalRequests)}</b> req &nbsp;`
-      + `<b>${fmtNum(k.stats.totalTokensIn)}</b> in / <b>${fmtNum(k.stats.totalTokensOut)}</b> out`
-      + ((k.stats.totalCacheRead || 0) > 0 ? ` &nbsp;<span class="c-dim">${fmtNum(k.stats.totalCacheRead)} cached</span>` : '')
-      + ((k.stats.totalCacheCreation || 0) > 0 ? ` &nbsp;<span class="c-dim">${fmtNum(k.stats.totalCacheCreation)} cache-write</span>` : '')
-      + '<br>' + badge
-      + (k.stats.rateLimitHits > 0 ? ` &nbsp;<span class="c-dim">${k.stats.rateLimitHits} rate-limits</span>` : '')
-      + ((k.recentErrors || 0) > 0 ? ` &nbsp;<span class="c-red">${k.recentErrors} errors (1h)</span>` : '');
-    card.querySelector('.card-stats').innerHTML = statsHtml;
-    card.querySelector('.card-capacity').innerHTML = `
-      <div class="card-capacity-head">
-        <span class="badge ${esc(telemetry.badgeClass)}">${esc(telemetry.badgeLabel)}</span>
-        ${retryBadge(k)}
-      </div>
-      <div class="capacity-summary">
-        <div class="capacity-summary-title">${esc(telemetry.title)}</div>
-        <div class="capacity-summary-sub">${esc(telemetry.subtitle)}</div>
-      </div>
-      <div class="capacity-grid">
-        <span><b>Primary driver</b> ${esc(claim)}</span>
-        <span><b>Organization</b> ${esc(shortOrg(k.capacity?.organizationId))}</span>
-        <span><b>Fallback path</b> ${esc(fallback)}</span>
-        <span><b>Extra usage</b> ${esc(overage)}</span>
-        <span><b>Responses seen</b> ${fmtNum(responseCount)}</span>
-        <span><b>Signals parsed</b> ${fmtNum(normalizedCount)}${responseCount > 0 ? ` (${fmtPct(normalizedCount / responseCount)})` : ''}</span>
-        <span><b>Last response</b> ${esc(responseAge)}</span>
-        <span><b>Latency</b> ${esc(latency)}</span>
-        <span><b>Last telemetry</b> ${esc(signalAge)}</span>
-        <span><b>Request ID</b> ${esc(k.capacity?.lastRequestId ? shortId(k.capacity.lastRequestId) : '--')}</span>
-      </div>
-      ${windowsHtml ? `
-        <div class="capacity-section">
-          <div class="capacity-section-label">Recent limit windows</div>
-          <div class="capacity-window-list">${windowsHtml}</div>
+    html += `<tr class="${esc(tone)}">
+      <td>
+        <div class="table-stack">
+          <div class="table-title-row">
+            <span class="table-title ${esc(cc)}">${esc(k.label)}</span>
+            <button class="btn-link" onclick='renameKey(${keyRef})'>Rename</button>
+          </div>
+          <div class="table-masked">${esc(k.maskedKey)}</div>
+          <div class="table-meta">${esc(humanizePriority(pri))} · Org ${esc(shortOrg(k.capacity?.organizationId))} · Driver ${esc(claim)}</div>
         </div>
-      ` : '<div class="card-note">No active rate-limit windows were observed for this key yet.</div>'}
-      ${extraUsageNote ? `<div class="card-note">${esc(extraUsageNote)}</div>` : ''}
-      <div class="card-note">${esc(coverageSummary)}</div>
-    `;
+      </td>
+      <td>
+        <div class="table-stack">
+          <div>${badge}</div>
+          <div class="table-sub">${k.isAvailable ? 'Routing active now.' : `Cooling ends in ${fmtCountdown(k.availableAt - Date.now())}.`}</div>
+          <div class="table-meta">${fmtNum(k.stats.rateLimitHits)} rate-limits · ${fmtNum(k.recentErrors || 0)} recent errors</div>
+        </div>
+      </td>
+      <td>
+        <div class="table-stack">
+          <div class="table-title-row">
+            <span class="badge ${esc(telemetry.badgeClass)}">${esc(telemetry.badgeLabel)}</span>
+            ${retryBadge(k)}
+          </div>
+          <div class="table-body">${esc(summary.main)}</div>
+          <div class="table-sub">${esc(summary.sub)}</div>
+        </div>
+      </td>
+      <td>${windowsHtml}</td>
+      <td>
+        <div class="table-metrics">
+          <div><strong>${fmtNum(k.stats.totalRequests)}</strong> requests</div>
+          <div>${fmtNum(k.stats.totalTokensIn)} in / ${fmtNum(k.stats.totalTokensOut)} out</div>
+          <div>${fmtNum(k.stats.totalCacheRead || 0)} cache read / ${fmtNum(k.stats.totalCacheCreation || 0)} cache write</div>
+        </div>
+      </td>
+      <td>
+        <div class="table-metrics">
+          <div><strong>${fmtNum(responseCount)}</strong> responses · ${fmtNum(normalizedCount)} parsed${responseCount > 0 ? ` (${fmtPct(normalizedCount / responseCount)})` : ''}</div>
+          <div>${esc(telemetryCoverageLabel(k))}</div>
+          <div>Last response ${esc(responseAge)} · last telemetry ${esc(signalAge)}</div>
+          <div>Latency ${esc(latency)} · request ${esc(k.capacity?.lastRequestId ? shortId(k.capacity.lastRequestId) : '--')}</div>
+        </div>
+      </td>
+      <td>
+        <div class="table-metrics">
+          <div><strong>Fallback:</strong> ${esc(fallback)}</div>
+          <div><strong>Extra usage:</strong> ${esc(overage)}</div>
+          <div><strong>Retry guidance:</strong> ${esc(retryGuidance)}</div>
+          ${overageNote(k) ? `<div class="table-sub">${esc(overageNote(k))}</div>` : ''}
+        </div>
+      </td>
+      <td>
+        <div class="table-controls">
+          <select class="key-priority-select" title="Selection priority" onchange='updateKeyPriority(${keyRef}, Number(this.value))'>
+            <option value="1"${pri === 1 ? ' selected' : ''}>Preferred</option>
+            <option value="2"${pri === 2 ? ' selected' : ''}>Normal</option>
+            <option value="3"${pri === 3 ? ' selected' : ''}>Fallback</option>
+          </select>
+          <button class="btn-link" onclick='removeKey(${keyRef})'>Remove</button>
+        </div>
+      </td>
+    </tr>`;
+  }
 
-    // Update priority dropdown only if user isn't interacting with it
-    const sel = card.querySelector('.priority-select');
-    if (document.activeElement !== sel && Number(sel.value) !== pri) {
-      sel.value = pri;
-    }
-  });
+  html += '</tbody></table>';
+  el.innerHTML = html;
 }
 
 // ── Render tokens ──────────────────────────────────────────────
