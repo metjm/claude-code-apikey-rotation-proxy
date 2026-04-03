@@ -248,6 +248,10 @@ function cleanupTempDir(dir: string): void {
   }
 }
 
+function futureEpochSeconds(offsetMs: number): string {
+  return String(Math.floor((Date.now() + offsetMs) / 1000));
+}
+
 /** Simple JSON mock upstream that returns a success response */
 function jsonOkHandler(): (req: Request) => Response {
   return () =>
@@ -1150,6 +1154,251 @@ describe("Full Proxy Flow", () => {
   });
 });
 
+// ── Capacity Telemetry End-to-End ────────────────────────────────
+
+describe("Capacity Telemetry End-to-End", () => {
+  test("normalized headers are reflected in /admin/stats and pool summary", async () => {
+    const dir = makeTempDir();
+    const up = startMockUpstream(() =>
+      new Response(
+        JSON.stringify({
+          usage: { input_tokens: 10, output_tokens: 4 },
+        }),
+        {
+          status: 200,
+          headers: {
+            "content-type": "application/json",
+            "request-id": "req-cap-e2e-1",
+            "anthropic-organization-id": "org-cap-e2e",
+            "anthropic-ratelimit-unified-representative-claim": "seven_day",
+            "anthropic-ratelimit-unified-status": "allowed_warning",
+            "anthropic-ratelimit-unified-reset": futureEpochSeconds(45 * 60_000),
+            "anthropic-ratelimit-unified-7d-status": "allowed_warning",
+            "anthropic-ratelimit-unified-7d-utilization": "0.93",
+            "anthropic-ratelimit-unified-7d-reset": futureEpochSeconds(7 * 24 * 60 * 60_000),
+            "anthropic-ratelimit-unified-fallback": "available",
+            "anthropic-ratelimit-unified-fallback-percentage": "0.5",
+            "x-should-retry": "false",
+            "x-envoy-upstream-service-time": "1876",
+          },
+        },
+      ),
+    );
+    const p = startProxy({ dataDir: dir, upstream: up.url });
+    p.km.addKey(FAKE_KEY_1, "cap-e2e-key");
+
+    const res = await fetch(`${p.url}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-3-haiku-20240307",
+        max_tokens: 8,
+        messages: [{ role: "user", content: "capacity" }],
+      }),
+    });
+    expect(res.status).toBe(200);
+    await res.json();
+
+    const stats = await fetch(`${p.url}/admin/stats`);
+    const body = await stats.json();
+    const key = body.keys.find((k: { label: string }) => k.label === "cap-e2e-key");
+
+    expect(key).toBeDefined();
+    expect(key.capacity.organizationId).toBe("org-cap-e2e");
+    expect(key.capacity.lastRequestId).toBe("req-cap-e2e-1");
+    expect(key.capacity.representativeClaim).toBe("seven_day");
+    expect(key.capacity.responseCount).toBe(1);
+    expect(key.capacity.normalizedHeaderCount).toBe(1);
+    expect(key.capacity.shouldRetry).toBe(false);
+    expect(key.capacity.fallbackAvailable).toBe(true);
+    expect(key.capacity.fallbackPercentage).toBe(0.5);
+    expect(key.capacity.latencyMs).toBe(1876);
+    expect(key.capacityHealth).toBe("warning");
+    expect(key.capacity.signalCoverage.find((s: { signalName: string }) => s.signalName === "windows")).toBeDefined();
+    expect(key.capacity.windows.find((w: { windowName: string }) => w.windowName === "unified-7d")!.utilization).toBe(0.93);
+
+    expect(body.capacitySummary.warningKeys).toBe(1);
+    expect(body.capacitySummary.fallbackAvailableKeys).toBe(1);
+    expect(body.capacitySummary.distinctOrganizations).toBe(1);
+    expect(body.capacitySummary.windows.find((w: { windowName: string }) => w.windowName === "unified-7d")!.maxUtilization).toBe(0.93);
+
+    p.stop();
+    up.stop();
+    cleanupTempDir(dir);
+  });
+
+  test("responses without normalized headers increase response counts without fabricating signal state", async () => {
+    const dir = makeTempDir();
+    const up = startMockUpstream(() =>
+      new Response(
+        JSON.stringify({ ok: true }),
+        {
+          status: 200,
+          headers: {
+            "content-type": "application/json",
+            "x-custom-response": "present",
+          },
+        },
+      ),
+    );
+    const p = startProxy({ dataDir: dir, upstream: up.url });
+    p.km.addKey(FAKE_KEY_1, "cap-sparse-key");
+
+    const res = await fetch(`${p.url}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-3-haiku-20240307",
+        max_tokens: 4,
+        messages: [{ role: "user", content: "sparse" }],
+      }),
+    });
+    expect(res.status).toBe(200);
+    await res.json();
+
+    const stats = await fetch(`${p.url}/admin/stats`);
+    const body = await stats.json();
+    const key = body.keys.find((k: { label: string }) => k.label === "cap-sparse-key");
+
+    expect(key).toBeDefined();
+    expect(key.capacity.responseCount).toBe(1);
+    expect(key.capacity.normalizedHeaderCount).toBe(0);
+    expect(key.capacity.lastResponseAt).not.toBeNull();
+    expect(key.capacity.lastHeaderAt).toBeNull();
+    expect(key.capacity.signalCoverage).toEqual([]);
+    expect(key.capacity.windows).toEqual([]);
+    expect(key.capacityHealth).toBe("unknown");
+    expect(body.capacitySummary.windows).toEqual([]);
+
+    p.stop();
+    up.stop();
+    cleanupTempDir(dir);
+  });
+
+  test("/admin/capacity/timeseries rolls up observed windows", async () => {
+    const dir = makeTempDir();
+    const up = startMockUpstream(() =>
+      new Response(
+        JSON.stringify({ ok: true }),
+        {
+          status: 200,
+          headers: {
+            "content-type": "application/json",
+            "anthropic-ratelimit-unified-5h-status": "allowed",
+            "anthropic-ratelimit-unified-5h-utilization": "0.41",
+            "anthropic-ratelimit-unified-5h-reset": futureEpochSeconds(5 * 60 * 60_000),
+            "anthropic-ratelimit-unified-7d-status": "allowed_warning",
+            "anthropic-ratelimit-unified-7d-utilization": "0.88",
+            "anthropic-ratelimit-unified-7d-reset": futureEpochSeconds(7 * 24 * 60 * 60_000),
+          },
+        },
+      ),
+    );
+    const p = startProxy({ dataDir: dir, upstream: up.url });
+    p.km.addKey(FAKE_KEY_1, "cap-ts-key");
+
+    const res = await fetch(`${p.url}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-3-haiku-20240307",
+        max_tokens: 4,
+        messages: [{ role: "user", content: "timeseries" }],
+      }),
+    });
+    expect(res.status).toBe(200);
+    await res.json();
+
+    // Flush debounced capacity timeseries writes before re-reading through HTTP.
+    p.stop();
+    const reloaded = startProxy({ dataDir: dir, upstream: up.url });
+
+    const tsRes = await fetch(`${reloaded.url}/admin/capacity/timeseries?hours=24&resolution=hour&key=cap-ts-key`);
+    expect(tsRes.status).toBe(200);
+    const tsBody = await tsRes.json();
+
+    expect(tsBody.buckets.length).toBe(2);
+    const fiveHour = tsBody.buckets.find((b: { windowName: string }) => b.windowName === "unified-5h");
+    const sevenDay = tsBody.buckets.find((b: { windowName: string }) => b.windowName === "unified-7d");
+    expect(fiveHour.allowed).toBe(1);
+    expect(fiveHour.maxUtilization).toBe(0.41);
+    expect(sevenDay.warning).toBe(1);
+    expect(sevenDay.maxUtilization).toBe(0.88);
+
+    reloaded.stop();
+    up.stop();
+    cleanupTempDir(dir);
+  });
+
+  test("initial SSE snapshot includes capacitySummary and per-key capacity state", async () => {
+    const dir = makeTempDir();
+    const up = startMockUpstream(() =>
+      new Response(
+        JSON.stringify({ ok: true }),
+        {
+          status: 200,
+          headers: {
+            "content-type": "application/json",
+            "anthropic-organization-id": "org-sse-cap",
+            "anthropic-ratelimit-unified-status": "allowed_warning",
+            "anthropic-ratelimit-unified-utilization": "0.77",
+            "anthropic-ratelimit-unified-reset": futureEpochSeconds(30 * 60_000),
+          },
+        },
+      ),
+    );
+    const p = startProxy({ dataDir: dir, upstream: up.url });
+    p.km.addKey(FAKE_KEY_1, "cap-sse-key");
+
+    const proxyRes = await fetch(`${p.url}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-3-haiku-20240307",
+        max_tokens: 4,
+        messages: [{ role: "user", content: "sse" }],
+      }),
+    });
+    expect(proxyRes.status).toBe(200);
+    await proxyRes.json();
+
+    const controller = new AbortController();
+    const sseRes = await fetch(`${p.url}/admin/events`, { signal: controller.signal });
+    expect(sseRes.status).toBe(200);
+
+    const reader = sseRes.body!.getReader();
+    const decoder = new TextDecoder();
+    let accumulated = "";
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      accumulated += decoder.decode(value, { stream: true });
+      if (accumulated.includes("\n\n")) break;
+    }
+
+    controller.abort();
+    try { reader.cancel(); } catch {}
+
+    const firstLine = accumulated
+      .split("\n")
+      .find((line) => line.startsWith("data: "));
+    expect(firstLine).toBeDefined();
+    const event = JSON.parse(firstLine!.slice(6));
+    const key = event.keys.find((k: { label: string }) => k.label === "cap-sse-key");
+
+    expect(event.type).toBe("keys");
+    expect(event.capacitySummary.warningKeys).toBe(1);
+    expect(event.capacitySummary.windows[0].windowName).toBe("unified");
+    expect(key.capacity.organizationId).toBe("org-sse-cap");
+    expect(key.capacity.responseCount).toBe(1);
+    expect(key.capacity.normalizedHeaderCount).toBe(1);
+
+    p.stop();
+    up.stop();
+    cleanupTempDir(dir);
+  });
+});
+
 // ── Rate Limit Rotation End-to-End ───────────────────────────────
 
 describe("Rate Limit Rotation End-to-End", () => {
@@ -1177,6 +1426,10 @@ describe("Rate Limit Rotation End-to-End", () => {
             headers: {
               "content-type": "application/json",
               "retry-after": "30",
+              "anthropic-ratelimit-unified-status": "rejected",
+              "anthropic-ratelimit-unified-reset": futureEpochSeconds(30 * 60_000),
+              "anthropic-ratelimit-unified-overage-status": "rejected",
+              "anthropic-ratelimit-unified-overage-disabled-reason": "out_of_credits",
             },
           },
         );
@@ -1241,6 +1494,12 @@ describe("Rate Limit Rotation End-to-End", () => {
     expect(limitedKey).toBeDefined();
     expect(limitedKey.stats.rateLimitHits).toBeGreaterThanOrEqual(1);
     expect(limitedKey.isAvailable).toBe(false); // rate limited
+    expect(limitedKey.capacity.retryAfterSecs).toBe(30);
+    expect(limitedKey.capacity.overageStatus).toBe("rejected");
+    expect(limitedKey.capacity.overageDisabledReason).toBe("out_of_credits");
+    expect(limitedKey.capacity.normalizedHeaderCount).toBeGreaterThanOrEqual(1);
+    expect(limitedKey.capacity.windows.find((w: { windowName: string }) => w.windowName === "unified")!.status).toBe("rejected");
+    expect(limitedKey.capacityHealth).toBe("cooling_down");
 
     expect(goodKey).toBeDefined();
     expect(goodKey.stats.successfulRequests).toBeGreaterThanOrEqual(1);

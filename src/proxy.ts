@@ -1,5 +1,11 @@
 import type { KeyManager } from "./key-manager.ts";
-import type { ProxyConfig, ProxyResult, ProxyTokenEntry } from "./types.ts";
+import {
+  type CapacityObservation,
+  type ProxyConfig,
+  type ProxyResult,
+  type ProxyTokenEntry,
+  unixMs,
+} from "./types.ts";
 import { log } from "./logger.ts";
 import { emitWithKeys } from "./events.ts";
 import type { SchemaTracker } from "./schema-tracker.ts";
@@ -97,6 +103,7 @@ export async function proxyRequest(
     }, keyManager.listKeys());
 
     let upstream: Response;
+    const fetchStartedAt = Date.now();
     try {
       upstream = await fetchUpstream(upstreamUrl, req.method, headers, req.body);
     } catch (err) {
@@ -118,6 +125,13 @@ export async function proxyRequest(
         usedKey: entry,
       };
     }
+
+    const capacityObservation = extractCapacityObservation(
+      upstream.headers,
+      upstream.status,
+      fetchStartedAt,
+    );
+    keyManager.recordCapacityObservation(entry, capacityObservation);
 
     log("info", "Upstream responded", {
       label: entry.label,
@@ -262,6 +276,178 @@ function parseRetryAfter(header: string | null): number {
   return Number.isFinite(secs) && secs > 0 ? secs : 60;
 }
 
+function extractCapacityObservation(
+  headers: Headers,
+  status: number,
+  fetchStartedAt: number,
+): CapacityObservation {
+  const observedSignals = new Set<string>();
+  let requestId: string | undefined;
+  let organizationId: string | undefined;
+  let representativeClaim: string | undefined;
+  let retryAfterSecs: number | undefined;
+  let shouldRetry: boolean | undefined;
+  let fallbackAvailable: boolean | undefined;
+  let fallbackPercentage: number | undefined;
+  let overageStatus: string | undefined;
+  let overageDisabledReason: string | undefined;
+  let latencyMs: number | undefined;
+
+  const windows = new Map<string, {
+    windowName: string;
+    status?: string | null;
+    utilization?: number | null;
+    resetAt?: ReturnType<typeof unixMs> | null;
+    surpassedThreshold?: number | null;
+  }>();
+
+  const requestIdHeader = headers.get("request-id") ?? headers.get("x-request-id");
+  if (requestIdHeader !== null) {
+    requestId = requestIdHeader;
+    observedSignals.add("request_id");
+  }
+
+  const organizationHeader = headers.get("anthropic-organization-id");
+  if (organizationHeader !== null) {
+    organizationId = organizationHeader;
+    observedSignals.add("organization");
+  }
+
+  const representativeClaimHeader = headers.get("anthropic-ratelimit-unified-representative-claim");
+  if (representativeClaimHeader !== null) {
+    representativeClaim = representativeClaimHeader;
+    observedSignals.add("representative_claim");
+  }
+
+  const retryAfterHeader = headers.get("retry-after");
+  if (retryAfterHeader !== null) {
+    observedSignals.add("retry_after");
+  }
+  if (retryAfterHeader !== null || status === RATE_LIMIT_STATUS) {
+    retryAfterSecs = parseRetryAfter(retryAfterHeader);
+  }
+
+  const shouldRetryHeader = headers.get("x-should-retry");
+  if (shouldRetryHeader === "true") {
+    shouldRetry = true;
+    observedSignals.add("should_retry");
+  } else if (shouldRetryHeader === "false") {
+    shouldRetry = false;
+    observedSignals.add("should_retry");
+  }
+
+  const fallbackHeader = headers.get("anthropic-ratelimit-unified-fallback");
+  if (fallbackHeader === "available") {
+    fallbackAvailable = true;
+    observedSignals.add("fallback");
+  } else if (fallbackHeader === "unavailable") {
+    fallbackAvailable = false;
+    observedSignals.add("fallback");
+  }
+
+  const fallbackPercentageHeader = parseFinite(headers.get("anthropic-ratelimit-unified-fallback-percentage"));
+  if (fallbackPercentageHeader !== null) {
+    fallbackPercentage = fallbackPercentageHeader;
+    observedSignals.add("fallback");
+  }
+
+  const overageStatusHeader = headers.get("anthropic-ratelimit-unified-overage-status");
+  if (overageStatusHeader !== null) {
+    overageStatus = overageStatusHeader;
+    observedSignals.add("overage");
+  }
+
+  const overageDisabledReasonHeader = headers.get("anthropic-ratelimit-unified-overage-disabled-reason");
+  if (overageDisabledReasonHeader !== null) {
+    overageDisabledReason = overageDisabledReasonHeader;
+    observedSignals.add("overage");
+  }
+
+  const headerLatency = parseLatencyMs(headers);
+  if (headerLatency !== null) latencyMs = headerLatency;
+  else latencyMs = Math.max(0, Date.now() - fetchStartedAt);
+
+  for (const [name, value] of headers.entries()) {
+    const match = /^anthropic-ratelimit-(.+)-(status|utilization|reset|surpassed-threshold)$/.exec(name);
+    if (!match) continue;
+
+    const [, rawWindowName, field] = match;
+    if (!rawWindowName) continue;
+    observedSignals.add("windows");
+
+    const current = windows.get(rawWindowName) ?? { windowName: rawWindowName };
+    if (field === "status") {
+      current.status = value;
+    } else if (field === "utilization") {
+      const parsed = parseFinite(value);
+      if (parsed !== null) current.utilization = parsed;
+    } else if (field === "reset") {
+      const parsed = parseEpochMs(value);
+      if (parsed !== null) current.resetAt = parsed;
+    } else if (field === "surpassed-threshold") {
+      const parsed = parseFinite(value);
+      if (parsed !== null) current.surpassedThreshold = parsed;
+    }
+    windows.set(rawWindowName, current);
+  }
+
+  return {
+    seenAt: unixMs(Date.now()),
+    httpStatus: status,
+    ...(requestId !== undefined ? { requestId } : {}),
+    ...(organizationId !== undefined ? { organizationId } : {}),
+    ...(representativeClaim !== undefined ? { representativeClaim } : {}),
+    ...(retryAfterSecs !== undefined ? { retryAfterSecs } : {}),
+    ...(shouldRetry !== undefined ? { shouldRetry } : {}),
+    ...(fallbackAvailable !== undefined ? { fallbackAvailable } : {}),
+    ...(fallbackPercentage !== undefined ? { fallbackPercentage } : {}),
+    ...(overageStatus !== undefined ? { overageStatus } : {}),
+    ...(overageDisabledReason !== undefined ? { overageDisabledReason } : {}),
+    ...(latencyMs !== undefined ? { latencyMs } : {}),
+    ...(observedSignals.size > 0 ? { observedSignals: [...observedSignals].sort() } : {}),
+    ...(windows.size > 0
+      ? {
+          windows: [...windows.values()].map((window) => ({
+            ...window,
+            lastSeenAt: unixMs(Date.now()),
+          })),
+        }
+      : {}),
+  };
+}
+
+function parseFinite(value: string | null): number | null {
+  if (value === null) return null;
+  const parsed = Number.parseFloat(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function parseEpochMs(value: string | null): ReturnType<typeof unixMs> | null {
+  const parsed = parseFinite(value);
+  if (parsed === null || parsed <= 0) return null;
+  if (parsed >= 1e11) return unixMs(Math.round(parsed));
+  return unixMs(Math.round(parsed * 1000));
+}
+
+function parseLatencyMs(headers: Headers): number | null {
+  const envoy = parseFinite(headers.get("x-envoy-upstream-service-time"));
+  if (envoy !== null) return Math.round(envoy);
+
+  const serverTiming = headers.get("server-timing");
+  if (serverTiming === null) return null;
+
+  const explicitOrigin = /x-originResponse;dur=([\d.]+)/i.exec(serverTiming);
+  if (explicitOrigin) {
+    const parsed = parseFinite(explicitOrigin[1] ?? null);
+    if (parsed !== null) return Math.round(parsed);
+  }
+
+  const generic = /dur=([\d.]+)/i.exec(serverTiming);
+  if (!generic) return null;
+  const parsed = parseFinite(generic[1] ?? null);
+  return parsed === null ? null : Math.round(parsed);
+}
+
 // ── Token tracking ────────────────────────────────────────────────
 
 interface AnthropicUsage {
@@ -387,4 +573,3 @@ function createTokenTrackingStream(
     },
   }));
 }
-

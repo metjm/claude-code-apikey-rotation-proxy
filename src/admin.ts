@@ -49,6 +49,10 @@ const routes: ReadonlyMap<string, ReadonlyMap<string, RouteHandler>> = new Map([
     new Map<string, RouteHandler>([["GET", handleTimeseriesStats]]),
   ],
   [
+    "/admin/capacity/timeseries",
+    new Map<string, RouteHandler>([["GET", handleCapacityTimeseries]]),
+  ],
+  [
     "/admin/health",
     new Map<string, RouteHandler>([["GET", handleHealth]]),
   ],
@@ -336,6 +340,7 @@ function handleStats(
   keyManager: KeyManager,
 ): Response {
   const keys = keyManager.listKeys();
+  const capacitySummary = keyManager.getCapacitySummary();
   const totals = keys.reduce(
     (acc, k) => ({
       totalRequests: acc.totalRequests + k.stats.totalRequests,
@@ -360,6 +365,7 @@ function handleStats(
     availableKeys: keys.filter((k) => k.isAvailable).length,
     totals,
     keys,
+    capacitySummary,
   });
 }
 
@@ -372,8 +378,28 @@ function handleTimeseriesStats(
   const resolution = url.searchParams.get("resolution") === "day" ? "day" as const : "hour" as const;
   const keyLabel = url.searchParams.get("key") ?? undefined;
   const userLabel = url.searchParams.get("user") ?? undefined;
+  const buckets = keyManager.queryTimeseries({
+    hours,
+    resolution,
+    ...(keyLabel !== undefined ? { keyLabel } : {}),
+    ...(userLabel !== undefined ? { userLabel } : {}),
+  });
+  return json({ resolution, buckets });
+}
 
-  const buckets = keyManager.queryTimeseries({ hours, resolution, keyLabel, userLabel });
+function handleCapacityTimeseries(
+  req: Request,
+  keyManager: KeyManager,
+): Response {
+  const url = new URL(req.url);
+  const hours = Math.min(Number(url.searchParams.get("hours") ?? 24), 720);
+  const resolution = url.searchParams.get("resolution") === "day" ? "day" as const : "hour" as const;
+  const keyLabel = url.searchParams.get("key") ?? undefined;
+  const buckets = keyManager.queryCapacityTimeseries({
+    hours,
+    resolution,
+    ...(keyLabel !== undefined ? { keyLabel } : {}),
+  });
   return json({ resolution, buckets });
 }
 
@@ -389,6 +415,7 @@ function handleEvents(
             type: "keys", ts: new Date().toISOString(),
             keys: keyManager.listKeys(), tokens: keyManager.listTokens(),
             currentBucket: keyManager.getCurrentBucket(),
+            capacitySummary: keyManager.getCapacitySummary(),
           };
           controller.enqueue(`data: ${JSON.stringify(ev)}\n\n`);
         } catch {}

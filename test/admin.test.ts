@@ -6,6 +6,7 @@ import { handleAdminRoute } from "../src/admin.ts";
 import { KeyManager } from "../src/key-manager.ts";
 import { SchemaTracker } from "../src/schema-tracker.ts";
 import type { ProxyConfig } from "../src/types.ts";
+import { unixMs } from "../src/types.ts";
 
 // ── Helpers ───────────────────────────────────────────────────────
 
@@ -167,6 +168,16 @@ describe("Route Dispatch", () => {
     expect(res!.status).toBe(200);
     const body = await jsonBody(res!);
     expect(body).toHaveProperty("totals");
+    expect(body).toHaveProperty("capacitySummary");
+  });
+
+  test("routes GET /admin/capacity/timeseries", async () => {
+    const req = makeReq("GET", "/admin/capacity/timeseries");
+    const res = await handleAdminRoute(req, km, config, st);
+    expect(res).not.toBeNull();
+    expect(res!.status).toBe(200);
+    const body = await jsonBody(res!);
+    expect(body).toHaveProperty("buckets");
   });
 
   test("routes GET /admin/health", async () => {
@@ -256,6 +267,45 @@ describe("Route Dispatch", () => {
     const res = await handleAdminRoute(req, km, config, st);
     expect(res).not.toBeNull();
     expect(res!.status).toBe(405);
+  });
+});
+
+describe("Capacity admin payloads", () => {
+  test("GET /admin/stats includes keys with capacity state and a pool summary", async () => {
+    const entry = km.addKey(VALID_KEY, "cap-admin");
+    km.recordCapacityObservation(entry, {
+      seenAt: unixMs(1_000),
+      httpStatus: 200,
+      organizationId: "org-admin",
+      windows: [{ windowName: "unified", status: "allowed_warning", utilization: 0.75, resetAt: unixMs(Date.now() + 60_000) }],
+    });
+
+    const res = await handleAdminRoute(makeReq("GET", "/admin/stats"), km, makeConfig(), st);
+    const body = await jsonBody(res!);
+    expect(body.keys[0].capacity.organizationId).toBe("org-admin");
+    expect(body.keys[0].capacity.responseCount).toBe(1);
+    expect(body.keys[0].capacity.normalizedHeaderCount).toBe(1);
+    expect(body.keys[0].capacity.signalCoverage[0].signalName).toBe("organization");
+    expect(body.keys[0].capacityHealth).toBe("warning");
+    expect(body.capacitySummary.warningKeys).toBe(1);
+    expect(body.capacitySummary.windows[0].windowName).toBe("unified");
+  });
+
+  test("GET /admin/capacity/timeseries returns rollups by window", async () => {
+    const entry = km.addKey(VALID_KEY, "cap-ts");
+    km.recordCapacityObservation(entry, {
+      seenAt: unixMs(1_000),
+      httpStatus: 200,
+      windows: [{ windowName: "unified", status: "allowed", utilization: 0.4, resetAt: unixMs(Date.now() + 60_000) }],
+    });
+    km.close();
+    km = new KeyManager(tempDir);
+
+    const res = await handleAdminRoute(makeReq("GET", "/admin/capacity/timeseries?hours=24&resolution=hour&key=cap-ts"), km, makeConfig(), st);
+    const body = await jsonBody(res!);
+    expect(body.buckets).toHaveLength(1);
+    expect(body.buckets[0].windowName).toBe("unified");
+    expect(body.buckets[0].allowed).toBe(1);
   });
 });
 

@@ -15,6 +15,7 @@ import type {
   ProxyTokenEntry,
   StoredState,
 } from "../src/types.ts";
+import { unixMs } from "../src/types.ts";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -1011,6 +1012,173 @@ describe("Persistence", () => {
     expect(keys.length).toBe(1);
     expect(keys[0]!.availableAt).toBe(savedAvailableAt);
     expect(keys[0]!.isAvailable).toBe(false);
+  });
+});
+
+// ── Capacity telemetry ───────────────────────────────────────────────────────
+
+describe("Capacity telemetry", () => {
+  test("recordCapacityObservation merges sparse updates without wiping prior fields", () => {
+    const km = create();
+    const entry = km.addKey(VALID_KEY_1, "cap-merge");
+
+    km.recordCapacityObservation(entry, {
+      seenAt: unixMs(1_000),
+      httpStatus: 200,
+      organizationId: "org-1",
+      representativeClaim: "seven_day",
+      windows: [
+        {
+          windowName: "unified-7d",
+          status: "allowed_warning",
+          utilization: 0.92,
+          resetAt: unixMs(Date.now() + 60_000),
+        },
+      ],
+    });
+
+    km.recordCapacityObservation(entry, {
+      seenAt: unixMs(2_000),
+      httpStatus: 200,
+      requestId: "req-123",
+      windows: [
+        {
+          windowName: "unified-5h",
+          status: "allowed",
+          utilization: 0.41,
+          resetAt: unixMs(Date.now() + 120_000),
+        },
+      ],
+    });
+
+    const key = km.listKeys()[0]!;
+    expect(key.capacity.organizationId).toBe("org-1");
+    expect(key.capacity.representativeClaim).toBe("seven_day");
+    expect(key.capacity.lastRequestId).toBe("req-123");
+    expect(key.capacity.responseCount).toBe(2);
+    expect(key.capacity.normalizedHeaderCount).toBe(2);
+    expect(key.capacity.signalCoverage.find((signal) => signal.signalName === "windows")!.seenCount).toBe(2);
+    expect(key.capacity.signalCoverage.find((signal) => signal.signalName === "request_id")!.seenCount).toBe(1);
+    expect(key.capacity.windows.map((w) => w.windowName).sort()).toEqual(["unified-5h", "unified-7d"]);
+    expect(key.capacity.windows.find((w) => w.windowName === "unified-7d")!.utilization).toBe(0.92);
+    expect(key.capacityHealth).toBe("warning");
+  });
+
+  test("capacity state persists across reload", async () => {
+    const km1 = create();
+    const entry = km1.addKey(VALID_KEY_1, "cap-persist");
+
+    km1.recordCapacityObservation(entry, {
+      seenAt: unixMs(5_000),
+      httpStatus: 429,
+      organizationId: "org-persist",
+      retryAfterSecs: 45,
+      overageStatus: "rejected",
+      overageDisabledReason: "out_of_credits",
+      windows: [
+        {
+          windowName: "unified",
+          status: "rejected",
+          utilization: 1,
+          resetAt: unixMs(Date.now() + 180_000),
+        },
+      ],
+    });
+
+    await waitForSave();
+
+    const km2 = create();
+    const key = km2.listKeys()[0]!;
+    expect(key.capacity.responseCount).toBe(1);
+    expect(key.capacity.normalizedHeaderCount).toBe(1);
+    expect(key.capacity.organizationId).toBe("org-persist");
+    expect(key.capacity.retryAfterSecs).toBe(45);
+    expect(key.capacity.overageStatus).toBe("rejected");
+    expect(key.capacity.windows[0]!.windowName).toBe("unified");
+    expect(key.capacity.windows[0]!.status).toBe("rejected");
+  });
+
+  test("getCapacitySummary aggregates health and windows", () => {
+    const km = create();
+    const healthy = km.addKey(VALID_KEY_1, "healthy");
+    const warning = km.addKey(VALID_KEY_2, "warning");
+    const rejected = km.addKey(VALID_KEY_3, "rejected");
+
+    km.recordCapacityObservation(healthy, {
+      seenAt: unixMs(1_000),
+      httpStatus: 200,
+      organizationId: "org-a",
+      windows: [{ windowName: "unified-5h", status: "allowed", utilization: 0.25, resetAt: unixMs(Date.now() + 60_000) }],
+    });
+    km.recordCapacityObservation(warning, {
+      seenAt: unixMs(1_100),
+      httpStatus: 200,
+      organizationId: "org-a",
+      fallbackAvailable: true,
+      windows: [{ windowName: "unified-5h", status: "allowed_warning", utilization: 0.86, resetAt: unixMs(Date.now() + 60_000) }],
+    });
+    km.recordCapacityObservation(rejected, {
+      seenAt: unixMs(1_200),
+      httpStatus: 429,
+      organizationId: "org-b",
+      overageStatus: "rejected",
+      windows: [{ windowName: "unified-5h", status: "rejected", utilization: 1, resetAt: unixMs(Date.now() + 60_000) }],
+    });
+
+    const summary = km.getCapacitySummary();
+    expect(summary.healthyKeys).toBe(1);
+    expect(summary.warningKeys).toBe(1);
+    expect(summary.rejectedKeys).toBe(1);
+    expect(summary.fallbackAvailableKeys).toBe(1);
+    expect(summary.overageRejectedKeys).toBe(1);
+    expect(summary.distinctOrganizations).toBe(2);
+    expect(summary.windows[0]!.windowName).toBe("unified-5h");
+    expect(summary.windows[0]!.warningKeys).toBe(1);
+  });
+
+  test("queryCapacityTimeseries returns per-window rollups", async () => {
+    const km = create();
+    const entry = km.addKey(VALID_KEY_1, "cap-ts");
+
+    km.recordCapacityObservation(entry, {
+      seenAt: unixMs(3_000),
+      httpStatus: 200,
+      windows: [{ windowName: "unified", status: "allowed_warning", utilization: 0.77, resetAt: unixMs(Date.now() + 60_000) }],
+    });
+    km.recordCapacityObservation(entry, {
+      seenAt: unixMs(4_000),
+      httpStatus: 200,
+      windows: [{ windowName: "unified", status: "allowed", utilization: 0.55, resetAt: unixMs(Date.now() + 60_000) }],
+    });
+
+    await waitForSave();
+
+    const buckets = km.queryCapacityTimeseries({ hours: 24, resolution: "hour", keyLabel: "cap-ts" });
+    expect(buckets.length).toBe(1);
+    expect(buckets[0]!.windowName).toBe("unified");
+    expect(buckets[0]!.samples).toBe(2);
+    expect(buckets[0]!.warning).toBe(1);
+    expect(buckets[0]!.allowed).toBe(1);
+    expect(buckets[0]!.maxUtilization).toBe(0.77);
+  });
+
+  test("getNextAvailableKey prefers healthier keys over equally available warning keys", () => {
+    const km = create();
+    const warning = km.addKey(VALID_KEY_1, "warning-first");
+    const healthy = km.addKey(VALID_KEY_2, "healthy-second");
+
+    km.recordCapacityObservation(warning, {
+      seenAt: unixMs(10_000),
+      httpStatus: 200,
+      windows: [{ windowName: "unified", status: "allowed_warning", utilization: 0.88, resetAt: unixMs(Date.now() + 60_000) }],
+    });
+    km.recordCapacityObservation(healthy, {
+      seenAt: unixMs(10_500),
+      httpStatus: 200,
+      windows: [{ windowName: "unified", status: "allowed", utilization: 0.2, resetAt: unixMs(Date.now() + 60_000) }],
+    });
+
+    expect(km.getNextAvailableKey()!.label).toBe(healthy.label);
   });
 });
 

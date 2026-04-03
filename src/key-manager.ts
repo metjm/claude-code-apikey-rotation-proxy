@@ -3,8 +3,16 @@ import { existsSync, mkdirSync, readFileSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 import {
   type ApiKey,
+  type ApiKeyCapacityState,
   type ApiKeyEntry,
   type ApiKeyStats,
+  type CapacityHealth,
+  type CapacityObservation,
+  type CapacitySummary,
+  type CapacitySummaryWindow,
+  type CapacityTimeseriesBucket,
+  type CapacityTimeseriesQuery,
+  type CapacityWindowSnapshot,
   type KeyLabel,
   type MaskedKeyEntry,
   type MaskedTokenEntry,
@@ -56,6 +64,54 @@ interface TokenRow {
   total_cache_creation: number;
 }
 
+interface CapacityStateRow {
+  key: string;
+  response_count: number;
+  normalized_header_count: number;
+  last_response_at: number | null;
+  last_header_at: number | null;
+  last_upstream_status: number | null;
+  last_request_id: string | null;
+  organization_id: string | null;
+  representative_claim: string | null;
+  retry_after_secs: number | null;
+  should_retry: number | null;
+  fallback_available: number | null;
+  fallback_percentage: number | null;
+  overage_status: string | null;
+  overage_disabled_reason: string | null;
+  latency_ms: number | null;
+}
+
+interface CapacityCoverageRow {
+  key: string;
+  signal_name: string;
+  seen_count: number;
+  last_seen_at: number | null;
+}
+
+interface CapacityWindowRow {
+  key: string;
+  window_name: string;
+  status: string | null;
+  utilization: number | null;
+  reset_at: number | null;
+  surpassed_threshold: number | null;
+  last_seen_at: number | null;
+}
+
+interface CapacityTsRow {
+  b: string;
+  window_name: string;
+  samples: number;
+  allowed_count: number;
+  warning_count: number;
+  rejected_count: number;
+  utilization_sum: number;
+  utilization_samples: number;
+  utilization_max: number;
+}
+
 // ── KeyManager ────────────────────────────────────────────────────
 
 interface BucketAccumulator {
@@ -69,8 +125,22 @@ interface BucketAccumulator {
   cacheCreation: number;
 }
 
+interface CapacityBucketAccumulator {
+  samples: number;
+  allowedCount: number;
+  warningCount: number;
+  rejectedCount: number;
+  utilizationSum: number;
+  utilizationSamples: number;
+  utilizationMax: number;
+}
+
 function emptyBucket(): BucketAccumulator {
   return { requests: 0, successes: 0, errors: 0, rateLimits: 0, tokensIn: 0, tokensOut: 0, cacheRead: 0, cacheCreation: 0 };
+}
+
+function emptyCapacityBucket(): CapacityBucketAccumulator {
+  return { samples: 0, allowedCount: 0, warningCount: 0, rejectedCount: 0, utilizationSum: 0, utilizationSamples: 0, utilizationMax: 0 };
 }
 
 function currentBucketKey(): string {
@@ -85,6 +155,7 @@ export class KeyManager {
   private readonly cleanupInterval: ReturnType<typeof setInterval>;
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly tsAccumulator = new Map<string, BucketAccumulator>();
+  private readonly capacityTsAccumulator = new Map<string, CapacityBucketAccumulator>();
 
   constructor(dataDir: string) {
     this.dbPath = process.env["DB_PATH"] ?? join(dataDir, "state.db");
@@ -162,6 +233,60 @@ export class KeyManager {
       );
 
       CREATE INDEX IF NOT EXISTS idx_stats_ts_bucket ON stats_timeseries(bucket);
+
+      CREATE TABLE IF NOT EXISTS api_key_capacity_state (
+        key TEXT PRIMARY KEY,
+        response_count INTEGER NOT NULL DEFAULT 0,
+        normalized_header_count INTEGER NOT NULL DEFAULT 0,
+        last_response_at INTEGER,
+        last_header_at INTEGER,
+        last_upstream_status INTEGER,
+        last_request_id TEXT,
+        organization_id TEXT,
+        representative_claim TEXT,
+        retry_after_secs INTEGER,
+        should_retry INTEGER,
+        fallback_available INTEGER,
+        fallback_percentage REAL,
+        overage_status TEXT,
+        overage_disabled_reason TEXT,
+        latency_ms INTEGER
+      );
+
+      CREATE TABLE IF NOT EXISTS api_key_capacity_signal_coverage (
+        key TEXT NOT NULL,
+        signal_name TEXT NOT NULL,
+        seen_count INTEGER NOT NULL DEFAULT 0,
+        last_seen_at INTEGER,
+        PRIMARY KEY (key, signal_name)
+      );
+
+      CREATE TABLE IF NOT EXISTS api_key_capacity_windows (
+        key TEXT NOT NULL,
+        window_name TEXT NOT NULL,
+        status TEXT,
+        utilization REAL,
+        reset_at INTEGER,
+        surpassed_threshold REAL,
+        last_seen_at INTEGER,
+        PRIMARY KEY (key, window_name)
+      );
+
+      CREATE TABLE IF NOT EXISTS capacity_window_timeseries (
+        bucket TEXT NOT NULL,
+        key_label TEXT NOT NULL,
+        window_name TEXT NOT NULL,
+        samples INTEGER NOT NULL DEFAULT 0,
+        allowed_count INTEGER NOT NULL DEFAULT 0,
+        warning_count INTEGER NOT NULL DEFAULT 0,
+        rejected_count INTEGER NOT NULL DEFAULT 0,
+        utilization_sum REAL NOT NULL DEFAULT 0,
+        utilization_samples INTEGER NOT NULL DEFAULT 0,
+        utilization_max REAL NOT NULL DEFAULT 0,
+        PRIMARY KEY (bucket, key_label, window_name)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_capacity_window_ts_bucket ON capacity_window_timeseries(bucket);
     `);
 
     // Migrate existing tables to add cache columns
@@ -174,6 +299,9 @@ export class KeyManager {
     migrate("proxy_tokens", "total_cache_creation");
     migrate("stats_timeseries", "cache_read");
     migrate("stats_timeseries", "cache_creation");
+    migrate("api_key_capacity_state", "response_count");
+    migrate("api_key_capacity_state", "normalized_header_count");
+    migrate("capacity_window_timeseries", "utilization_samples");
 
     // One-time reset: old token counts were inaccurate (missing cache tokens)
     const marker = this.db.query("SELECT 1 FROM stats_timeseries WHERE key_label = '__reset_v2__'").get();
@@ -254,8 +382,30 @@ export class KeyManager {
   // ── Load from DB ────────────────────────────────────────────────
 
   private loadFromDb(): void {
+    const stateRows = this.db.query("SELECT * FROM api_key_capacity_state").all() as CapacityStateRow[];
+    const coverageRows = this.db.query("SELECT * FROM api_key_capacity_signal_coverage").all() as CapacityCoverageRow[];
+    const windowRows = this.db.query("SELECT * FROM api_key_capacity_windows").all() as CapacityWindowRow[];
+    const statesByKey = new Map(stateRows.map((row) => [row.key, row]));
+    const coverageByKey = new Map<string, CapacityCoverageRow[]>();
+    for (const row of coverageRows) {
+      const existing = coverageByKey.get(row.key) ?? [];
+      existing.push(row);
+      coverageByKey.set(row.key, existing);
+    }
+    const windowsByKey = new Map<string, CapacityWindowRow[]>();
+    for (const row of windowRows) {
+      const existing = windowsByKey.get(row.key) ?? [];
+      existing.push(row);
+      windowsByKey.set(row.key, existing);
+    }
+
     const keyRows = this.db.query("SELECT * FROM api_keys").all() as KeyRow[];
-    this.keys = keyRows.map((r) => rowToKeyEntry(r));
+    this.keys = keyRows.map((r) => rowToKeyEntry(
+      r,
+      statesByKey.get(r.key) ?? null,
+      coverageByKey.get(r.key) ?? [],
+      windowsByKey.get(r.key) ?? [],
+    ));
 
     const tokenRows = this.db.query("SELECT * FROM proxy_tokens").all() as TokenRow[];
     this.tokens = tokenRows.map((r) => rowToTokenEntry(r));
@@ -272,8 +422,17 @@ export class KeyManager {
     const available = this.keys
       .filter((k) => k.availableAt <= currentTime)
       .sort((a, b) => {
-        // Sort by priority first (lower = preferred), then LRU within same tier
+        const healthRankDiff = capacityHealthRank(this.getCapacityHealth(a)) - capacityHealthRank(this.getCapacityHealth(b));
+        if (healthRankDiff !== 0) return healthRankDiff;
+        // Sort by priority within a health tier, then prefer lower utilization, then LRU.
         if (a.priority !== b.priority) return a.priority - b.priority;
+        const utilA = representativeUtilization(a);
+        const utilB = representativeUtilization(b);
+        if (utilA !== utilB) {
+          if (!Number.isFinite(utilA)) return 1;
+          if (!Number.isFinite(utilB)) return -1;
+          return utilA - utilB;
+        }
         return (b.stats.lastUsedAt ?? 0) - (a.stats.lastUsedAt ?? 0);
       });
 
@@ -293,6 +452,104 @@ export class KeyManager {
 
   totalCount(): number {
     return this.keys.length;
+  }
+
+  getCapacityHealth(entry: ApiKeyEntry): CapacityHealth {
+    return deriveCapacityHealth(entry);
+  }
+
+  getCapacitySummary(): CapacitySummary {
+    const keys = this.keys;
+    let healthyKeys = 0;
+    let warningKeys = 0;
+    let rejectedKeys = 0;
+    let coolingDownKeys = 0;
+    let unknownKeys = 0;
+    let fallbackAvailableKeys = 0;
+    let overageRejectedKeys = 0;
+    let lastUpdatedAt: UnixMs | null = null;
+    const orgs = new Set<string>();
+    const windowMap = new Map<string, {
+      utils: number[];
+      nextResetAt: UnixMs | null;
+      knownKeys: number;
+      allowedKeys: number;
+      warningKeys: number;
+      rejectedKeys: number;
+    }>();
+
+    for (const key of keys) {
+      const health = this.getCapacityHealth(key);
+      if (health === "healthy") healthyKeys++;
+      else if (health === "warning") warningKeys++;
+      else if (health === "rejected") rejectedKeys++;
+      else if (health === "cooling_down") coolingDownKeys++;
+      else unknownKeys++;
+
+      if (key.capacity.organizationId) orgs.add(key.capacity.organizationId);
+      if (key.capacity.fallbackAvailable) fallbackAvailableKeys++;
+      if (key.capacity.overageStatus === "rejected") overageRejectedKeys++;
+      if (key.capacity.lastHeaderAt && (!lastUpdatedAt || key.capacity.lastHeaderAt > lastUpdatedAt)) {
+        lastUpdatedAt = key.capacity.lastHeaderAt;
+      }
+
+      for (const window of activeCapacityWindows(key)) {
+        const existing = windowMap.get(window.windowName) ?? {
+          utils: [],
+          nextResetAt: null,
+          knownKeys: 0,
+          allowedKeys: 0,
+          warningKeys: 0,
+          rejectedKeys: 0,
+        };
+        existing.knownKeys++;
+        if (window.utilization !== null) existing.utils.push(window.utilization);
+        if (window.status === "allowed") existing.allowedKeys++;
+        else if (window.status === "allowed_warning") existing.warningKeys++;
+        else if (window.status === "rejected") existing.rejectedKeys++;
+        if (window.resetAt !== null && window.resetAt > now()) {
+          if (existing.nextResetAt === null || window.resetAt < existing.nextResetAt) {
+            existing.nextResetAt = window.resetAt;
+          }
+        }
+        windowMap.set(window.windowName, existing);
+      }
+    }
+
+    const windows: CapacitySummaryWindow[] = [...windowMap.entries()]
+      .sort((a, b) => a[0].localeCompare(b[0]))
+      .map(([windowName, summary]) => {
+        const sortedUtils = [...summary.utils].sort((a, b) => a - b);
+        const medianUtilization = sortedUtils.length === 0
+          ? null
+          : sortedUtils[Math.floor(sortedUtils.length / 2)]!;
+        const maxUtilization = sortedUtils.length === 0
+          ? null
+          : sortedUtils[sortedUtils.length - 1]!;
+        return {
+          windowName,
+          knownKeys: summary.knownKeys,
+          allowedKeys: summary.allowedKeys,
+          warningKeys: summary.warningKeys,
+          rejectedKeys: summary.rejectedKeys,
+          maxUtilization,
+          medianUtilization,
+          nextResetAt: summary.nextResetAt,
+        };
+      });
+
+    return {
+      healthyKeys,
+      warningKeys,
+      rejectedKeys,
+      coolingDownKeys,
+      unknownKeys,
+      fallbackAvailableKeys,
+      overageRejectedKeys,
+      distinctOrganizations: orgs.size,
+      lastUpdatedAt,
+      windows,
+    };
   }
 
   // ── Stats recording ─────────────────────────────────────────────
@@ -346,6 +603,72 @@ export class KeyManager {
     this.scheduleSave();
   }
 
+  recordCapacityObservation(entry: ApiKeyEntry, observation: CapacityObservation): void {
+    const next: {
+      -readonly [K in keyof ApiKeyCapacityState]: ApiKeyCapacityState[K];
+    } = { ...entry.capacity, signalCoverage: [...entry.capacity.signalCoverage], windows: [...entry.capacity.windows] };
+    const observedSignals = observation.observedSignals !== undefined
+      ? new Set(observation.observedSignals)
+      : inferObservedSignals(observation);
+    const signalCoverageMap = new Map(next.signalCoverage.map((signal) => [signal.signalName, { ...signal }]));
+
+    next.responseCount = entry.capacity.responseCount + 1;
+    next.lastResponseAt = observation.seenAt;
+    if (observation.httpStatus !== undefined) next.lastUpstreamStatus = observation.httpStatus;
+    if (observation.requestId !== undefined) next.lastRequestId = observation.requestId;
+    if (observation.organizationId !== undefined) next.organizationId = observation.organizationId;
+    if (observation.representativeClaim !== undefined) next.representativeClaim = observation.representativeClaim;
+    if (observation.retryAfterSecs !== undefined) next.retryAfterSecs = observation.retryAfterSecs;
+    if (observation.shouldRetry !== undefined) next.shouldRetry = observation.shouldRetry;
+    if (observation.fallbackAvailable !== undefined) next.fallbackAvailable = observation.fallbackAvailable;
+    if (observation.fallbackPercentage !== undefined) next.fallbackPercentage = observation.fallbackPercentage;
+    if (observation.overageStatus !== undefined) next.overageStatus = observation.overageStatus;
+    if (observation.overageDisabledReason !== undefined) next.overageDisabledReason = observation.overageDisabledReason;
+    if (observation.latencyMs !== undefined) next.latencyMs = observation.latencyMs;
+
+    for (const signalName of observedSignals) {
+      const existing = signalCoverageMap.get(signalName) ?? {
+        signalName,
+        seenCount: 0,
+        lastSeenAt: null,
+      };
+      existing.seenCount += 1;
+      existing.lastSeenAt = observation.seenAt;
+      signalCoverageMap.set(signalName, existing);
+    }
+
+    const windowMap = new Map(next.windows.map((window) => [window.windowName, { ...window }]));
+    for (const window of observation.windows ?? []) {
+      const existing = windowMap.get(window.windowName) ?? {
+        windowName: window.windowName,
+        status: null,
+        utilization: null,
+        resetAt: null,
+        surpassedThreshold: null,
+        lastSeenAt: null,
+      };
+      if (window.status !== undefined) existing.status = window.status;
+      if (window.utilization !== undefined) existing.utilization = window.utilization;
+      if (window.resetAt !== undefined) existing.resetAt = window.resetAt;
+      if (window.surpassedThreshold !== undefined) existing.surpassedThreshold = window.surpassedThreshold;
+      existing.lastSeenAt = window.lastSeenAt ?? observation.seenAt;
+      windowMap.set(window.windowName, existing);
+
+      if (window.status !== undefined || window.utilization !== undefined) {
+        this.recordCapacityTimeseries(entry.label, window.windowName, window.status ?? null, window.utilization ?? null);
+      }
+    }
+
+    if (observedSignals.size > 0) {
+      next.normalizedHeaderCount = entry.capacity.normalizedHeaderCount + 1;
+      next.lastHeaderAt = observation.seenAt;
+    }
+    next.signalCoverage = [...signalCoverageMap.values()].sort((a, b) => a.signalName.localeCompare(b.signalName));
+    next.windows = [...windowMap.values()].sort((a, b) => a.windowName.localeCompare(b.windowName));
+    entry.capacity = next;
+    this.scheduleSave();
+  }
+
   // ── CRUD ────────────────────────────────────────────────────────
 
   addKey(rawKey: string, label?: string): ApiKeyEntry {
@@ -359,6 +682,7 @@ export class KeyManager {
       key,
       label: asKeyLabel(label ?? `key-${this.keys.length + 1}`),
       stats: freshStats(),
+      capacity: freshCapacityState(),
       availableAt: unixMs(0),
       priority: 2,
     };
@@ -406,6 +730,9 @@ export class KeyManager {
     if (idx === -1) return false;
     const removed = this.keys.splice(idx, 1)[0]!;
     this.db.run("DELETE FROM api_keys WHERE key = ?", [removed.key]);
+    this.db.run("DELETE FROM api_key_capacity_state WHERE key = ?", [removed.key]);
+    this.db.run("DELETE FROM api_key_capacity_signal_coverage WHERE key = ?", [removed.key]);
+    this.db.run("DELETE FROM api_key_capacity_windows WHERE key = ?", [removed.key]);
     log("info", "Key removed", { label: removed.label });
     return true;
   }
@@ -415,6 +742,9 @@ export class KeyManager {
     if (idx === -1) return false;
     const removed = this.keys.splice(idx, 1)[0]!;
     this.db.run("DELETE FROM api_keys WHERE key = ?", [removed.key]);
+    this.db.run("DELETE FROM api_key_capacity_state WHERE key = ?", [removed.key]);
+    this.db.run("DELETE FROM api_key_capacity_signal_coverage WHERE key = ?", [removed.key]);
+    this.db.run("DELETE FROM api_key_capacity_windows WHERE key = ?", [removed.key]);
     log("info", "Key removed", { label: removed.label });
     return true;
   }
@@ -436,6 +766,8 @@ export class KeyManager {
         maskedKey: maskKey(k.key),
         label: k.label,
         stats: k.stats,
+        capacity: k.capacity,
+        capacityHealth: this.getCapacityHealth(k),
         availableAt: k.availableAt,
         isAvailable: k.availableAt <= currentTime,
         priority: k.priority,
@@ -636,6 +968,28 @@ export class KeyManager {
     }
   }
 
+  private recordCapacityTimeseries(
+    keyLabel: string,
+    windowName: string,
+    status: string | null,
+    utilization: number | null,
+  ): void {
+    if (status === null && utilization === null) return;
+    const bucket = currentBucketKey();
+    const mapKey = `${bucket}|${keyLabel}|${windowName}`;
+    const acc = this.capacityTsAccumulator.get(mapKey) ?? emptyCapacityBucket();
+    acc.samples++;
+    if (status === "allowed") acc.allowedCount++;
+    else if (status === "allowed_warning") acc.warningCount++;
+    else if (status === "rejected") acc.rejectedCount++;
+    if (utilization !== null) {
+      acc.utilizationSum += utilization;
+      acc.utilizationSamples++;
+      acc.utilizationMax = Math.max(acc.utilizationMax, utilization);
+    }
+    this.capacityTsAccumulator.set(mapKey, acc);
+  }
+
   getCurrentBucket(): TimeseriesBucket {
     const bucket = currentBucketKey();
 
@@ -709,9 +1063,52 @@ export class KeyManager {
     }));
   }
 
+  queryCapacityTimeseries(opts: CapacityTimeseriesQuery): CapacityTimeseriesBucket[] {
+    const hours = Math.min(opts.hours ?? 24, 720);
+    const resolution = opts.resolution ?? "hour";
+    const cutoff = new Date(Date.now() - hours * 60 * 60 * 1000).toISOString().slice(0, 13);
+    const groupExpr = resolution === "day" ? "substr(bucket, 1, 10)" : "bucket";
+    const params: string[] = [cutoff];
+    const conditions = ["bucket >= ?"];
+
+    if (opts.keyLabel) {
+      conditions.push("key_label = ?");
+      params.push(opts.keyLabel);
+    }
+
+    const sql = `
+      SELECT ${groupExpr} AS b,
+        window_name,
+        SUM(samples) AS samples,
+        SUM(allowed_count) AS allowed_count,
+        SUM(warning_count) AS warning_count,
+        SUM(rejected_count) AS rejected_count,
+        SUM(utilization_sum) AS utilization_sum,
+        SUM(utilization_samples) AS utilization_samples,
+        MAX(utilization_max) AS utilization_max
+      FROM capacity_window_timeseries
+      WHERE ${conditions.join(" AND ")}
+      GROUP BY b, window_name
+      ORDER BY b, window_name
+    `;
+
+    const rows = this.db.query(sql).all(...params) as CapacityTsRow[];
+    return rows.map((row) => ({
+      bucket: row.b,
+      windowName: row.window_name,
+      samples: row.samples,
+      allowed: row.allowed_count,
+      warning: row.warning_count,
+      rejected: row.rejected_count,
+      avgUtilization: row.utilization_samples > 0 ? row.utilization_sum / row.utilization_samples : null,
+      maxUtilization: row.utilization_samples > 0 ? row.utilization_max : null,
+    }));
+  }
+
   private cleanupOldTimeseries(): void {
     const cutoff = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 13);
     this.db.run("DELETE FROM stats_timeseries WHERE bucket < ?", [cutoff]);
+    this.db.run("DELETE FROM capacity_window_timeseries WHERE bucket < ?", [cutoff]);
   }
 
   // ── Persistence ─────────────────────────────────────────────────
@@ -752,6 +1149,63 @@ export class KeyManager {
         cache_read     = cache_read     + excluded.cache_read,
         cache_creation = cache_creation + excluded.cache_creation
     `);
+    const upsertCapacityState = this.db.prepare(`
+      INSERT INTO api_key_capacity_state (
+        key, response_count, normalized_header_count, last_response_at, last_header_at, last_upstream_status, last_request_id,
+        organization_id, representative_claim, retry_after_secs, should_retry,
+        fallback_available, fallback_percentage, overage_status, overage_disabled_reason, latency_ms
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(key) DO UPDATE SET
+        response_count = excluded.response_count,
+        normalized_header_count = excluded.normalized_header_count,
+        last_response_at = excluded.last_response_at,
+        last_header_at = excluded.last_header_at,
+        last_upstream_status = excluded.last_upstream_status,
+        last_request_id = excluded.last_request_id,
+        organization_id = excluded.organization_id,
+        representative_claim = excluded.representative_claim,
+        retry_after_secs = excluded.retry_after_secs,
+        should_retry = excluded.should_retry,
+        fallback_available = excluded.fallback_available,
+        fallback_percentage = excluded.fallback_percentage,
+        overage_status = excluded.overage_status,
+        overage_disabled_reason = excluded.overage_disabled_reason,
+        latency_ms = excluded.latency_ms
+    `);
+    const clearCapacitySignalCoverage = this.db.prepare("DELETE FROM api_key_capacity_signal_coverage WHERE key = ?");
+    const upsertCapacitySignalCoverage = this.db.prepare(`
+      INSERT INTO api_key_capacity_signal_coverage (key, signal_name, seen_count, last_seen_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(key, signal_name) DO UPDATE SET
+        seen_count = excluded.seen_count,
+        last_seen_at = excluded.last_seen_at
+    `);
+    const clearCapacityWindows = this.db.prepare("DELETE FROM api_key_capacity_windows WHERE key = ?");
+    const upsertCapacityWindow = this.db.prepare(`
+      INSERT INTO api_key_capacity_windows (key, window_name, status, utilization, reset_at, surpassed_threshold, last_seen_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(key, window_name) DO UPDATE SET
+        status = excluded.status,
+        utilization = excluded.utilization,
+        reset_at = excluded.reset_at,
+        surpassed_threshold = excluded.surpassed_threshold,
+        last_seen_at = excluded.last_seen_at
+    `);
+    const upsertCapacityTs = this.db.prepare(`
+      INSERT INTO capacity_window_timeseries (
+        bucket, key_label, window_name, samples, allowed_count, warning_count, rejected_count, utilization_sum, utilization_samples, utilization_max
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(bucket, key_label, window_name) DO UPDATE SET
+        samples = samples + excluded.samples,
+        allowed_count = allowed_count + excluded.allowed_count,
+        warning_count = warning_count + excluded.warning_count,
+        rejected_count = rejected_count + excluded.rejected_count,
+        utilization_sum = utilization_sum + excluded.utilization_sum,
+        utilization_samples = utilization_samples + excluded.utilization_samples,
+        utilization_max = MAX(utilization_max, excluded.utilization_max)
+    `);
 
     this.db.transaction(() => {
       for (const k of this.keys) {
@@ -760,6 +1214,45 @@ export class KeyManager {
           k.stats.errors, k.stats.lastUsedAt, k.stats.totalTokensIn, k.stats.totalTokensOut,
           k.stats.totalCacheRead, k.stats.totalCacheCreation, k.availableAt, k.key,
         );
+        upsertCapacityState.run(
+          k.key,
+          k.capacity.responseCount,
+          k.capacity.normalizedHeaderCount,
+          k.capacity.lastResponseAt,
+          k.capacity.lastHeaderAt,
+          k.capacity.lastUpstreamStatus,
+          k.capacity.lastRequestId,
+          k.capacity.organizationId,
+          k.capacity.representativeClaim,
+          k.capacity.retryAfterSecs,
+          boolToInt(k.capacity.shouldRetry),
+          boolToInt(k.capacity.fallbackAvailable),
+          k.capacity.fallbackPercentage,
+          k.capacity.overageStatus,
+          k.capacity.overageDisabledReason,
+          k.capacity.latencyMs,
+        );
+        clearCapacitySignalCoverage.run(k.key);
+        for (const signal of k.capacity.signalCoverage) {
+          upsertCapacitySignalCoverage.run(
+            k.key,
+            signal.signalName,
+            signal.seenCount,
+            signal.lastSeenAt,
+          );
+        }
+        clearCapacityWindows.run(k.key);
+        for (const window of k.capacity.windows) {
+          upsertCapacityWindow.run(
+            k.key,
+            window.windowName,
+            window.status,
+            window.utilization,
+            window.resetAt,
+            window.surpassedThreshold,
+            window.lastSeenAt,
+          );
+        }
       }
       for (const t of this.tokens) {
         updateToken.run(
@@ -770,16 +1263,37 @@ export class KeyManager {
       }
       for (const [mapKey, acc] of this.tsAccumulator) {
         const [bucket, keyLabel, userLabel] = mapKey.split("|");
-        upsertTs.run(bucket, keyLabel, userLabel, acc.requests, acc.successes, acc.errors, acc.rateLimits, acc.tokensIn, acc.tokensOut, acc.cacheRead, acc.cacheCreation);
+        upsertTs.run(bucket!, keyLabel!, userLabel!, acc.requests, acc.successes, acc.errors, acc.rateLimits, acc.tokensIn, acc.tokensOut, acc.cacheRead, acc.cacheCreation);
+      }
+      for (const [mapKey, acc] of this.capacityTsAccumulator) {
+        const [bucket, keyLabel, windowName] = mapKey.split("|");
+        upsertCapacityTs.run(
+          bucket!,
+          keyLabel!,
+          windowName!,
+          acc.samples,
+          acc.allowedCount,
+          acc.warningCount,
+          acc.rejectedCount,
+          acc.utilizationSum,
+          acc.utilizationSamples,
+          acc.utilizationMax,
+        );
       }
       this.tsAccumulator.clear();
+      this.capacityTsAccumulator.clear();
     })();
   }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────
 
-function rowToKeyEntry(r: KeyRow): ApiKeyEntry {
+function rowToKeyEntry(
+  r: KeyRow,
+  state: CapacityStateRow | null,
+  coverage: CapacityCoverageRow[],
+  windows: CapacityWindowRow[],
+): ApiKeyEntry {
   return {
     key: r.key as ApiKey,
     label: r.label as KeyLabel,
@@ -795,6 +1309,7 @@ function rowToKeyEntry(r: KeyRow): ApiKeyEntry {
       totalCacheRead: r.total_cache_read ?? 0,
       totalCacheCreation: r.total_cache_creation ?? 0,
     },
+    capacity: stateToCapacity(state, coverage, windows),
     availableAt: r.available_at as UnixMs,
     priority: r.priority,
   };
@@ -833,6 +1348,28 @@ function freshStats(): ApiKeyStats {
   };
 }
 
+function freshCapacityState(): ApiKeyCapacityState {
+  return {
+    responseCount: 0,
+    normalizedHeaderCount: 0,
+    lastResponseAt: null,
+    lastHeaderAt: null,
+    lastUpstreamStatus: null,
+    lastRequestId: null,
+    organizationId: null,
+    representativeClaim: null,
+    retryAfterSecs: null,
+    shouldRetry: null,
+    fallbackAvailable: null,
+    fallbackPercentage: null,
+    overageStatus: null,
+    overageDisabledReason: null,
+    latencyMs: null,
+    signalCoverage: [],
+    windows: [],
+  };
+}
+
 function freshTokenStats(): ProxyTokenStats {
   return {
     totalRequests: 0,
@@ -857,3 +1394,106 @@ function maskToken(token: string): string {
   return `${token.slice(0, 4)}...${token.slice(-4)}`;
 }
 
+function stateToCapacity(
+  state: CapacityStateRow | null,
+  coverage: CapacityCoverageRow[],
+  windows: CapacityWindowRow[],
+): ApiKeyCapacityState {
+  if (state === null && coverage.length === 0 && windows.length === 0) return freshCapacityState();
+  return {
+    responseCount: state?.response_count ?? 0,
+    normalizedHeaderCount: state?.normalized_header_count ?? 0,
+    lastResponseAt: (state?.last_response_at as UnixMs | null) ?? null,
+    lastHeaderAt: (state?.last_header_at as UnixMs | null) ?? null,
+    lastUpstreamStatus: state?.last_upstream_status ?? null,
+    lastRequestId: state?.last_request_id ?? null,
+    organizationId: state?.organization_id ?? null,
+    representativeClaim: state?.representative_claim ?? null,
+    retryAfterSecs: state?.retry_after_secs ?? null,
+    shouldRetry: intToBool(state?.should_retry ?? null),
+    fallbackAvailable: intToBool(state?.fallback_available ?? null),
+    fallbackPercentage: state?.fallback_percentage ?? null,
+    overageStatus: state?.overage_status ?? null,
+    overageDisabledReason: state?.overage_disabled_reason ?? null,
+    latencyMs: state?.latency_ms ?? null,
+    signalCoverage: coverage
+      .map((signal) => ({
+        signalName: signal.signal_name,
+        seenCount: signal.seen_count,
+        lastSeenAt: (signal.last_seen_at as UnixMs | null) ?? null,
+      }))
+      .sort((a, b) => a.signalName.localeCompare(b.signalName)),
+    windows: windows
+      .map((window): CapacityWindowSnapshot => ({
+        windowName: window.window_name,
+        status: window.status ?? null,
+        utilization: window.utilization ?? null,
+        resetAt: (window.reset_at as UnixMs | null) ?? null,
+        surpassedThreshold: window.surpassed_threshold ?? null,
+        lastSeenAt: (window.last_seen_at as UnixMs | null) ?? null,
+      }))
+      .sort((a, b) => a.windowName.localeCompare(b.windowName)),
+  };
+}
+
+function deriveCapacityHealth(entry: ApiKeyEntry): CapacityHealth {
+  if (entry.availableAt > now()) return "cooling_down";
+  if (entry.capacity.overageStatus === "rejected") return "rejected";
+  const windows = activeCapacityWindows(entry);
+  if (windows.some((window) => window.status === "rejected")) return "rejected";
+  if (windows.some((window) => window.status === "allowed_warning")) return "warning";
+  if (windows.some((window) => window.status === "allowed")) return "healthy";
+  return "unknown";
+}
+
+function activeCapacityWindows(entry: ApiKeyEntry): CapacityWindowSnapshot[] {
+  const nowMs = now();
+  return entry.capacity.windows.filter((window) => window.resetAt === null || window.resetAt > nowMs);
+}
+
+function representativeUtilization(entry: ApiKeyEntry): number {
+  const preferred = preferredCapacityWindow(entry);
+  if (preferred?.utilization !== null && preferred?.utilization !== undefined) return preferred.utilization;
+  const active = activeCapacityWindows(entry)
+    .map((window) => window.utilization)
+    .filter((value): value is number => value !== null);
+  return active.length > 0 ? Math.max(...active) : Number.POSITIVE_INFINITY;
+}
+
+function preferredCapacityWindow(entry: ApiKeyEntry): CapacityWindowSnapshot | undefined {
+  const claim = entry.capacity.representativeClaim;
+  if (claim === "five_hour") return entry.capacity.windows.find((window) => window.windowName.includes("5h"));
+  if (claim === "seven_day") return entry.capacity.windows.find((window) => window.windowName.includes("7d"));
+  return entry.capacity.windows[0];
+}
+
+function capacityHealthRank(health: CapacityHealth): number {
+  if (health === "healthy") return 0;
+  if (health === "warning") return 1;
+  if (health === "unknown") return 2;
+  if (health === "rejected") return 3;
+  return 4;
+}
+
+function boolToInt(value: boolean | null): number | null {
+  if (value === null) return null;
+  return value ? 1 : 0;
+}
+
+function intToBool(value: number | null): boolean | null {
+  if (value === null) return null;
+  return value === 1;
+}
+
+function inferObservedSignals(observation: CapacityObservation): Set<string> {
+  const signals = new Set<string>();
+  if (observation.requestId !== undefined) signals.add("request_id");
+  if (observation.organizationId !== undefined) signals.add("organization");
+  if (observation.representativeClaim !== undefined) signals.add("representative_claim");
+  if (observation.retryAfterSecs !== undefined) signals.add("retry_after");
+  if (observation.shouldRetry !== undefined) signals.add("should_retry");
+  if (observation.fallbackAvailable !== undefined || observation.fallbackPercentage !== undefined) signals.add("fallback");
+  if (observation.overageStatus !== undefined || observation.overageDisabledReason !== undefined) signals.add("overage");
+  if ((observation.windows?.length ?? 0) > 0) signals.add("windows");
+  return signals;
+}

@@ -43,6 +43,25 @@
   .header-stat { color: var(--text-dim); font-size: 12px; }
   .header-stat b { color: var(--text-bright); }
   .sep { color: var(--border); }
+  .summary-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 10px; margin-bottom: 14px;
+  }
+  .summary-card {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px;
+  }
+  .summary-card-label { color: var(--text-dim); font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; }
+  .summary-card-value { color: var(--text-bright); font-size: 16px; font-weight: 700; }
+  .summary-card-sub { color: var(--text-dim); font-size: 11px; margin-top: 4px; }
+  .window-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; }
+  .window-card {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px;
+  }
+  .window-card-head { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; margin-bottom: 8px; }
+  .window-card-name { color: var(--text-bright); font-weight: 600; font-size: 12px; }
+  .window-card-reset { color: var(--text-dim); font-size: 11px; }
+  .window-card-stats { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px 10px; font-size: 11px; }
+  .window-card-stats b { color: var(--text); }
 
   /* Panels grid */
   .panels { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
@@ -73,6 +92,10 @@
   .badge { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 10px; font-weight: 600; }
   .badge-ok { background: rgba(63,185,80,0.15); color: var(--green); }
   .badge-ratelimited { background: rgba(210,153,34,0.15); color: var(--yellow); }
+  .badge-warning { background: rgba(210,153,34,0.15); color: var(--yellow); }
+  .badge-rejected { background: rgba(248,81,73,0.15); color: var(--red); }
+  .badge-unknown { background: rgba(139,148,158,0.18); color: var(--text-dim); }
+  .badge-blue { background: rgba(88,166,255,0.15); color: var(--blue); }
   .card-remove { position: absolute; top: 6px; right: 8px; background: none; border: none; color: var(--text-dim); cursor: pointer; font-size: 14px; line-height: 1; padding: 2px; }
   .card-remove:hover { color: var(--red); }
   .editable { cursor: pointer; border-bottom: 1px dashed var(--border); }
@@ -84,6 +107,20 @@
   .priority-select:focus { outline: none; border-color: var(--blue); }
   .priority-select option { background: var(--bg2); color: var(--text); }
   .empty-state { color: var(--text-dim); font-size: 12px; padding: 20px 0; text-align: center; flex: 1; display: flex; align-items: center; justify-content: center; }
+  .card-capacity {
+    margin-top: 8px; padding-top: 8px; border-top: 1px solid rgba(48,54,61,0.55);
+    color: var(--text-dim); font-size: 11px; line-height: 1.6;
+  }
+  .card-capacity-head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
+  .capacity-kv { display: flex; gap: 6px; flex-wrap: wrap; }
+  .capacity-kv span { white-space: nowrap; }
+  .window-pill-list { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+  .window-pill {
+    display: inline-flex; gap: 5px; align-items: center; background: var(--bg3);
+    border: 1px solid var(--border); border-radius: 999px; padding: 2px 8px; font-size: 10px;
+  }
+  .window-pill strong { color: var(--text-bright); font-weight: 600; }
+  .card-note { color: var(--text-dim); font-size: 10px; margin-top: 4px; }
 
   /* Add forms */
   .add-form { display: none; gap: 8px; margin-bottom: 8px; align-items: flex-end; flex-wrap: wrap; }
@@ -157,6 +194,8 @@
   .webhook-row .webhook-label { color: var(--text-dim); flex-shrink: 0; max-width: 120px; overflow: hidden; text-overflow: ellipsis; }
   .webhook-row .webhook-date { color: var(--text-dim); flex-shrink: 0; font-size: 11px; }
   .webhook-actions { display: flex; gap: 4px; flex-shrink: 0; }
+  .schema-actions { display:flex; gap:6px; align-items:center; margin-bottom:8px; }
+  .inline-toggle { display:flex; align-items:center; gap:6px; color: var(--text-dim); font-size: 11px; }
 </style>
 </head>
 <body>
@@ -186,6 +225,17 @@
     <span class="header-stat"><b id="hdr-reqs">0</b> reqs</span>
     <span class="sep">|</span>
     <span class="header-stat"><b id="hdr-tokens-in">0</b> in / <b id="hdr-tokens-out">0</b> out</span>
+  </div>
+
+  <div class="log-panel" style="margin-bottom:16px">
+    <div class="log-header">
+      <span class="panel-title">Pool Capacity</span>
+      <span class="header-stat" id="pool-updated">No normalized capacity data yet</span>
+    </div>
+    <div class="summary-grid" id="capacity-summary-grid">
+      <div class="empty-state">No capacity data observed yet</div>
+    </div>
+    <div class="window-grid" id="capacity-window-summary"></div>
   </div>
 
   <!-- Panels -->
@@ -259,6 +309,18 @@
       </div>
       <div style="flex:1;position:relative;min-height:200px"><canvas id="chart-tokens"></canvas></div>
     </div>
+    <div class="panel" style="min-height:280px">
+      <div class="panel-header">
+        <span class="panel-title">Capacity Pressure</span>
+      </div>
+      <div style="flex:1;position:relative;min-height:200px"><canvas id="chart-capacity"></canvas></div>
+    </div>
+    <div class="panel" style="min-height:280px">
+      <div class="panel-header">
+        <span class="panel-title">Unified Status Mix</span>
+      </div>
+      <div style="flex:1;position:relative;min-height:200px"><canvas id="chart-capacity-status"></canvas></div>
+    </div>
   </div>
 
   <!-- API Schema -->
@@ -296,9 +358,19 @@
         </div>
       </div>
 
+      <div class="schema-sub">
+        <span class="schema-sub-header">Normalized Rate-Limit Signals</span>
+        <div id="normalized-signals">
+          <div class="empty-state" style="padding:10px 0">No normalized signals yet</div>
+        </div>
+      </div>
+
       <!-- Response Headers -->
       <div class="schema-sub">
-        <span class="schema-sub-header">Response Headers</span>
+        <div class="schema-actions">
+          <span class="schema-sub-header" style="margin-bottom:0">Response Headers</span>
+          <label class="inline-toggle"><input type="checkbox" id="show-noisy-headers" onchange="renderSchemaHeaders()"> Show noisy headers</label>
+        </div>
         <div id="schema-headers">
           <div class="empty-state" style="padding:10px 0">No headers tracked yet</div>
         </div>
@@ -367,6 +439,7 @@ Chart.defaults.font.size = 11;
 let adminToken = sessionStorage.getItem('adminToken') || '';
 let keys = [];
 let tokens = [];
+let capacitySummary = null;
 let evtSource = null;
 const MAX_LOG = 200;
 const keyColorMap = {};
@@ -432,6 +505,10 @@ function fmtNum(n) {
   if (n >= 1e3) return (n / 1e3).toFixed(1) + 'k';
   return String(n);
 }
+function fmtPct(n) {
+  if (n === null || n === undefined || Number.isNaN(Number(n))) return '--';
+  return Math.round(Number(n) * 100) + '%';
+}
 function fmtTime(iso) {
   if (!iso) return '--:--:--';
   const d = new Date(iso);
@@ -454,6 +531,128 @@ function keyColor(label) {
   return keyColorMap[label];
 }
 function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML.replace(/'/g, '&#39;'); }
+function humanizeWindowName(name) {
+  if (!name) return '--';
+  if (name === 'unified') return 'Representative';
+  return name.replace(/^unified-/, 'Unified ').replace(/_/g, ' ').toUpperCase();
+}
+function humanizeClaim(claim) {
+  if (!claim) return '--';
+  if (claim === 'five_hour') return '5h';
+  if (claim === 'seven_day') return '7d';
+  return claim.replace(/_/g, ' ');
+}
+function shortOrg(org) {
+  if (!org) return '--';
+  if (org.length <= 14) return org;
+  return `${org.slice(0, 8)}...${org.slice(-4)}`;
+}
+function shortId(value) {
+  if (!value) return '--';
+  if (value.length <= 18) return value;
+  return `${value.slice(0, 10)}...${value.slice(-4)}`;
+}
+function humanizeSignalName(name) {
+  const labels = {
+    request_id: 'Request ID',
+    organization: 'Organization',
+    representative_claim: 'Representative Claim',
+    retry_after: 'Retry-After',
+    should_retry: 'Should Retry',
+    fallback: 'Fallback',
+    overage: 'Overage',
+    windows: 'Rate-Limit Windows',
+  };
+  return labels[name] || name.replace(/_/g, ' ');
+}
+function shortSignalName(name) {
+  const labels = {
+    request_id: 'req',
+    organization: 'org',
+    representative_claim: 'claim',
+    retry_after: 'retry',
+    should_retry: 'retry?',
+    fallback: 'fallback',
+    overage: 'overage',
+    windows: 'windows',
+  };
+  return labels[name] || name;
+}
+function signalCoverage(key, signalName) {
+  return (key.capacity?.signalCoverage || []).find(signal => signal.signalName === signalName) || null;
+}
+function activeCapacityWindows(key) {
+  const nowMs = Date.now();
+  return (key.capacity?.windows || []).filter(window => window.resetAt === null || window.resetAt === undefined || window.resetAt > nowMs);
+}
+function healthBadge(key) {
+  const health = key.capacityHealth || 'unknown';
+  if (health === 'cooling_down') {
+    const rem = key.availableAt - Date.now();
+    return `<span class="badge badge-ratelimited">Cooling ${rem > 0 ? fmtCountdown(rem) : ''}</span>`;
+  }
+  if (health === 'healthy') return '<span class="badge badge-ok">Healthy</span>';
+  if (health === 'warning') return '<span class="badge badge-warning">Warning</span>';
+  if (health === 'rejected') return '<span class="badge badge-rejected">Rejected</span>';
+  return '<span class="badge badge-unknown">Unknown</span>';
+}
+function renderCapacitySummary() {
+  const grid = document.getElementById('capacity-summary-grid');
+  const windowsEl = document.getElementById('capacity-window-summary');
+  const updatedEl = document.getElementById('pool-updated');
+  const totalResponses = keys.reduce((sum, key) => sum + (key.capacity?.responseCount || 0), 0);
+  const normalizedResponses = keys.reduce((sum, key) => sum + (key.capacity?.normalizedHeaderCount || 0), 0);
+  const normalizedPct = totalResponses > 0 ? fmtPct(normalizedResponses / totalResponses) : '--';
+  if (!capacitySummary) {
+    grid.innerHTML = '<div class="empty-state">No capacity data observed yet</div>';
+    windowsEl.innerHTML = '';
+    updatedEl.textContent = 'No normalized capacity data yet';
+    return;
+  }
+
+  if (capacitySummary.lastUpdatedAt) {
+    updatedEl.textContent = `Updated ${fmtRelative(new Date(capacitySummary.lastUpdatedAt).toISOString())}`;
+  } else if (totalResponses > 0) {
+    updatedEl.textContent = `No normalized signals yet (${fmtNum(totalResponses)} responses seen)`;
+  } else {
+    updatedEl.textContent = 'Waiting for normalized headers';
+  }
+
+  const cards = [
+    { label: 'Healthy', value: capacitySummary.healthyKeys, sub: `${capacitySummary.warningKeys} warning / ${capacitySummary.rejectedKeys} rejected` },
+    { label: 'Cooling', value: capacitySummary.coolingDownKeys, sub: `${capacitySummary.unknownKeys} unknown` },
+    { label: 'Organizations', value: capacitySummary.distinctOrganizations, sub: 'distinct org IDs seen' },
+    { label: 'Responses', value: fmtNum(totalResponses), sub: 'upstream responses observed' },
+    { label: 'Signals', value: normalizedPct, sub: `${fmtNum(normalizedResponses)} / ${fmtNum(totalResponses)} responses carried normalized signals` },
+    { label: 'Fallback', value: capacitySummary.fallbackAvailableKeys, sub: 'keys with fallback available' },
+    { label: 'Overage', value: capacitySummary.overageRejectedKeys, sub: 'keys reporting overage rejection' },
+  ];
+  grid.innerHTML = cards.map(card =>
+    `<div class="summary-card"><div class="summary-card-label">${esc(card.label)}</div><div class="summary-card-value">${esc(String(card.value))}</div><div class="summary-card-sub">${esc(card.sub)}</div></div>`
+  ).join('');
+
+  if (!capacitySummary.windows || capacitySummary.windows.length === 0) {
+    windowsEl.innerHTML = '<div class="empty-state">No rate-limit windows observed yet</div>';
+    return;
+  }
+
+  windowsEl.innerHTML = capacitySummary.windows.map(window => `
+    <div class="window-card">
+      <div class="window-card-head">
+        <span class="window-card-name">${esc(humanizeWindowName(window.windowName))}</span>
+        <span class="window-card-reset">${window.nextResetAt ? `reset ${fmtCountdown(window.nextResetAt - Date.now())}` : 'reset --'}</span>
+      </div>
+      <div class="window-card-stats">
+        <span><b>${fmtPct(window.maxUtilization)}</b> max util</span>
+        <span><b>${fmtPct(window.medianUtilization)}</b> median util</span>
+        <span><b>${fmtNum(window.allowedKeys)}</b> allowed</span>
+        <span><b>${fmtNum(window.warningKeys)}</b> warning</span>
+        <span><b>${fmtNum(window.rejectedKeys)}</b> rejected</span>
+        <span><b>${fmtNum(window.knownKeys)}</b> keys reporting</span>
+      </div>
+    </div>
+  `).join('');
+}
 
 // ── Render keys ────────────────────────────────────────────────
 function renderKeys() {
@@ -477,15 +676,33 @@ function renderKeys() {
   keys.forEach(k => {
     const ratio = totalReqs > 0 ? k.stats.totalRequests / totalReqs : 0;
     const cc = keyColor(k.label);
-    const isAvail = k.isAvailable;
     const pri = k.priority || 2;
-    let badge;
-    if (isAvail) {
-      badge = '<span class="badge badge-ok">OK</span>';
-    } else {
-      const rem = k.availableAt - Date.now();
-      badge = `<span class="badge badge-ratelimited">RATE-LTD ${rem > 0 ? fmtCountdown(rem) : ''}</span>`;
-    }
+    const badge = healthBadge(k);
+    const windows = activeCapacityWindows(k);
+    const windowsHtml = windows.slice(0, 4).map(window => {
+      const status = window.status || 'unknown';
+      const reset = window.resetAt ? `, reset ${fmtCountdown(window.resetAt - Date.now())}` : '';
+      return `<span class="window-pill"><strong>${esc(humanizeWindowName(window.windowName))}</strong><span>${fmtPct(window.utilization)}</span><span>${esc(status)}${reset}</span></span>`;
+    }).join('');
+    const claim = k.capacity?.representativeClaim ? humanizeClaim(k.capacity.representativeClaim) : '--';
+    const fallback = k.capacity?.fallbackAvailable === true
+      ? `available${k.capacity.fallbackPercentage !== null && k.capacity.fallbackPercentage !== undefined ? ` @ ${fmtPct(k.capacity.fallbackPercentage)}` : ''}`
+      : k.capacity?.fallbackAvailable === false ? 'unavailable' : 'unknown';
+    const overage = k.capacity?.overageStatus
+      ? `${k.capacity.overageStatus}${k.capacity.overageDisabledReason ? ` (${k.capacity.overageDisabledReason})` : ''}`
+      : 'n/a';
+    const latency = k.capacity?.latencyMs !== null && k.capacity?.latencyMs !== undefined ? `${fmtNum(k.capacity.latencyMs)} ms` : '--';
+    const responseCount = k.capacity?.responseCount || 0;
+    const normalizedCount = k.capacity?.normalizedHeaderCount || 0;
+    const responseAge = k.capacity?.lastResponseAt ? fmtRelative(new Date(k.capacity.lastResponseAt).toISOString()) : '--';
+    const signalAge = k.capacity?.lastHeaderAt ? fmtRelative(new Date(k.capacity.lastHeaderAt).toISOString()) : '--';
+    const coverageSummary = responseCount === 0
+      ? 'No upstream responses observed for this key yet.'
+      : normalizedCount === 0
+        ? `No normalized signals seen across ${fmtNum(responseCount)} responses yet.`
+        : ['organization', 'representative_claim', 'windows', 'fallback', 'overage']
+            .map(signalName => `${shortSignalName(signalName)} ${fmtPct((signalCoverage(k, signalName)?.seenCount || 0) / responseCount)}`)
+            .join(' · ');
 
     let card = el.querySelector(`.card[data-key="${CSS.escape(k.maskedKey)}"]`);
     if (!card) {
@@ -499,6 +716,7 @@ function renderKeys() {
         <div class="card-masked"></div>
         <div class="card-bar"><div class="card-bar-fill"></div></div>
         <div class="card-stats"></div>
+        <div class="card-capacity"></div>
         <select class="priority-select" title="Selection priority">
           <option value="1">Preferred</option>
           <option value="2">Normal</option>
@@ -521,7 +739,7 @@ function renderKeys() {
 
     const fill = card.querySelector('.card-bar-fill');
     fill.style.width = (ratio * 100).toFixed(1) + '%';
-    fill.style.background = `var(--${isAvail ? 'green' : 'yellow'})`;
+    fill.style.background = k.capacityHealth === 'rejected' ? 'var(--red)' : k.capacityHealth === 'warning' ? 'var(--yellow)' : 'var(--green)';
 
     let statsHtml = `<b>${fmtNum(k.stats.totalRequests)}</b> req &nbsp;`
       + `<b>${fmtNum(k.stats.totalTokensIn)}</b> in / <b>${fmtNum(k.stats.totalTokensOut)}</b> out`
@@ -531,6 +749,30 @@ function renderKeys() {
       + (k.stats.rateLimitHits > 0 ? ` &nbsp;<span class="c-dim">${k.stats.rateLimitHits} rate-limits</span>` : '')
       + ((k.recentErrors || 0) > 0 ? ` &nbsp;<span class="c-red">${k.recentErrors} errors (1h)</span>` : '');
     card.querySelector('.card-stats').innerHTML = statsHtml;
+    card.querySelector('.card-capacity').innerHTML = `
+      <div class="card-capacity-head">
+        <span class="badge badge-blue">${esc(claim)}</span>
+        ${k.capacity?.shouldRetry === true ? '<span class="badge badge-ok">retryable</span>' : ''}
+        ${k.capacity?.shouldRetry === false ? '<span class="badge badge-rejected">no retry</span>' : ''}
+      </div>
+      <div class="capacity-kv">
+        <span><b>Org</b> ${esc(shortOrg(k.capacity?.organizationId))}</span>
+        <span><b>Fallback</b> ${esc(fallback)}</span>
+        <span><b>Overage</b> ${esc(overage)}</span>
+      </div>
+      <div class="capacity-kv">
+        <span><b>Responses</b> ${fmtNum(responseCount)}</span>
+        <span><b>Signals</b> ${fmtNum(normalizedCount)}${responseCount > 0 ? ` (${fmtPct(normalizedCount / responseCount)})` : ''}</span>
+        <span><b>Last Resp</b> ${esc(responseAge)}</span>
+      </div>
+      <div class="capacity-kv">
+        <span><b>Latency</b> ${esc(latency)}</span>
+        <span><b>Last Sig</b> ${esc(signalAge)}</span>
+        <span><b>Request</b> ${esc(k.capacity?.lastRequestId ? shortId(k.capacity.lastRequestId) : '--')}</span>
+      </div>
+      ${windowsHtml ? `<div class="window-pill-list">${windowsHtml}</div>` : '<div class="card-note">No active rate-limit windows observed for this key yet.</div>'}
+      <div class="card-note">${esc(coverageSummary)}</div>
+    `;
 
     // Update priority dropdown only if user isn't interacting with it
     const sel = card.querySelector('.priority-select');
@@ -604,6 +846,8 @@ function renderHeader() {
   document.getElementById('hdr-reqs').textContent = fmtNum(total);
   document.getElementById('hdr-tokens-in').textContent = fmtNum(tokIn);
   document.getElementById('hdr-tokens-out').textContent = fmtNum(tokOut);
+  renderCapacitySummary();
+  renderNormalizedSignals();
 }
 
 // ── Activity log ───────────────────────────────────────────────
@@ -680,6 +924,10 @@ function connectSSE() {
         renderKeys();
         renderHeader();
       }
+      if (event.capacitySummary) {
+        capacitySummary = event.capacitySummary;
+        renderCapacitySummary();
+      }
       // Update tokens from heartbeat
       if (event.tokens) {
         tokens = event.tokens;
@@ -728,8 +976,9 @@ async function removeKey(maskedKey) {
 
 async function refreshKeys() {
   try {
-    const data = await api('GET', '/admin/keys');
+    const data = await api('GET', '/admin/stats');
     keys = data.keys;
+    capacitySummary = data.capacitySummary || capacitySummary;
     renderKeys();
     renderHeader();
   } catch {}
@@ -870,6 +1119,8 @@ renderSetupSnippet();
 // ── Charts ─────────────────────────────────────────────────────
 let requestsChart = null;
 let tokensChart = null;
+let capacityChart = null;
+let capacityStatusChart = null;
 
 function formatBucketLabel(bucket, resolution) {
   if (resolution === 'day') return bucket;
@@ -905,8 +1156,12 @@ async function loadCharts() {
   const resolution = hours > 72 ? 'day' : 'hour';
 
   let data;
+  let capacityData;
   try {
-    data = await api('GET', `/admin/stats/timeseries?hours=${hours}&resolution=${resolution}`);
+    [data, capacityData] = await Promise.all([
+      api('GET', `/admin/stats/timeseries?hours=${hours}&resolution=${resolution}`),
+      api('GET', `/admin/capacity/timeseries?hours=${hours}&resolution=${resolution}`),
+    ]);
   } catch { return; }
 
   const filled = fillGaps(data.buckets, hours, resolution);
@@ -914,6 +1169,8 @@ async function loadCharts() {
 
   if (requestsChart) requestsChart.destroy();
   if (tokensChart) tokensChart.destroy();
+  if (capacityChart) capacityChart.destroy();
+  if (capacityStatusChart) capacityStatusChart.destroy();
 
   requestsChart = new Chart(document.getElementById('chart-requests'), {
     type: 'bar',
@@ -946,6 +1203,74 @@ async function loadCharts() {
     options: {
       responsive: true, maintainAspectRatio: false,
       scales: { x: { ticks: { maxRotation: 45, maxTicksLimit: 24 } }, y: { beginAtZero: true } },
+      plugins: { legend: { position: 'bottom', labels: { boxWidth: 12 } } }
+    }
+  });
+
+  const capacityRows = capacityData?.buckets || [];
+  const bucketKeys = fillGaps([], hours, resolution).map(b => b.bucket);
+  const labelByBucket = new Map(bucketKeys.map(bucket => [bucket, formatBucketLabel(bucket, resolution)]));
+  const windows = [...new Set(capacityRows.map(row => row.windowName))];
+  const pressureWindows = windows.filter(name => name !== 'unified');
+  const pressureWindowList = pressureWindows.length > 0 ? pressureWindows : windows.slice(0, 3);
+  const statusWindow = windows.includes('unified') ? 'unified' : (windows[0] || null);
+
+  capacityChart = new Chart(document.getElementById('chart-capacity'), {
+    type: 'line',
+    data: {
+      labels: bucketKeys.map(bucket => labelByBucket.get(bucket)),
+      datasets: pressureWindowList.map((windowName, idx) => ({
+        label: `${humanizeWindowName(windowName)} max util`,
+        data: bucketKeys.map(bucket => {
+          const row = capacityRows.find(entry => entry.bucket === bucket && entry.windowName === windowName);
+          return row?.maxUtilization ?? null;
+        }),
+        borderColor: ['#58a6ff', '#39d2c0', '#d2a8ff', '#ffa657'][idx % 4],
+        backgroundColor: 'transparent',
+        tension: 0.3,
+        pointRadius: 2,
+        spanGaps: true,
+      })),
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      scales: {
+        x: { ticks: { maxRotation: 45, maxTicksLimit: 24 } },
+        y: {
+          beginAtZero: true,
+          suggestedMax: 1,
+          ticks: { callback: value => `${Math.round(Number(value) * 100)}%` },
+        },
+      },
+      plugins: { legend: { position: 'bottom', labels: { boxWidth: 12 } } }
+    }
+  });
+
+  capacityStatusChart = new Chart(document.getElementById('chart-capacity-status'), {
+    type: 'bar',
+    data: {
+      labels: bucketKeys.map(bucket => labelByBucket.get(bucket)),
+      datasets: statusWindow ? [
+        {
+          label: `${humanizeWindowName(statusWindow)} allowed`,
+          data: bucketKeys.map(bucket => capacityRows.find(entry => entry.bucket === bucket && entry.windowName === statusWindow)?.allowed ?? 0),
+          backgroundColor: '#3fb950',
+        },
+        {
+          label: `${humanizeWindowName(statusWindow)} warning`,
+          data: bucketKeys.map(bucket => capacityRows.find(entry => entry.bucket === bucket && entry.windowName === statusWindow)?.warning ?? 0),
+          backgroundColor: '#d29922',
+        },
+        {
+          label: `${humanizeWindowName(statusWindow)} rejected`,
+          data: bucketKeys.map(bucket => capacityRows.find(entry => entry.bucket === bucket && entry.windowName === statusWindow)?.rejected ?? 0),
+          backgroundColor: '#f85149',
+        },
+      ] : [],
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      scales: { x: { stacked: true, ticks: { maxRotation: 45, maxTicksLimit: 24 } }, y: { stacked: true, beginAtZero: true } },
       plugins: { legend: { position: 'bottom', labels: { boxWidth: 12 } } }
     }
   });
@@ -989,6 +1314,7 @@ let schemaHeaders = [];
 let schemaFields = [];
 let webhooks = [];
 const collapsedGroups = new Set();
+const noisyHeaderNames = new Set(['cf-ray', 'set-cookie', 'date', 'server', 'server-timing', 'x-envoy-upstream-service-time', 'request-id', 'x-request-id', 'content-length', 'connection']);
 
 function fmtRelative(iso) {
   if (!iso) return '--';
@@ -1013,6 +1339,7 @@ async function refreshSchema() {
     schemaHeaders = schemaData.headers;
     schemaFields = schemaData.fields;
     webhooks = webhookData.webhooks;
+    renderNormalizedSignals();
     renderSchemaHeaders();
     renderSchemaFields();
     renderWebhooks();
@@ -1021,14 +1348,93 @@ async function refreshSchema() {
   }
 }
 
+function renderNormalizedSignals() {
+  const el = document.getElementById('normalized-signals');
+  if (!capacitySummary || ((!capacitySummary.windows || capacitySummary.windows.length === 0) && keys.length === 0)) {
+    el.innerHTML = '<div class="empty-state" style="padding:10px 0">No normalized signals yet</div>';
+    return;
+  }
+
+  const totalResponses = keys.reduce((sum, key) => sum + (key.capacity?.responseCount || 0), 0);
+  const claimCounts = new Map();
+  for (const key of keys) {
+    const claim = key.capacity?.representativeClaim || 'unknown';
+    claimCounts.set(claim, (claimCounts.get(claim) || 0) + 1);
+  }
+  const claimSummary = [...claimCounts.entries()].map(([claim, count]) => `${humanizeClaim(claim)} (${count})`).join(', ') || '--';
+  const coreSignals = ['organization', 'representative_claim', 'windows', 'fallback', 'overage', 'retry_after', 'should_retry', 'request_id'];
+  const signalSummary = new Map(coreSignals.map(signalName => [signalName, {
+    signalName,
+    keysSeen: 0,
+    seenCount: 0,
+    lastSeenAt: null,
+  }]));
+  for (const key of keys) {
+    for (const signal of key.capacity?.signalCoverage || []) {
+      const existing = signalSummary.get(signal.signalName) || {
+        signalName: signal.signalName,
+        keysSeen: 0,
+        seenCount: 0,
+        lastSeenAt: null,
+      };
+      existing.keysSeen += 1;
+      existing.seenCount += signal.seenCount;
+      if (signal.lastSeenAt && (!existing.lastSeenAt || signal.lastSeenAt > existing.lastSeenAt)) {
+        existing.lastSeenAt = signal.lastSeenAt;
+      }
+      signalSummary.set(signal.signalName, existing);
+    }
+  }
+
+  let html = `<div class="summary-card" style="margin-bottom:10px">
+    <div class="summary-card-label">Representative Claims</div>
+    <div class="summary-card-sub">${esc(claimSummary)}</div>
+  </div>`;
+
+  html += `<div class="summary-card" style="margin-bottom:10px">
+    <div class="summary-card-label">Signal Coverage</div>
+    <div class="summary-card-sub">${totalResponses > 0 ? `${fmtNum(keys.reduce((sum, key) => sum + (key.capacity?.normalizedHeaderCount || 0), 0))} / ${fmtNum(totalResponses)} responses with normalized signals` : 'No responses observed yet'}</div>
+  </div>`;
+
+  html += '<table class="schema-table" style="margin-bottom:10px"><thead><tr><th>Signal</th><th>Keys Seen</th><th>Coverage</th><th>Seen</th><th>Last Seen</th></tr></thead><tbody>';
+  for (const signal of [...signalSummary.values()]) {
+    const coverage = totalResponses > 0 ? fmtPct(signal.seenCount / totalResponses) : '--';
+    html += `<tr><td class="path-col">${esc(humanizeSignalName(signal.signalName))}</td><td>${fmtNum(signal.keysSeen)}</td><td>${coverage}</td><td>${fmtNum(signal.seenCount)}</td><td>${signal.lastSeenAt ? fmtRelative(new Date(signal.lastSeenAt).toISOString()) : '--'}</td></tr>`;
+  }
+  html += '</tbody></table>';
+
+  if (capacitySummary.windows && capacitySummary.windows.length > 0) {
+    html += '<table class="schema-table"><thead><tr><th>Window</th><th>Keys</th><th>Allowed</th><th>Warning</th><th>Rejected</th><th>Median</th><th>Max</th><th>Next Reset</th></tr></thead><tbody>';
+    for (const window of capacitySummary.windows) {
+      html += `<tr><td class="path-col">${esc(humanizeWindowName(window.windowName))}</td><td>${fmtNum(window.knownKeys)}</td><td>${fmtNum(window.allowedKeys)}</td><td>${fmtNum(window.warningKeys)}</td><td>${fmtNum(window.rejectedKeys)}</td><td>${fmtPct(window.medianUtilization)}</td><td>${fmtPct(window.maxUtilization)}</td><td>${window.nextResetAt ? fmtCountdown(window.nextResetAt - Date.now()) : '--'}</td></tr>`;
+    }
+    html += '</tbody></table>';
+  }
+
+  el.innerHTML = html;
+}
+
 function renderSchemaHeaders() {
   const el = document.getElementById('schema-headers');
   if (schemaHeaders.length === 0) {
     el.innerHTML = '<div class="empty-state" style="padding:10px 0">No headers tracked yet</div>';
     return;
   }
+  const showNoisy = document.getElementById('show-noisy-headers').checked;
+  const filteredHeaders = schemaHeaders
+    .filter(h => showNoisy || !noisyHeaderNames.has(h.name))
+    .sort((a, b) => {
+      const aAnthropic = a.name.startsWith('anthropic-') ? 0 : 1;
+      const bAnthropic = b.name.startsWith('anthropic-') ? 0 : 1;
+      if (aAnthropic !== bAnthropic) return aAnthropic - bAnthropic;
+      return b.hitCount - a.hitCount || a.name.localeCompare(b.name);
+    });
+  if (filteredHeaders.length === 0) {
+    el.innerHTML = '<div class="empty-state" style="padding:10px 0">No non-noisy headers tracked yet</div>';
+    return;
+  }
   let html = '<table class="schema-table"><thead><tr><th>Header</th><th>Hits</th><th>Last Seen</th><th>Sample Values</th></tr></thead><tbody>';
-  for (const h of schemaHeaders) {
+  for (const h of filteredHeaders) {
     const samples = h.sampleValues.slice(0, 5).map(v => `<code>${esc(v)}</code>`).join(', ');
     const overflow = h.sampleValues.length > 5 ? ` <span class="c-dim">+${h.sampleValues.length - 5}</span>` : '';
     html += `<tr><td class="path-col">${esc(h.name)}</td><td>${fmtNum(h.hitCount)}</td><td>${fmtRelative(h.lastSeenAt)}</td><td class="sample-val">${samples}${overflow}${h.valueOverflow ? ' <span class="c-dim">(overflow)</span>' : ''}</td></tr>`;
@@ -1130,13 +1536,17 @@ async function testWebhook(url) {
 
 // ── Init ───────────────────────────────────────────────────────
 let countdownInterval = null;
+let chartsRefreshInterval = null;
 function init() {
   connectSSE();
+  refreshKeys();
   refreshTokens();
   loadCharts();
   refreshSchema();
   if (countdownInterval) clearInterval(countdownInterval);
+  if (chartsRefreshInterval) clearInterval(chartsRefreshInterval);
   countdownInterval = setInterval(() => { renderKeys(); renderHeader(); }, 1000);
+  chartsRefreshInterval = setInterval(() => { loadCharts(); }, 30000);
 }
 </script>
 </body>

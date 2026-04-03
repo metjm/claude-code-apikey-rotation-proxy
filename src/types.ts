@@ -50,10 +50,53 @@ export interface ApiKeyStats {
   readonly totalCacheCreation: number;
 }
 
+export type CapacityHealth =
+  | "healthy"
+  | "warning"
+  | "rejected"
+  | "cooling_down"
+  | "unknown";
+
+export interface CapacityWindowSnapshot {
+  readonly windowName: string;
+  readonly status: string | null;
+  readonly utilization: number | null;
+  readonly resetAt: UnixMs | null;
+  readonly surpassedThreshold: number | null;
+  readonly lastSeenAt: UnixMs | null;
+}
+
+export interface CapacitySignalCoverage {
+  readonly signalName: string;
+  readonly seenCount: number;
+  readonly lastSeenAt: UnixMs | null;
+}
+
+export interface ApiKeyCapacityState {
+  readonly responseCount: number;
+  readonly normalizedHeaderCount: number;
+  readonly lastResponseAt: UnixMs | null;
+  readonly lastHeaderAt: UnixMs | null;
+  readonly lastUpstreamStatus: number | null;
+  readonly lastRequestId: string | null;
+  readonly organizationId: string | null;
+  readonly representativeClaim: string | null;
+  readonly retryAfterSecs: number | null;
+  readonly shouldRetry: boolean | null;
+  readonly fallbackAvailable: boolean | null;
+  readonly fallbackPercentage: number | null;
+  readonly overageStatus: string | null;
+  readonly overageDisabledReason: string | null;
+  readonly latencyMs: number | null;
+  readonly signalCoverage: readonly CapacitySignalCoverage[];
+  readonly windows: readonly CapacityWindowSnapshot[];
+}
+
 export interface ApiKeyEntry {
   readonly key: ApiKey;
   readonly label: KeyLabel;
   stats: ApiKeyStats;
+  capacity: ApiKeyCapacityState;
   /** Key is rate-limited until this time. 0 = available now. */
   availableAt: UnixMs;
   /** Selection priority: 1 = Preferred, 2 = Normal, 3 = Fallback. */
@@ -64,6 +107,8 @@ export interface MaskedKeyEntry {
   readonly maskedKey: string;
   readonly label: KeyLabel;
   readonly stats: ApiKeyStats;
+  readonly capacity: ApiKeyCapacityState;
+  readonly capacityHealth: CapacityHealth;
   readonly availableAt: UnixMs;
   readonly isAvailable: boolean;
   readonly priority: number;
@@ -101,7 +146,7 @@ export interface MaskedTokenEntry {
 
 export interface StoredState {
   readonly version: 1;
-  readonly keys: readonly ApiKeyEntry[];
+  readonly keys: readonly (Omit<ApiKeyEntry, "capacity"> & { readonly capacity?: ApiKeyCapacityState })[];
   readonly tokens?: readonly ProxyTokenEntry[];
 }
 
@@ -184,6 +229,73 @@ export interface TimeseriesQuery {
   readonly keyLabel?: string;
   readonly userLabel?: string;
   readonly resolution?: "hour" | "day";
+}
+
+export interface CapacityWindowObservation {
+  readonly windowName: string;
+  readonly status?: string | null;
+  readonly utilization?: number | null;
+  readonly resetAt?: UnixMs | null;
+  readonly surpassedThreshold?: number | null;
+  readonly lastSeenAt?: UnixMs | null;
+}
+
+export interface CapacityObservation {
+  readonly seenAt: UnixMs;
+  readonly httpStatus?: number;
+  readonly requestId?: string | null;
+  readonly organizationId?: string | null;
+  readonly representativeClaim?: string | null;
+  readonly retryAfterSecs?: number | null;
+  readonly shouldRetry?: boolean | null;
+  readonly fallbackAvailable?: boolean | null;
+  readonly fallbackPercentage?: number | null;
+  readonly overageStatus?: string | null;
+  readonly overageDisabledReason?: string | null;
+  readonly latencyMs?: number | null;
+  readonly observedSignals?: readonly string[];
+  readonly windows?: readonly CapacityWindowObservation[];
+}
+
+export interface CapacitySummaryWindow {
+  readonly windowName: string;
+  readonly knownKeys: number;
+  readonly allowedKeys: number;
+  readonly warningKeys: number;
+  readonly rejectedKeys: number;
+  readonly maxUtilization: number | null;
+  readonly medianUtilization: number | null;
+  readonly nextResetAt: UnixMs | null;
+}
+
+export interface CapacitySummary {
+  readonly healthyKeys: number;
+  readonly warningKeys: number;
+  readonly rejectedKeys: number;
+  readonly coolingDownKeys: number;
+  readonly unknownKeys: number;
+  readonly fallbackAvailableKeys: number;
+  readonly overageRejectedKeys: number;
+  readonly distinctOrganizations: number;
+  readonly lastUpdatedAt: UnixMs | null;
+  readonly windows: readonly CapacitySummaryWindow[];
+}
+
+export interface CapacityTimeseriesQuery {
+  readonly hours?: number;
+  readonly keyLabel?: string;
+  readonly resolution?: "hour" | "day";
+}
+
+export interface CapacityTimeseriesBucket {
+  readonly bucket: string;
+  readonly windowName: string;
+  readonly samples: number;
+  readonly allowed: number;
+  readonly warning: number;
+  readonly rejected: number;
+  readonly avgUtilization: number | null;
+  readonly maxUtilization: number | null;
 }
 
 // ── Logging ───────────────────────────────────────────────────────
