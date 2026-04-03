@@ -473,6 +473,8 @@ export class KeyManager {
       const health = this.getCapacityHealth(key);
       if (health === "healthy") healthyKeys++;
       else if (health === "warning") warningKeys++;
+      // Reserved for future operational states. Successful-response quota headers
+      // are analytics-only in this file and intentionally collapse to "warning".
       else if (health === "rejected") rejectedKeys++;
       else if (health === "cooling_down") coolingDownKeys++;
       else unknownKeys++;
@@ -640,6 +642,8 @@ export class KeyManager {
       signalCoverageMap.set(signalName, existing);
     }
 
+    // Capacity observations are merged as passive telemetry. They do not change
+    // routing; 429 handling still owns cooldowns through availableAt.
     const windowMap = new Map(next.windows.map((window) => [window.windowName, { ...window }]));
     for (const window of observation.windows ?? []) {
       const existing = windowMap.get(window.windowName) ?? {
@@ -1442,15 +1446,25 @@ function stateToCapacity(
 function deriveCapacityHealth(entry: ApiKeyEntry): CapacityHealth {
   if (entry.availableAt > now()) return "cooling_down";
   const windows = activeCapacityWindows(entry);
-  if (windows.some((window) => window.status === "rejected")) return "warning";
-  if (windows.some((window) => window.status === "allowed_warning")) return "warning";
-  if (windows.some((window) => window.status === "allowed")) return "healthy";
+  if (hasCapacityWarningTelemetry(windows)) return "warning";
+  if (hasCapacityHealthyTelemetry(windows)) return "healthy";
   return "unknown";
 }
 
 function activeCapacityWindows(entry: ApiKeyEntry): CapacityWindowSnapshot[] {
   const nowMs = now();
   return entry.capacity.windows.filter((window) => window.resetAt === null || window.resetAt > nowMs);
+}
+
+function hasCapacityWarningTelemetry(windows: CapacityWindowSnapshot[]): boolean {
+  // Claude Code treats observed unified quota statuses as informational context on
+  // otherwise successful responses. Preserve "rejected" telemetry as a warning
+  // signal here instead of elevating it to an operationally blocked state.
+  return windows.some((window) => window.status === "rejected" || window.status === "allowed_warning");
+}
+
+function hasCapacityHealthyTelemetry(windows: CapacityWindowSnapshot[]): boolean {
+  return windows.some((window) => window.status === "allowed");
 }
 
 function boolToInt(value: boolean | null): number | null {

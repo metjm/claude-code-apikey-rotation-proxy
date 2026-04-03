@@ -1115,7 +1115,7 @@ describe("Capacity telemetry", () => {
     expect(key.capacity.windows[0]!.status).toBe("rejected");
   });
 
-  test("getCapacitySummary aggregates health and windows", () => {
+  test("getCapacitySummary keeps successful-response rejection telemetry in warning-only health", () => {
     const km = create();
     const healthy = km.addKey(VALID_KEY_1, "healthy");
     const warning = km.addKey(VALID_KEY_2, "warning");
@@ -1136,16 +1136,21 @@ describe("Capacity telemetry", () => {
     });
     km.recordCapacityObservation(observedRejected, {
       seenAt: unixMs(1_200),
-      httpStatus: 429,
+      httpStatus: 200,
       organizationId: "org-b",
       overageStatus: "rejected",
       windows: [{ windowName: "unified-5h", status: "rejected", utilization: 1, resetAt: unixMs(Date.now() + 60_000) }],
     });
 
     const summary = km.getCapacitySummary();
+    const observed = km.listKeys().find((key) => key.label === "observed-rejected");
+    expect(observed).toBeDefined();
+    expect(observed!.isAvailable).toBe(true);
+    expect(observed!.capacityHealth).toBe("warning");
     expect(summary.healthyKeys).toBe(1);
     expect(summary.warningKeys).toBe(2);
     expect(summary.rejectedKeys).toBe(0);
+    expect(summary.coolingDownKeys).toBe(0);
     expect(summary.fallbackAvailableKeys).toBe(1);
     expect(summary.overageRejectedKeys).toBe(1);
     expect(summary.distinctOrganizations).toBe(2);

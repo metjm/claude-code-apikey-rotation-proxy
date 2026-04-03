@@ -1157,7 +1157,7 @@ describe("Full Proxy Flow", () => {
 // ── Capacity Telemetry End-to-End ────────────────────────────────
 
 describe("Capacity Telemetry End-to-End", () => {
-  test("normalized headers are reflected in /admin/stats and pool summary", async () => {
+  test("successful responses treat per-window rejected headers as analytics and keep the key routable", async () => {
     const dir = makeTempDir();
     const up = startMockUpstream(() =>
       new Response(
@@ -1171,11 +1171,13 @@ describe("Capacity Telemetry End-to-End", () => {
             "request-id": "req-cap-e2e-1",
             "anthropic-organization-id": "org-cap-e2e",
             "anthropic-ratelimit-unified-representative-claim": "seven_day",
-            "anthropic-ratelimit-unified-status": "allowed_warning",
+            "anthropic-ratelimit-unified-status": "allowed",
             "anthropic-ratelimit-unified-reset": futureEpochSeconds(45 * 60_000),
-            "anthropic-ratelimit-unified-7d-status": "allowed_warning",
+            "anthropic-ratelimit-unified-7d-status": "rejected",
             "anthropic-ratelimit-unified-7d-utilization": "0.93",
             "anthropic-ratelimit-unified-7d-reset": futureEpochSeconds(7 * 24 * 60 * 60_000),
+            "anthropic-ratelimit-unified-overage-status": "rejected",
+            "anthropic-ratelimit-unified-overage-disabled-reason": "out_of_credits",
             "anthropic-ratelimit-unified-fallback": "available",
             "anthropic-ratelimit-unified-fallback-percentage": "0.5",
             "x-should-retry": "false",
@@ -1204,6 +1206,14 @@ describe("Capacity Telemetry End-to-End", () => {
     const key = body.keys.find((k: { label: string }) => k.label === "cap-e2e-key");
 
     expect(key).toBeDefined();
+    const unified = key!.capacity.windows.find(
+      (w: { windowName: string }) => w.windowName === "unified",
+    );
+    const sevenDay = key!.capacity.windows.find(
+      (w: { windowName: string }) => w.windowName === "unified-7d",
+    );
+
+    expect(key.isAvailable).toBe(true);
     expect(key.capacity.organizationId).toBe("org-cap-e2e");
     expect(key.capacity.lastRequestId).toBe("req-cap-e2e-1");
     expect(key.capacity.representativeClaim).toBe("seven_day");
@@ -1212,13 +1222,22 @@ describe("Capacity Telemetry End-to-End", () => {
     expect(key.capacity.shouldRetry).toBe(false);
     expect(key.capacity.fallbackAvailable).toBe(true);
     expect(key.capacity.fallbackPercentage).toBe(0.5);
+    expect(key.capacity.overageStatus).toBe("rejected");
+    expect(key.capacity.overageDisabledReason).toBe("out_of_credits");
     expect(key.capacity.latencyMs).toBe(1876);
     expect(key.capacityHealth).toBe("warning");
     expect(key.capacity.signalCoverage.find((s: { signalName: string }) => s.signalName === "windows")).toBeDefined();
-    expect(key.capacity.windows.find((w: { windowName: string }) => w.windowName === "unified-7d")!.utilization).toBe(0.93);
+    expect(unified).toBeDefined();
+    expect(unified.status).toBe("allowed_warning");
+    expect(sevenDay).toBeDefined();
+    expect(sevenDay.status).toBe("allowed_warning");
+    expect(sevenDay.utilization).toBe(0.93);
 
+    expect(body.capacitySummary.healthyKeys).toBe(0);
     expect(body.capacitySummary.warningKeys).toBe(1);
+    expect(body.capacitySummary.rejectedKeys).toBe(0);
     expect(body.capacitySummary.fallbackAvailableKeys).toBe(1);
+    expect(body.capacitySummary.overageRejectedKeys).toBe(1);
     expect(body.capacitySummary.distinctOrganizations).toBe(1);
     expect(body.capacitySummary.windows.find((w: { windowName: string }) => w.windowName === "unified-7d")!.maxUtilization).toBe(0.93);
 
@@ -1275,7 +1294,7 @@ describe("Capacity Telemetry End-to-End", () => {
     cleanupTempDir(dir);
   });
 
-  test("/admin/capacity/timeseries rolls up observed windows", async () => {
+  test("/admin/capacity/timeseries rolls up utilization windows without trusting undocumented per-window statuses", async () => {
     const dir = makeTempDir();
     const up = startMockUpstream(() =>
       new Response(
@@ -1284,10 +1303,12 @@ describe("Capacity Telemetry End-to-End", () => {
           status: 200,
           headers: {
             "content-type": "application/json",
+            "anthropic-ratelimit-unified-status": "allowed_warning",
+            "anthropic-ratelimit-unified-reset": futureEpochSeconds(60 * 60_000),
             "anthropic-ratelimit-unified-5h-status": "allowed",
             "anthropic-ratelimit-unified-5h-utilization": "0.41",
             "anthropic-ratelimit-unified-5h-reset": futureEpochSeconds(5 * 60 * 60_000),
-            "anthropic-ratelimit-unified-7d-status": "allowed_warning",
+            "anthropic-ratelimit-unified-7d-status": "rejected",
             "anthropic-ratelimit-unified-7d-utilization": "0.88",
             "anthropic-ratelimit-unified-7d-reset": futureEpochSeconds(7 * 24 * 60 * 60_000),
           },
@@ -1317,12 +1338,21 @@ describe("Capacity Telemetry End-to-End", () => {
     expect(tsRes.status).toBe(200);
     const tsBody = await tsRes.json();
 
-    expect(tsBody.buckets.length).toBe(2);
+    expect(tsBody.buckets.length).toBe(3);
+    const unified = tsBody.buckets.find((b: { windowName: string }) => b.windowName === "unified");
     const fiveHour = tsBody.buckets.find((b: { windowName: string }) => b.windowName === "unified-5h");
     const sevenDay = tsBody.buckets.find((b: { windowName: string }) => b.windowName === "unified-7d");
+    expect(unified).toBeDefined();
+    expect(fiveHour).toBeDefined();
+    expect(sevenDay).toBeDefined();
+    expect(unified.warning).toBe(1);
     expect(fiveHour.allowed).toBe(1);
+    expect(fiveHour.warning).toBe(0);
+    expect(fiveHour.rejected).toBe(0);
     expect(fiveHour.maxUtilization).toBe(0.41);
+    expect(sevenDay.allowed).toBe(0);
     expect(sevenDay.warning).toBe(1);
+    expect(sevenDay.rejected).toBe(0);
     expect(sevenDay.maxUtilization).toBe(0.88);
 
     reloaded.stop();
@@ -1330,7 +1360,7 @@ describe("Capacity Telemetry End-to-End", () => {
     cleanupTempDir(dir);
   });
 
-  test("initial SSE snapshot includes capacitySummary and per-key capacity state", async () => {
+  test("initial SSE snapshot exposes routing state separately from analytics-only overage rejection", async () => {
     const dir = makeTempDir();
     const up = startMockUpstream(() =>
       new Response(
@@ -1340,9 +1370,12 @@ describe("Capacity Telemetry End-to-End", () => {
           headers: {
             "content-type": "application/json",
             "anthropic-organization-id": "org-sse-cap",
-            "anthropic-ratelimit-unified-status": "allowed_warning",
-            "anthropic-ratelimit-unified-utilization": "0.77",
+            "anthropic-ratelimit-unified-status": "allowed",
             "anthropic-ratelimit-unified-reset": futureEpochSeconds(30 * 60_000),
+            "anthropic-ratelimit-unified-overage-status": "rejected",
+            "anthropic-ratelimit-unified-overage-disabled-reason": "org_level_disabled",
+            "anthropic-ratelimit-unified-7d-utilization": "0.77",
+            "anthropic-ratelimit-unified-7d-reset": futureEpochSeconds(7 * 24 * 60 * 60_000),
           },
         },
       ),
@@ -1387,9 +1420,17 @@ describe("Capacity Telemetry End-to-End", () => {
     const key = event.keys.find((k: { label: string }) => k.label === "cap-sse-key");
 
     expect(event.type).toBe("keys");
+    expect(key).toBeDefined();
+    expect(event.capacitySummary.healthyKeys).toBe(0);
     expect(event.capacitySummary.warningKeys).toBe(1);
-    expect(event.capacitySummary.windows[0].windowName).toBe("unified");
+    expect(event.capacitySummary.rejectedKeys).toBe(0);
+    expect(event.capacitySummary.overageRejectedKeys).toBe(1);
+    expect(event.capacitySummary.windows.find((w: { windowName: string }) => w.windowName === "unified")).toBeDefined();
     expect(key.capacity.organizationId).toBe("org-sse-cap");
+    expect(key.isAvailable).toBe(true);
+    expect(key.capacityHealth).toBe("warning");
+    expect(key.capacity.overageStatus).toBe("rejected");
+    expect(key.capacity.overageDisabledReason).toBe("org_level_disabled");
     expect(key.capacity.responseCount).toBe(1);
     expect(key.capacity.normalizedHeaderCount).toBe(1);
 
@@ -1501,6 +1542,8 @@ describe("Rate Limit Rotation End-to-End", () => {
     expect(limitedKey.capacity.windows.find((w: { windowName: string }) => w.windowName === "unified")!.status).toBe("rejected");
     expect(limitedKey.capacity.windows.find((w: { windowName: string }) => w.windowName === "unified-overage")).toBeUndefined();
     expect(limitedKey.capacityHealth).toBe("cooling_down");
+    expect(body.capacitySummary.coolingDownKeys).toBeGreaterThanOrEqual(1);
+    expect(body.capacitySummary.rejectedKeys).toBe(0);
 
     expect(goodKey).toBeDefined();
     expect(goodKey.stats.successfulRequests).toBeGreaterThanOrEqual(1);

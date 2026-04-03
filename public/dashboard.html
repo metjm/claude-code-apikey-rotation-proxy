@@ -113,8 +113,31 @@
     color: var(--text-dim); font-size: 11px; line-height: 1.6;
   }
   .card-capacity-head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
+  .capacity-summary { margin-bottom: 8px; }
+  .capacity-summary-title { color: var(--text-bright); font-size: 12px; font-weight: 600; line-height: 1.45; }
+  .capacity-summary-sub { color: var(--text-dim); font-size: 10px; margin-top: 3px; line-height: 1.5; }
   .capacity-kv { display: flex; gap: 6px; flex-wrap: wrap; }
   .capacity-kv span { white-space: nowrap; }
+  .capacity-grid {
+    display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 4px 10px; margin-top: 4px;
+  }
+  .capacity-grid span { white-space: normal; min-width: 0; }
+  .capacity-section { margin-top: 8px; }
+  .capacity-section-label {
+    color: var(--text-dim); font-size: 10px; text-transform: uppercase;
+    letter-spacing: 0.5px; margin-bottom: 4px;
+  }
+  .capacity-window-list { display: flex; flex-direction: column; gap: 4px; }
+  .capacity-window-row {
+    display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: center;
+    background: var(--bg3); border: 1px solid var(--border); border-radius: 5px; padding: 4px 7px;
+  }
+  .capacity-window-row.tone-ok { border-color: rgba(63,185,80,0.35); }
+  .capacity-window-row.tone-warning { border-color: rgba(210,153,34,0.45); }
+  .capacity-window-row.tone-unknown { border-color: rgba(139,148,158,0.35); }
+  .capacity-window-name { color: var(--text-bright); font-weight: 600; }
+  .capacity-window-detail { color: var(--text-dim); font-size: 10px; }
   .window-pill-list { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
   .window-pill {
     display: inline-flex; gap: 5px; align-items: center; background: var(--bg3);
@@ -537,13 +560,18 @@ function keyColor(label) {
 function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML.replace(/'/g, '&#39;'); }
 function humanizeWindowName(name) {
   if (!name) return '--';
-  if (name === 'unified') return 'Representative';
-  return name.replace(/^unified-/, 'Unified ').replace(/_/g, ' ').toUpperCase();
+  if (name === 'unified') return 'Primary limit signal';
+  if (name === 'unified-5h') return 'Short window (5h)';
+  if (name === 'unified-7d') return 'Weekly window (7d)';
+  if (name === 'unified-overage') return 'Extra usage';
+  return name.replace(/^unified-/, '').replace(/_/g, ' ').replace(/\b\w/g, ch => ch.toUpperCase());
 }
 function humanizeClaim(claim) {
   if (!claim) return '--';
-  if (claim === 'five_hour') return '5h';
-  if (claim === 'seven_day') return '7d';
+  if (claim === 'five_hour') return '5h window';
+  if (claim === 'seven_day') return '7d window';
+  if (claim === 'seven_day_sonnet') return '7d Sonnet window';
+  if (claim === 'seven_day_opus') return '7d Opus window';
   return claim.replace(/_/g, ' ');
 }
 function shortOrg(org) {
@@ -560,7 +588,7 @@ function humanizeSignalName(name) {
   const labels = {
     request_id: 'Request ID',
     organization: 'Organization',
-    representative_claim: 'Representative Claim',
+    representative_claim: 'Primary Limit Driver',
     retry_after: 'Retry-After',
     should_retry: 'Should Retry',
     fallback: 'Fallback',
@@ -573,7 +601,7 @@ function shortSignalName(name) {
   const labels = {
     request_id: 'req',
     organization: 'org',
-    representative_claim: 'claim',
+    representative_claim: 'driver',
     retry_after: 'retry',
     should_retry: 'retry?',
     fallback: 'fallback',
@@ -589,14 +617,6 @@ function activeCapacityWindows(key) {
   const nowMs = Date.now();
   return (key.capacity?.windows || []).filter(window => window.resetAt === null || window.resetAt === undefined || window.resetAt > nowMs);
 }
-function observedCapacityState(key) {
-  const windows = activeCapacityWindows(key);
-  if ((key.capacity?.overageStatus || '') === 'rejected') return 'rejected';
-  if (windows.some(window => window.status === 'rejected')) return 'rejected';
-  if (windows.some(window => window.status === 'allowed_warning')) return 'warning';
-  if (windows.some(window => window.status === 'allowed')) return 'healthy';
-  return 'unknown';
-}
 function routingBadge(key) {
   if (!key.isAvailable) {
     const rem = key.availableAt - Date.now();
@@ -604,12 +624,166 @@ function routingBadge(key) {
   }
   return '<span class="badge badge-ok">Available</span>';
 }
-function observedHealthBadge(key) {
-  const health = observedCapacityState(key);
-  if (health === 'healthy') return '<span class="badge badge-ok">Observed Healthy</span>';
-  if (health === 'warning') return '<span class="badge badge-warning">Observed Warning</span>';
-  if (health === 'rejected') return '<span class="badge badge-rejected">Observed Rejected</span>';
-  return '<span class="badge badge-unknown">No Signal</span>';
+function windowSortRank(windowName) {
+  if (windowName === 'unified') return 0;
+  if (windowName === 'unified-5h') return 1;
+  if (windowName === 'unified-7d') return 2;
+  if (windowName === 'unified-overage') return 3;
+  return 10;
+}
+function sortedCapacityWindows(key, options = {}) {
+  const includeOverage = options.includeOverage === true;
+  return activeCapacityWindows(key)
+    .filter(window => includeOverage || window.windowName !== 'unified-overage')
+    .sort((a, b) => {
+      const aRank = windowSortRank(a.windowName);
+      const bRank = windowSortRank(b.windowName);
+      if (aRank !== bRank) return aRank - bRank;
+      return String(a.windowName).localeCompare(String(b.windowName));
+    });
+}
+function readableWindowStatus(window) {
+  if (!window) return 'unknown';
+  if (window.windowName === 'unified-overage' && window.status === 'rejected') return 'extra usage unavailable';
+  if (window.surpassedThreshold) return 'past warning threshold';
+  if (window.status === 'allowed_warning') return 'close to limit';
+  if (window.status === 'allowed') return 'looks OK';
+  if (window.status === 'rejected') return 'header said limit reached';
+  return window.status || 'status unknown';
+}
+function windowTone(window) {
+  if (!window) return 'unknown';
+  if (window.surpassedThreshold || window.status === 'allowed_warning') return 'warning';
+  if (window.status === 'allowed') return 'ok';
+  return 'unknown';
+}
+function summarizeWindow(window) {
+  if (!window) return 'No active rate-limit windows were observed in recent telemetry.';
+  const bits = [];
+  if (window.utilization !== null && window.utilization !== undefined) bits.push(`${fmtPct(window.utilization)} used`);
+  bits.push(readableWindowStatus(window));
+  if (window.resetAt) bits.push(`resets in ${fmtCountdown(window.resetAt - Date.now())}`);
+  return `${humanizeWindowName(window.windowName)}: ${bits.join(', ')}`;
+}
+function telemetryCoverageSummary(key) {
+  const responseCount = key.capacity?.responseCount || 0;
+  const normalizedCount = key.capacity?.normalizedHeaderCount || 0;
+  if (responseCount === 0) return 'No upstream responses observed for this key yet.';
+  if (normalizedCount === 0) {
+    return `Observed ${fmtNum(responseCount)} responses, but none included the normalized limit headers this dashboard understands yet.`;
+  }
+  const coreSignals = ['organization', 'representative_claim', 'windows', 'fallback', 'overage'];
+  const missing = [];
+  const intermittent = [];
+  for (const signalName of coreSignals) {
+    const seen = signalCoverage(key, signalName)?.seenCount || 0;
+    if (seen === 0) missing.push(humanizeSignalName(signalName));
+    else if (seen < responseCount) intermittent.push(humanizeSignalName(signalName));
+  }
+  if (missing.length === 0 && intermittent.length === 0) {
+    return 'Telemetry quality is strong: core limit signals were present on every observed response.';
+  }
+  const notes = [];
+  if (missing.length > 0) notes.push(`never saw ${missing.join(', ')}`);
+  if (intermittent.length > 0) notes.push(`${intermittent.join(', ')} were intermittent`);
+  return `Telemetry is partial: ${notes.join('; ')}.`;
+}
+function describeFallback(key) {
+  if (key.capacity?.fallbackAvailable === true) {
+    return `Available${key.capacity.fallbackPercentage !== null && key.capacity.fallbackPercentage !== undefined ? ` @ ${fmtPct(key.capacity.fallbackPercentage)}` : ''}`;
+  }
+  if (key.capacity?.fallbackAvailable === false) return 'Unavailable';
+  return 'Unknown';
+}
+function describeOverage(key) {
+  if (!key.capacity?.overageStatus) return 'No signal';
+  if (key.capacity.overageStatus === 'allowed') return 'Available';
+  if (key.capacity.overageStatus === 'allowed_warning') return 'Available, but nearing cap';
+  if (key.capacity.overageStatus === 'rejected') {
+    return `Blocked${key.capacity.overageDisabledReason ? ` (${key.capacity.overageDisabledReason})` : ''}`;
+  }
+  return key.capacity.overageStatus;
+}
+function overageNote(key) {
+  if (key.capacity?.overageStatus !== 'rejected') return '';
+  const reason = key.capacity?.overageDisabledReason || 'provider policy';
+  return `Extra usage is blocked (${reason}). That does not remove the key from rotation by itself.`;
+}
+function retryBadge(key) {
+  if (key.capacity?.shouldRetry === true) return '<span class="badge badge-ok">auto-retry OK</span>';
+  if (key.capacity?.shouldRetry === false) return '<span class="badge badge-warning">avoid auto-retry</span>';
+  return '';
+}
+function capacityHeadline(key) {
+  const responseCount = key.capacity?.responseCount || 0;
+  const normalizedCount = key.capacity?.normalizedHeaderCount || 0;
+  const windows = sortedCapacityWindows(key);
+  const conflictingWindow = windows.find(window => window.status === 'rejected');
+  const warningWindow = windows.find(window => window.surpassedThreshold || window.status === 'allowed_warning');
+  const healthyWindow = windows.find(window => window.status === 'allowed') || windows[0] || null;
+  if (!key.isAvailable) {
+    const rem = key.availableAt - Date.now();
+    return {
+      badgeClass: 'badge-ratelimited',
+      badgeLabel: 'Paused after rate-limit',
+      title: 'Routing is paused because the proxy recently received a real rate-limit response.',
+      subtitle: rem > 0 ? `The proxy will try this key again in ${fmtCountdown(rem)}.` : 'The cooldown window has nearly expired.',
+    };
+  }
+  if (responseCount === 0) {
+    return {
+      badgeClass: 'badge-unknown',
+      badgeLabel: 'No telemetry yet',
+      title: 'This key is in rotation, but the dashboard has not seen an upstream response for it yet.',
+      subtitle: 'Capacity details will fill in after the first observed upstream response.',
+    };
+  }
+  if (normalizedCount === 0) {
+    return {
+      badgeClass: 'badge-unknown',
+      badgeLabel: 'No parsed limit signals',
+      title: 'Responses were observed, but none carried the normalized limit headers this dashboard understands.',
+      subtitle: `Seen ${fmtNum(responseCount)} responses so far. Keep using the key, but treat quota telemetry as unavailable.`,
+    };
+  }
+  if (key.capacity?.retryAfterSecs && key.capacity.retryAfterSecs > 0) {
+    return {
+      badgeClass: 'badge-ratelimited',
+      badgeLabel: 'Retry later',
+      title: 'Upstream asked clients to wait before retrying recent requests.',
+      subtitle: `Current retry guidance is ${fmtCountdown(key.capacity.retryAfterSecs * 1000)}.`,
+    };
+  }
+  if (conflictingWindow) {
+    return {
+      badgeClass: 'badge-warning',
+      badgeLabel: 'Conflicting limit signal',
+      title: 'The key is still serving traffic, but one quota header looks contradictory.',
+      subtitle: `${humanizeWindowName(conflictingWindow.windowName)} reported "${conflictingWindow.status}" on a successful response. Treat it as telemetry, not a hard block.`,
+    };
+  }
+  if (warningWindow) {
+    return {
+      badgeClass: 'badge-warning',
+      badgeLabel: 'Approaching a limit',
+      title: 'Recent telemetry says this key is getting close to a quota boundary, but it is still serving traffic.',
+      subtitle: summarizeWindow(warningWindow),
+    };
+  }
+  if (healthyWindow) {
+    return {
+      badgeClass: 'badge-ok',
+      badgeLabel: 'Capacity looks normal',
+      title: 'Recent telemetry suggests this key still has usable headroom.',
+      subtitle: summarizeWindow(healthyWindow),
+    };
+  }
+  return {
+    badgeClass: 'badge-blue',
+    badgeLabel: 'Telemetry present',
+    title: 'Recent limit telemetry was observed, but nothing clearly actionable stands out.',
+    subtitle: 'Use the detailed rows below for the raw window data.',
+  };
 }
 function renderCapacitySummary() {
   const grid = document.getElementById('capacity-summary-grid');
@@ -634,13 +808,13 @@ function renderCapacitySummary() {
   }
 
   const cards = [
-    { label: 'Observed Healthy', value: capacitySummary.healthyKeys, sub: `${capacitySummary.warningKeys} observed warning / ${capacitySummary.rejectedKeys} observed rejected` },
-    { label: 'Cooling', value: capacitySummary.coolingDownKeys, sub: `${capacitySummary.unknownKeys} no signal` },
+    { label: 'Telemetry Looks OK', value: capacitySummary.healthyKeys, sub: `${capacitySummary.warningKeys} keys need attention / ${capacitySummary.unknownKeys} no signal yet` },
+    { label: 'Cooling', value: capacitySummary.coolingDownKeys, sub: 'paused after real rate-limit responses' },
     { label: 'Organizations', value: capacitySummary.distinctOrganizations, sub: 'distinct org IDs seen' },
     { label: 'Responses', value: fmtNum(totalResponses), sub: 'upstream responses observed' },
     { label: 'Signals', value: normalizedPct, sub: `${fmtNum(normalizedResponses)} / ${fmtNum(totalResponses)} responses carried normalized signals` },
-    { label: 'Fallback', value: capacitySummary.fallbackAvailableKeys, sub: 'keys with fallback available' },
-    { label: 'Overage', value: capacitySummary.overageRejectedKeys, sub: 'analytics only; not routing state' },
+    { label: 'Fallback Path', value: capacitySummary.fallbackAvailableKeys, sub: 'keys with fallback available' },
+    { label: 'Extra Usage Blocked', value: capacitySummary.overageRejectedKeys, sub: 'analytics only; not a routing block by itself' },
   ];
   grid.innerHTML = cards.map(card =>
     `<div class="summary-card"><div class="summary-card-label">${esc(card.label)}</div><div class="summary-card-value">${esc(String(card.value))}</div><div class="summary-card-sub">${esc(card.sub)}</div></div>`
@@ -660,9 +834,9 @@ function renderCapacitySummary() {
       <div class="window-card-stats">
         <span><b>${fmtPct(window.maxUtilization)}</b> max util</span>
         <span><b>${fmtPct(window.medianUtilization)}</b> median util</span>
-        <span><b>${fmtNum(window.allowedKeys)}</b> allowed</span>
-        <span><b>${fmtNum(window.warningKeys)}</b> warning</span>
-        <span><b>${fmtNum(window.rejectedKeys)}</b> rejected</span>
+        <span><b>${fmtNum(window.allowedKeys)}</b> OK</span>
+        <span><b>${fmtNum(window.warningKeys)}</b> close</span>
+        <span><b>${fmtNum(window.rejectedKeys)}</b> header said reached</span>
         <span><b>${fmtNum(window.knownKeys)}</b> keys reporting</span>
       </div>
     </div>
@@ -693,32 +867,28 @@ function renderKeys() {
     const cc = keyColor(k.label);
     const pri = k.priority || 2;
     const badge = routingBadge(k);
-    const observedBadge = observedHealthBadge(k);
-    const windows = activeCapacityWindows(k);
+    const telemetry = capacityHeadline(k);
+    const windows = sortedCapacityWindows(k);
     const windowsHtml = windows.slice(0, 4).map(window => {
-      const status = window.status || 'unknown';
-      const reset = window.resetAt ? `, reset ${fmtCountdown(window.resetAt - Date.now())}` : '';
-      return `<span class="window-pill"><strong>${esc(humanizeWindowName(window.windowName))}</strong><span>${fmtPct(window.utilization)}</span><span>${esc(status)}${reset}</span></span>`;
+      const usage = window.utilization !== null && window.utilization !== undefined ? `${fmtPct(window.utilization)} used` : 'usage --';
+      const reset = window.resetAt ? `resets in ${fmtCountdown(window.resetAt - Date.now())}` : 'reset unknown';
+      return `<div class="capacity-window-row tone-${esc(windowTone(window))}">
+        <span class="capacity-window-name">${esc(humanizeWindowName(window.windowName))}</span>
+        <span class="capacity-window-detail">${esc(usage)}</span>
+        <span class="capacity-window-detail">${esc(readableWindowStatus(window))}</span>
+        <span class="capacity-window-detail">${esc(reset)}</span>
+      </div>`;
     }).join('');
-    const claim = k.capacity?.representativeClaim ? humanizeClaim(k.capacity.representativeClaim) : '--';
-    const fallback = k.capacity?.fallbackAvailable === true
-      ? `available${k.capacity.fallbackPercentage !== null && k.capacity.fallbackPercentage !== undefined ? ` @ ${fmtPct(k.capacity.fallbackPercentage)}` : ''}`
-      : k.capacity?.fallbackAvailable === false ? 'unavailable' : 'unknown';
-    const overage = k.capacity?.overageStatus
-      ? `${k.capacity.overageStatus}${k.capacity.overageDisabledReason ? ` (${k.capacity.overageDisabledReason})` : ''}`
-      : 'n/a';
+    const claim = k.capacity?.representativeClaim ? humanizeClaim(k.capacity.representativeClaim) : 'Unknown';
+    const fallback = describeFallback(k);
+    const overage = describeOverage(k);
     const latency = k.capacity?.latencyMs !== null && k.capacity?.latencyMs !== undefined ? `${fmtNum(k.capacity.latencyMs)} ms` : '--';
     const responseCount = k.capacity?.responseCount || 0;
     const normalizedCount = k.capacity?.normalizedHeaderCount || 0;
     const responseAge = k.capacity?.lastResponseAt ? fmtRelative(new Date(k.capacity.lastResponseAt).toISOString()) : '--';
     const signalAge = k.capacity?.lastHeaderAt ? fmtRelative(new Date(k.capacity.lastHeaderAt).toISOString()) : '--';
-    const coverageSummary = responseCount === 0
-      ? 'No upstream responses observed for this key yet.'
-      : normalizedCount === 0
-        ? `No normalized signals seen across ${fmtNum(responseCount)} responses yet.`
-        : ['organization', 'representative_claim', 'windows', 'fallback', 'overage']
-            .map(signalName => `${shortSignalName(signalName)} ${fmtPct((signalCoverage(k, signalName)?.seenCount || 0) / responseCount)}`)
-            .join(' · ');
+    const coverageSummary = telemetryCoverageSummary(k);
+    const extraUsageNote = overageNote(k);
 
     let card = el.querySelector(`.card[data-key="${CSS.escape(k.maskedKey)}"]`);
     if (!card) {
@@ -767,27 +937,32 @@ function renderKeys() {
     card.querySelector('.card-stats').innerHTML = statsHtml;
     card.querySelector('.card-capacity').innerHTML = `
       <div class="card-capacity-head">
-        ${observedBadge}
-        <span class="badge badge-blue">${esc(claim)}</span>
-        ${k.capacity?.shouldRetry === true ? '<span class="badge badge-ok">retryable</span>' : ''}
-        ${k.capacity?.shouldRetry === false ? '<span class="badge badge-rejected">no retry</span>' : ''}
+        <span class="badge ${esc(telemetry.badgeClass)}">${esc(telemetry.badgeLabel)}</span>
+        ${retryBadge(k)}
       </div>
-      <div class="capacity-kv">
-        <span><b>Org</b> ${esc(shortOrg(k.capacity?.organizationId))}</span>
-        <span><b>Fallback</b> ${esc(fallback)}</span>
-        <span><b>Overage</b> ${esc(overage)}</span>
+      <div class="capacity-summary">
+        <div class="capacity-summary-title">${esc(telemetry.title)}</div>
+        <div class="capacity-summary-sub">${esc(telemetry.subtitle)}</div>
       </div>
-      <div class="capacity-kv">
-        <span><b>Responses</b> ${fmtNum(responseCount)}</span>
-        <span><b>Signals</b> ${fmtNum(normalizedCount)}${responseCount > 0 ? ` (${fmtPct(normalizedCount / responseCount)})` : ''}</span>
-        <span><b>Last Resp</b> ${esc(responseAge)}</span>
-      </div>
-      <div class="capacity-kv">
+      <div class="capacity-grid">
+        <span><b>Primary driver</b> ${esc(claim)}</span>
+        <span><b>Organization</b> ${esc(shortOrg(k.capacity?.organizationId))}</span>
+        <span><b>Fallback path</b> ${esc(fallback)}</span>
+        <span><b>Extra usage</b> ${esc(overage)}</span>
+        <span><b>Responses seen</b> ${fmtNum(responseCount)}</span>
+        <span><b>Signals parsed</b> ${fmtNum(normalizedCount)}${responseCount > 0 ? ` (${fmtPct(normalizedCount / responseCount)})` : ''}</span>
+        <span><b>Last response</b> ${esc(responseAge)}</span>
         <span><b>Latency</b> ${esc(latency)}</span>
-        <span><b>Last Sig</b> ${esc(signalAge)}</span>
-        <span><b>Request</b> ${esc(k.capacity?.lastRequestId ? shortId(k.capacity.lastRequestId) : '--')}</span>
+        <span><b>Last telemetry</b> ${esc(signalAge)}</span>
+        <span><b>Request ID</b> ${esc(k.capacity?.lastRequestId ? shortId(k.capacity.lastRequestId) : '--')}</span>
       </div>
-      ${windowsHtml ? `<div class="window-pill-list">${windowsHtml}</div>` : '<div class="card-note">No active rate-limit windows observed for this key yet.</div>'}
+      ${windowsHtml ? `
+        <div class="capacity-section">
+          <div class="capacity-section-label">Recent limit windows</div>
+          <div class="capacity-window-list">${windowsHtml}</div>
+        </div>
+      ` : '<div class="card-note">No active rate-limit windows were observed for this key yet.</div>'}
+      ${extraUsageNote ? `<div class="card-note">${esc(extraUsageNote)}</div>` : ''}
       <div class="card-note">${esc(coverageSummary)}</div>
     `;
 
@@ -1287,17 +1462,17 @@ async function loadCharts() {
       labels: bucketKeys.map(bucket => labelByBucket.get(bucket)),
       datasets: statusWindow ? [
         {
-          label: `${humanizeWindowName(statusWindow)} allowed`,
+          label: `${humanizeWindowName(statusWindow)} OK`,
           data: bucketKeys.map(bucket => capacityRows.find(entry => entry.bucket === bucket && entry.windowName === statusWindow)?.allowed ?? 0),
           backgroundColor: '#3fb950',
         },
         {
-          label: `${humanizeWindowName(statusWindow)} warning`,
+          label: `${humanizeWindowName(statusWindow)} close`,
           data: bucketKeys.map(bucket => capacityRows.find(entry => entry.bucket === bucket && entry.windowName === statusWindow)?.warning ?? 0),
           backgroundColor: '#d29922',
         },
         {
-          label: `${humanizeWindowName(statusWindow)} rejected`,
+          label: `${humanizeWindowName(statusWindow)} header said reached`,
           data: bucketKeys.map(bucket => capacityRows.find(entry => entry.bucket === bucket && entry.windowName === statusWindow)?.rejected ?? 0),
           backgroundColor: '#f85149',
         },
@@ -1422,7 +1597,7 @@ function renderNormalizedSignals() {
   }
 
   let html = `<div class="summary-card" style="margin-bottom:10px">
-    <div class="summary-card-label">Representative Claims</div>
+    <div class="summary-card-label">Primary Limit Drivers</div>
     <div class="summary-card-sub">${esc(claimSummary)}</div>
   </div>`;
 
@@ -1439,7 +1614,7 @@ function renderNormalizedSignals() {
   html += '</tbody></table>';
 
   if (capacitySummary.windows && capacitySummary.windows.length > 0) {
-    html += '<table class="schema-table"><thead><tr><th>Window</th><th>Keys</th><th>Allowed</th><th>Warning</th><th>Rejected</th><th>Median</th><th>Max</th><th>Next Reset</th></tr></thead><tbody>';
+    html += '<table class="schema-table"><thead><tr><th>Window</th><th>Keys</th><th>OK</th><th>Close</th><th>Header Said Reached</th><th>Median</th><th>Max</th><th>Next Reset</th></tr></thead><tbody>';
     for (const window of capacitySummary.windows) {
       html += `<tr><td class="path-col">${esc(humanizeWindowName(window.windowName))}</td><td>${fmtNum(window.knownKeys)}</td><td>${fmtNum(window.allowedKeys)}</td><td>${fmtNum(window.warningKeys)}</td><td>${fmtNum(window.rejectedKeys)}</td><td>${fmtPct(window.medianUtilization)}</td><td>${fmtPct(window.maxUtilization)}</td><td>${window.nextResetAt ? fmtCountdown(window.nextResetAt - Date.now()) : '--'}</td></tr>`;
     }

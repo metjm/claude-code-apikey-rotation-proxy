@@ -152,7 +152,7 @@ export async function proxyRequest(
     }
 
     if (upstream.status === RATE_LIMIT_STATUS) {
-      const retryAfter = parseRetryAfter(upstream.headers.get("retry-after"));
+      const retryAfter = parseRetryAfter(upstream.headers);
       keyManager.recordRateLimit(entry, retryAfter);
       await upstream.text();
 
@@ -270,10 +270,158 @@ function buildUpstreamHeaders(incoming: Headers, apiKey: string): Headers {
   return headers;
 }
 
-function parseRetryAfter(header: string | null): number {
-  if (header === null) return 60;
-  const secs = parseFloat(header);
-  return Number.isFinite(secs) && secs > 0 ? secs : 60;
+type QuotaStatus = "allowed" | "allowed_warning" | "rejected";
+
+type EarlyWarningThreshold = {
+  readonly utilization: number;
+  readonly timePct: number;
+};
+
+type EarlyWarningWindowConfig = {
+  readonly windowName: string;
+  readonly claimAbbrev: string;
+  readonly windowDurationMs: number;
+  readonly thresholds: readonly EarlyWarningThreshold[];
+};
+
+type CapacityWindowDraft = {
+  readonly windowName: string;
+  status?: QuotaStatus | null;
+  utilization?: number | null;
+  resetAt?: ReturnType<typeof unixMs> | null;
+  surpassedThreshold?: number | null;
+};
+
+const EARLY_WARNING_WINDOWS: readonly EarlyWarningWindowConfig[] = [
+  {
+    windowName: "unified-5h",
+    claimAbbrev: "5h",
+    windowDurationMs: 5 * 60 * 60 * 1000,
+    thresholds: [{ utilization: 0.9, timePct: 0.72 }],
+  },
+  {
+    windowName: "unified-7d",
+    claimAbbrev: "7d",
+    windowDurationMs: 7 * 24 * 60 * 60 * 1000,
+    thresholds: [
+      { utilization: 0.75, timePct: 0.6 },
+      { utilization: 0.5, timePct: 0.35 },
+      { utilization: 0.25, timePct: 0.15 },
+    ],
+  },
+] as const;
+
+function parseRetryAfter(headers: Headers): number {
+  const retryAfterMs = parseFinite(headers.get("retry-after-ms"));
+  if (retryAfterMs !== null && retryAfterMs > 0) {
+    return Math.max(1, Math.ceil(retryAfterMs / 1000));
+  }
+
+  const header = headers.get("retry-after");
+  if (header !== null) {
+    const secs = parseFinite(header);
+    if (secs !== null && secs > 0) {
+      return Math.max(1, Math.ceil(secs));
+    }
+
+    const dateMs = Date.parse(header);
+    if (Number.isFinite(dateMs)) {
+      return Math.max(1, Math.ceil((dateMs - Date.now()) / 1000));
+    }
+  }
+
+  return 60;
+}
+
+function normalizeQuotaStatus(value: string | null): QuotaStatus | null {
+  if (value === "allowed" || value === "allowed_warning" || value === "rejected") {
+    return value;
+  }
+  return null;
+}
+
+function computeTimeProgress(resetAt: ReturnType<typeof unixMs>, windowDurationMs: number): number {
+  const resetAtMs = Number(resetAt);
+  const windowStart = resetAtMs - windowDurationMs;
+  const elapsed = Date.now() - windowStart;
+  return Math.max(0, Math.min(1, elapsed / windowDurationMs));
+}
+
+function shouldWarnForWindow(
+  utilization: number | null | undefined,
+  resetAt: ReturnType<typeof unixMs> | null | undefined,
+  config: EarlyWarningWindowConfig,
+): boolean {
+  if (utilization === null || utilization === undefined || resetAt === null || resetAt === undefined) {
+    return false;
+  }
+
+  const timeProgress = computeTimeProgress(resetAt, config.windowDurationMs);
+  return config.thresholds.some(
+    (threshold) => utilization >= threshold.utilization && timeProgress <= threshold.timePct,
+  );
+}
+
+function setWindowField<T extends keyof CapacityWindowDraft>(
+  draft: CapacityWindowDraft,
+  field: T,
+  value: CapacityWindowDraft[T] | null,
+): void {
+  if (value !== null) {
+    draft[field] = value;
+  }
+}
+
+function extractSupportedCapacityWindows(headers: Headers): CapacityWindowDraft[] {
+  const windows = new Map<string, CapacityWindowDraft>();
+  let earlyWarningObserved = false;
+
+  const unifiedStatusHeader = normalizeQuotaStatus(headers.get("anthropic-ratelimit-unified-status"));
+  const unifiedResetAt = parseEpochMs(headers.get("anthropic-ratelimit-unified-reset"));
+  const unifiedUtilization = parseFinite(headers.get("anthropic-ratelimit-unified-utilization"));
+  const unifiedSurpassedThreshold = parseFinite(headers.get("anthropic-ratelimit-unified-surpassed-threshold"));
+
+  for (const config of EARLY_WARNING_WINDOWS) {
+    const utilization = parseFinite(headers.get(`anthropic-ratelimit-unified-${config.claimAbbrev}-utilization`));
+    const resetAt = parseEpochMs(headers.get(`anthropic-ratelimit-unified-${config.claimAbbrev}-reset`));
+    const surpassedThreshold = parseFinite(headers.get(
+      `anthropic-ratelimit-unified-${config.claimAbbrev}-surpassed-threshold`,
+    ));
+
+    if (utilization === null && resetAt === null && surpassedThreshold === null) continue;
+
+    const status: QuotaStatus = surpassedThreshold !== null || shouldWarnForWindow(utilization, resetAt, config)
+      ? "allowed_warning"
+      : "allowed";
+    if (status === "allowed_warning") earlyWarningObserved = true;
+
+    const draft: CapacityWindowDraft = { windowName: config.windowName, status };
+    setWindowField(draft, "utilization", utilization);
+    setWindowField(draft, "resetAt", resetAt);
+    setWindowField(draft, "surpassedThreshold", surpassedThreshold);
+    windows.set(config.windowName, draft);
+  }
+
+  if (
+    unifiedStatusHeader !== null
+    || unifiedResetAt !== null
+    || unifiedUtilization !== null
+    || unifiedSurpassedThreshold !== null
+  ) {
+    let status = unifiedStatusHeader;
+    if (status === "allowed" || status === "allowed_warning") {
+      status = earlyWarningObserved || unifiedSurpassedThreshold !== null ? "allowed_warning" : "allowed";
+    }
+
+    const draft: CapacityWindowDraft = { windowName: "unified" };
+    setWindowField(draft, "status", status);
+    setWindowField(draft, "utilization", unifiedUtilization);
+    setWindowField(draft, "resetAt", unifiedResetAt);
+    setWindowField(draft, "surpassedThreshold", unifiedSurpassedThreshold);
+    windows.set("unified", draft);
+  }
+
+  return [...windows.values()];
 }
 
 function extractCapacityObservation(
@@ -293,14 +441,6 @@ function extractCapacityObservation(
   let overageDisabledReason: string | undefined;
   let latencyMs: number | undefined;
 
-  const windows = new Map<string, {
-    windowName: string;
-    status?: string | null;
-    utilization?: number | null;
-    resetAt?: ReturnType<typeof unixMs> | null;
-    surpassedThreshold?: number | null;
-  }>();
-
   const requestIdHeader = headers.get("request-id") ?? headers.get("x-request-id");
   if (requestIdHeader !== null) {
     requestId = requestIdHeader;
@@ -319,12 +459,11 @@ function extractCapacityObservation(
     observedSignals.add("representative_claim");
   }
 
-  const retryAfterHeader = headers.get("retry-after");
-  if (retryAfterHeader !== null) {
+  if (headers.has("retry-after") || headers.has("retry-after-ms")) {
     observedSignals.add("retry_after");
   }
-  if (retryAfterHeader !== null || status === RATE_LIMIT_STATUS) {
-    retryAfterSecs = parseRetryAfter(retryAfterHeader);
+  if (headers.has("retry-after") || headers.has("retry-after-ms") || status === RATE_LIMIT_STATUS) {
+    retryAfterSecs = parseRetryAfter(headers);
   }
 
   const shouldRetryHeader = headers.get("x-should-retry");
@@ -367,30 +506,8 @@ function extractCapacityObservation(
   if (headerLatency !== null) latencyMs = headerLatency;
   else latencyMs = Math.max(0, Date.now() - fetchStartedAt);
 
-  for (const [name, value] of headers.entries()) {
-    const match = /^anthropic-ratelimit-(.+)-(status|utilization|reset|surpassed-threshold)$/.exec(name);
-    if (!match) continue;
-
-    const [, rawWindowName, field] = match;
-    if (!rawWindowName) continue;
-    if (rawWindowName.endsWith("-overage")) continue;
-    observedSignals.add("windows");
-
-    const current = windows.get(rawWindowName) ?? { windowName: rawWindowName };
-    if (field === "status") {
-      current.status = value;
-    } else if (field === "utilization") {
-      const parsed = parseFinite(value);
-      if (parsed !== null) current.utilization = parsed;
-    } else if (field === "reset") {
-      const parsed = parseEpochMs(value);
-      if (parsed !== null) current.resetAt = parsed;
-    } else if (field === "surpassed-threshold") {
-      const parsed = parseFinite(value);
-      if (parsed !== null) current.surpassedThreshold = parsed;
-    }
-    windows.set(rawWindowName, current);
-  }
+  const windows = extractSupportedCapacityWindows(headers);
+  if (windows.length > 0) observedSignals.add("windows");
 
   return {
     seenAt: unixMs(Date.now()),
@@ -406,9 +523,9 @@ function extractCapacityObservation(
     ...(overageDisabledReason !== undefined ? { overageDisabledReason } : {}),
     ...(latencyMs !== undefined ? { latencyMs } : {}),
     ...(observedSignals.size > 0 ? { observedSignals: [...observedSignals].sort() } : {}),
-    ...(windows.size > 0
+    ...(windows.length > 0
       ? {
-          windows: [...windows.values()].map((window) => ({
+          windows: windows.map((window) => ({
             ...window,
             lastSeenAt: unixMs(Date.now()),
           })),

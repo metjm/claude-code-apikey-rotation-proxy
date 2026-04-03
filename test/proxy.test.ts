@@ -75,6 +75,10 @@ function makeRequest(
   return new Request(`${base}${path}`, opts);
 }
 
+function futureEpochSeconds(offsetSecs: number): string {
+  return String(Math.floor(Date.now() / 1000) + offsetSecs);
+}
+
 /**
  * Collect all emitted events during a callback.
  * Returns [result, collectedEvents].
@@ -501,6 +505,35 @@ describe("Rate Limit Handling (429)", () => {
     // availableAt should be roughly now + 120s
     const expectedMin = Date.now() + 119_000;
     const expectedMax = Date.now() + 121_000;
+    expect(keyA.availableAt).toBeGreaterThanOrEqual(expectedMin);
+    expect(keyA.availableAt).toBeLessThanOrEqual(expectedMax);
+  });
+
+  test("prefers retry-after-ms when present on 429 responses", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    km.addKey(FAKE_KEY_B, "key-b");
+
+    const mock = upstream((req) => {
+      const key = req.headers.get("x-api-key");
+      if (key === FAKE_KEY_A) {
+        return new Response("rate limited", {
+          status: 429,
+          headers: {
+            "retry-after": "120",
+            "retry-after-ms": "1500",
+          },
+        });
+      }
+      return new Response("ok");
+    });
+
+    const config = makeConfig(mock.url);
+    await proxyRequest(makeRequest("/v1/messages"), km, config, st);
+
+    const keyA = km.listKeys().find((k) => k.label === "key-a")!;
+    const expectedMin = Date.now() + 1_000;
+    const expectedMax = Date.now() + 3_000;
     expect(keyA.availableAt).toBeGreaterThanOrEqual(expectedMin);
     expect(keyA.availableAt).toBeLessThanOrEqual(expectedMax);
   });
@@ -1990,7 +2023,42 @@ describe("Schema Tracking Integration", () => {
 });
 
 describe("Capacity observation integration", () => {
-  test("normalizes capacity headers onto the key state", async () => {
+  test("successful-response capacity signals stay analytics-only and do not cool the key", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    const mock = upstream(() =>
+      new Response(JSON.stringify({ ok: true, usage: { input_tokens: 2, output_tokens: 1 } }), {
+        status: 200,
+        headers: {
+          "content-type": "application/json",
+          "request-id": "req_success_analytics_1",
+          "anthropic-ratelimit-unified-status": "rejected",
+          "anthropic-ratelimit-unified-reset": futureEpochSeconds(4 * 60 * 60),
+          "anthropic-ratelimit-unified-overage-status": "rejected",
+          "anthropic-ratelimit-unified-overage-disabled-reason": "out_of_credits",
+        },
+      }),
+    );
+
+    const config = makeConfig(mock.url);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config, st);
+    expect(result.kind).toBe("success");
+
+    const key = km.listKeys()[0]!;
+    expect(key.isAvailable).toBe(true);
+    expect(key.availableAt).toBeLessThanOrEqual(Date.now());
+    expect(key.capacityHealth).not.toBe("cooling_down");
+    expect(key.capacity.lastRequestId).toBe("req_success_analytics_1");
+    expect(key.capacity.overageStatus).toBe("rejected");
+    expect(key.capacity.overageDisabledReason).toBe("out_of_credits");
+    expect(key.capacity.retryAfterSecs).toBeNull();
+    expect(key.capacity.responseCount).toBe(1);
+    expect(key.capacity.normalizedHeaderCount).toBe(1);
+    expect(key.capacity.windows.find((w) => w.windowName === "unified")!.status).toBe("rejected");
+  });
+
+  test("normalizes supported Claude Code analytics headers and derives warning windows from threshold signals", async () => {
     const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
 
@@ -2002,13 +2070,14 @@ describe("Capacity observation integration", () => {
           "request-id": "req_capacity_1",
           "anthropic-organization-id": "org-abc",
           "anthropic-ratelimit-unified-representative-claim": "seven_day",
-          "anthropic-ratelimit-unified-status": "allowed_warning",
-          "anthropic-ratelimit-unified-reset": "1775224800",
-          "anthropic-ratelimit-unified-7d-status": "allowed_warning",
+          "anthropic-ratelimit-unified-status": "allowed",
+          "anthropic-ratelimit-unified-reset": futureEpochSeconds(4 * 60 * 60),
+          // Raw per-window status headers are not part of the supported Claude Code semantics.
+          "anthropic-ratelimit-unified-7d-status": "rejected",
           "anthropic-ratelimit-unified-7d-utilization": "0.92",
-          "anthropic-ratelimit-unified-7d-reset": "1775487600",
+          "anthropic-ratelimit-unified-7d-reset": futureEpochSeconds(3 * 24 * 60 * 60),
+          "anthropic-ratelimit-unified-7d-surpassed-threshold": "0.75",
           "anthropic-ratelimit-unified-fallback": "available",
-          "anthropic-ratelimit-unified-fallback-percentage": "0.5",
           "x-should-retry": "false",
           "x-envoy-upstream-service-time": "1234",
         },
@@ -2024,19 +2093,22 @@ describe("Capacity observation integration", () => {
     expect(key.capacity.lastRequestId).toBe("req_capacity_1");
     expect(key.capacity.representativeClaim).toBe("seven_day");
     expect(key.capacity.fallbackAvailable).toBe(true);
-    expect(key.capacity.fallbackPercentage).toBe(0.5);
     expect(key.capacity.shouldRetry).toBe(false);
     expect(key.capacity.latencyMs).toBe(1234);
     expect(key.capacity.responseCount).toBe(1);
     expect(key.capacity.normalizedHeaderCount).toBe(1);
     expect(key.capacity.signalCoverage.find((signal) => signal.signalName === "request_id")!.seenCount).toBe(1);
     expect(key.capacity.signalCoverage.find((signal) => signal.signalName === "windows")!.seenCount).toBe(1);
+    expect(key.isAvailable).toBe(true);
+    expect(key.capacity.windows.find((w) => w.windowName === "unified")!.status).toBe("allowed_warning");
     expect(key.capacity.windows.find((w) => w.windowName === "unified-7d")!.utilization).toBe(0.92);
+    expect(key.capacity.windows.find((w) => w.windowName === "unified-7d")!.surpassedThreshold).toBe(0.75);
+    expect(key.capacity.windows.find((w) => w.windowName === "unified-7d")!.status).toBe("allowed_warning");
     expect(key.capacity.windows.find((w) => w.windowName === "unified-overage")).toBeUndefined();
     expect(key.capacityHealth).toBe("warning");
   });
 
-  test("partial capacity headers merge with previous observations", async () => {
+  test("partial capacity headers merge while ignoring raw per-window status headers", async () => {
     const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
 
@@ -2049,9 +2121,9 @@ describe("Capacity observation integration", () => {
           headers: {
             "content-type": "application/json",
             "anthropic-organization-id": "org-first",
-            "anthropic-ratelimit-unified-7d-status": "allowed_warning",
-            "anthropic-ratelimit-unified-7d-utilization": "0.8",
-            "anthropic-ratelimit-unified-7d-reset": "1775487600",
+            "anthropic-ratelimit-unified-7d-status": "rejected",
+            "anthropic-ratelimit-unified-7d-utilization": "0.1",
+            "anthropic-ratelimit-unified-7d-reset": futureEpochSeconds(6 * 24 * 60 * 60),
           },
         });
       }
@@ -2060,9 +2132,11 @@ describe("Capacity observation integration", () => {
         headers: {
           "content-type": "application/json",
           "request-id": "req-second",
-          "anthropic-ratelimit-unified-5h-status": "allowed",
+          "anthropic-ratelimit-unified-status": "allowed",
+          "anthropic-ratelimit-unified-reset": futureEpochSeconds(60 * 60),
+          "anthropic-ratelimit-unified-5h-status": "rejected",
           "anthropic-ratelimit-unified-5h-utilization": "0.32",
-          "anthropic-ratelimit-unified-5h-reset": "1775224800",
+          "anthropic-ratelimit-unified-5h-reset": futureEpochSeconds(4 * 60 * 60),
         },
       });
     });
@@ -2076,8 +2150,12 @@ describe("Capacity observation integration", () => {
     expect(key.capacity.lastRequestId).toBe("req-second");
     expect(key.capacity.responseCount).toBe(2);
     expect(key.capacity.normalizedHeaderCount).toBe(2);
-    expect(key.capacity.windows.map((w) => w.windowName).sort()).toEqual(["unified-5h", "unified-7d"]);
-    expect(key.capacityHealth).toBe("warning");
+    expect(key.isAvailable).toBe(true);
+    expect(key.capacity.windows.map((w) => w.windowName).sort()).toEqual(["unified", "unified-5h", "unified-7d"]);
+    expect(key.capacity.windows.find((w) => w.windowName === "unified")!.status).toBe("allowed");
+    expect(key.capacity.windows.find((w) => w.windowName === "unified-5h")!.status).not.toBe("rejected");
+    expect(key.capacity.windows.find((w) => w.windowName === "unified-7d")!.status).not.toBe("rejected");
+    expect(key.capacityHealth).toBe("healthy");
   });
 
   test("responses without normalized headers still update response counts without pretending headers were seen", async () => {
@@ -2116,8 +2194,13 @@ describe("Capacity observation integration", () => {
           status: 429,
           headers: {
             "retry-after": "30",
+            "request-id": "req_capacity_429",
             "anthropic-ratelimit-unified-status": "rejected",
-            "anthropic-ratelimit-unified-reset": "1775224800",
+            "anthropic-ratelimit-unified-reset": futureEpochSeconds(30),
+            "anthropic-ratelimit-unified-5h-status": "rejected",
+            "anthropic-ratelimit-unified-5h-utilization": "0.95",
+            "anthropic-ratelimit-unified-5h-reset": futureEpochSeconds(30),
+            "anthropic-ratelimit-unified-5h-surpassed-threshold": "0.9",
             "anthropic-ratelimit-unified-overage-status": "rejected",
             "anthropic-ratelimit-unified-overage-disabled-reason": "out_of_credits",
           },
@@ -2135,11 +2218,14 @@ describe("Capacity observation integration", () => {
 
     const keyA = km.listKeys().find((k) => k.label === "key-a")!;
     expect(keyA.capacity.retryAfterSecs).toBe(30);
+    expect(keyA.capacity.lastRequestId).toBe("req_capacity_429");
     expect(keyA.capacity.overageStatus).toBe("rejected");
     expect(keyA.capacity.overageDisabledReason).toBe("out_of_credits");
     expect(keyA.capacity.responseCount).toBe(1);
     expect(keyA.capacity.normalizedHeaderCount).toBe(1);
     expect(keyA.capacity.windows.find((w) => w.windowName === "unified")!.status).toBe("rejected");
+    expect(keyA.capacity.windows.find((w) => w.windowName === "unified-5h")!.status).toBe("allowed_warning");
+    expect(keyA.capacity.windows.find((w) => w.windowName === "unified-5h")!.surpassedThreshold).toBe(0.9);
     expect(keyA.capacity.windows.find((w) => w.windowName === "unified-overage")).toBeUndefined();
     expect(keyA.isAvailable).toBe(false);
     expect(keyA.capacityHealth).toBe("cooling_down");

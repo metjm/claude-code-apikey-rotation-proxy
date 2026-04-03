@@ -298,8 +298,62 @@ describe("Capacity admin payloads", () => {
     expect(body.keys[0].capacity.normalizedHeaderCount).toBe(1);
     expect(body.keys[0].capacity.signalCoverage[0].signalName).toBe("organization");
     expect(body.keys[0].capacityHealth).toBe("warning");
+    expect(body.capacitySummary.healthyKeys).toBe(0);
     expect(body.capacitySummary.warningKeys).toBe(1);
+    expect(body.capacitySummary.rejectedKeys).toBe(0);
     expect(body.capacitySummary.windows[0].windowName).toBe("unified");
+  });
+
+  test("GET /admin/stats keeps successful-response rejected telemetry out of hard-rejection counts", async () => {
+    const entry = km.addKey(VALID_KEY, "cap-observed-rejected");
+    km.recordCapacityObservation(entry, {
+      seenAt: unixMs(1_500),
+      httpStatus: 200,
+      organizationId: "org-admin",
+      overageStatus: "rejected",
+      overageDisabledReason: "out_of_credits",
+      windows: [
+        {
+          windowName: "unified-7d",
+          status: "rejected",
+          utilization: 1,
+          resetAt: unixMs(Date.now() + 60_000),
+        },
+      ],
+    });
+
+    const res = await handleAdminRoute(makeReq("GET", "/admin/stats"), km, makeConfig(), st);
+    const body = await jsonBody(res!) as {
+      availableKeys: number;
+      keys: Array<{
+        isAvailable: boolean;
+        capacityHealth: string;
+        capacity: {
+          overageStatus: string | null;
+          overageDisabledReason: string | null;
+          windows: Array<{ status: string }>;
+        };
+      }>;
+      capacitySummary: {
+        warningKeys: number;
+        rejectedKeys: number;
+        overageRejectedKeys: number;
+        windows: Array<{ windowName: string; rejectedKeys: number }>;
+      };
+    };
+
+    expect(body.availableKeys).toBe(1);
+    expect(body.keys).toHaveLength(1);
+    expect(body.keys[0]!.isAvailable).toBe(true);
+    expect(body.keys[0]!.capacityHealth).toBe("warning");
+    expect(body.keys[0]!.capacity.overageStatus).toBe("rejected");
+    expect(body.keys[0]!.capacity.overageDisabledReason).toBe("out_of_credits");
+    expect(body.keys[0]!.capacity.windows[0]!.status).toBe("rejected");
+    expect(body.capacitySummary.warningKeys).toBe(1);
+    expect(body.capacitySummary.rejectedKeys).toBe(0);
+    expect(body.capacitySummary.overageRejectedKeys).toBe(1);
+    expect(body.capacitySummary.windows[0]!.windowName).toBe("unified-7d");
+    expect(body.capacitySummary.windows[0]!.rejectedKeys).toBe(1);
   });
 
   test("GET /admin/capacity/timeseries returns rollups by window", async () => {
