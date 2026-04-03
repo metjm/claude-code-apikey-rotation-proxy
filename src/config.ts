@@ -22,5 +22,6 @@ export function loadConfig(): ProxyConfig {
     adminToken: env("ADMIN_TOKEN") ?? null,
     dataDir: env("DATA_DIR") ?? join(process.cwd(), "data"),
     maxRetriesPerRequest: envInt("MAX_RETRIES", 10),
+    webhookUrl: env("WEBHOOK_URL") ?? null,
   } as const;
 }

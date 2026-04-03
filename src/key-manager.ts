@@ -81,11 +81,12 @@ export class KeyManager {
   private keys: ApiKeyEntry[] = [];
   private tokens: ProxyTokenEntry[] = [];
   private readonly db: Database;
-  private readonly dbPath: string;
+  readonly dbPath: string;
+  private readonly cleanupInterval: ReturnType<typeof setInterval>;
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly tsAccumulator = new Map<string, BucketAccumulator>();
 
-  constructor(dataDir: string, opts?: { registerShutdownHandler?: boolean }) {
+  constructor(dataDir: string) {
     this.dbPath = process.env["DB_PATH"] ?? join(dataDir, "state.db");
     mkdirSync(dirname(this.dbPath), { recursive: true });
 
@@ -98,23 +99,17 @@ export class KeyManager {
     this.migrateFromJson(dataDir);
     this.loadFromDb();
 
-    setInterval(() => this.cleanupOldTimeseries(), 60 * 60 * 1000);
-
-    if (opts?.registerShutdownHandler) {
-      const flush = () => this.flushAndExit();
-      process.on("SIGTERM", flush);
-      process.on("SIGINT", flush);
-    }
+    this.cleanupInterval = setInterval(() => this.cleanupOldTimeseries(), 60 * 60 * 1000);
   }
 
-  private flushAndExit(): void {
+  close(): void {
+    clearInterval(this.cleanupInterval);
     if (this.saveTimer) {
       clearTimeout(this.saveTimer);
       this.saveTimer = null;
-      this.saveNow();
     }
+    this.saveNow();
     this.db.close();
-    process.exit(0);
   }
 
   // ── Schema ──────────────────────────────────────────────────────

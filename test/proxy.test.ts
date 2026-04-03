@@ -8,6 +8,7 @@ import { KeyManager } from "../src/key-manager.ts";
 import { proxyRequest } from "../src/proxy.ts";
 import { subscribe, type ProxyEvent } from "../src/events.ts";
 import type { ProxyConfig, ProxyTokenEntry } from "../src/types.ts";
+import { SchemaTracker } from "../src/schema-tracker.ts";
 
 // ── Helpers ────────────────────────────────────────────────────────
 
@@ -19,14 +20,21 @@ const FAKE_OAUTH = "sk-ant-oat-test-oauth-AAAAAAAAAAAAAAAA";
 
 interface TestSetup {
   km: KeyManager;
+  st: SchemaTracker;
   tmpDir: string;
   cleanup: () => void;
+}
+
+function createTestSchemaTracker(tmpDir: string): SchemaTracker {
+  const dbPath = join(tmpDir, "test-state.db");
+  return new SchemaTracker(dbPath, null);
 }
 
 function createTestSetup(): TestSetup {
   const tmpDir = mkdtempSync(join(tmpdir(), "proxy-test-"));
   const km = new KeyManager(tmpDir);
-  return { km, tmpDir, cleanup: () => rmSync(tmpDir, { recursive: true, force: true }) };
+  const st = createTestSchemaTracker(tmpDir);
+  return { km, st, tmpDir, cleanup: () => { st.close(); rmSync(tmpDir, { recursive: true, force: true }); } };
 }
 
 interface MockUpstream {
@@ -53,6 +61,7 @@ function makeConfig(upstream: string, overrides?: Partial<ProxyConfig>): ProxyCo
     adminToken: null,
     dataDir: "/tmp",
     maxRetriesPerRequest: 10,
+    webhookUrl: null,
     ...overrides,
   };
 }
@@ -117,16 +126,16 @@ function upstream(
 
 describe("Basic Proxying", () => {
   test("returns no_keys when no keys registered", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     const mock = upstream(() => new Response("should not reach"));
     const config = makeConfig(mock.url);
 
-    const result = await proxyRequest(makeRequest("/v1/messages"), km, config);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config, st);
     expect(result.kind).toBe("no_keys");
   });
 
   test("successfully proxies GET request", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
 
     const mock = upstream((req) => {
@@ -138,7 +147,7 @@ describe("Basic Proxying", () => {
     });
 
     const config = makeConfig(mock.url);
-    const result = await proxyRequest(makeRequest("/v1/models", { method: "GET" }), km, config);
+    const result = await proxyRequest(makeRequest("/v1/models", { method: "GET" }), km, config, st);
 
     expect(result.kind).toBe("success");
     if (result.kind === "success") {
@@ -149,7 +158,7 @@ describe("Basic Proxying", () => {
   });
 
   test("successfully proxies POST request with body", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
 
     let receivedBody: unknown = null;
@@ -172,6 +181,7 @@ describe("Basic Proxying", () => {
       }),
       km,
       config,
+      st,
     );
 
     expect(result.kind).toBe("success");
@@ -179,7 +189,7 @@ describe("Basic Proxying", () => {
   });
 
   test("preserves query string in upstream URL", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
 
     let receivedUrl = "";
@@ -189,7 +199,7 @@ describe("Basic Proxying", () => {
     });
 
     const config = makeConfig(mock.url);
-    await proxyRequest(makeRequest("/v1/messages?beta=true&version=2"), km, config);
+    await proxyRequest(makeRequest("/v1/messages?beta=true&version=2"), km, config, st);
 
     const parsed = new URL(receivedUrl);
     expect(parsed.pathname).toBe("/v1/messages");
@@ -198,7 +208,7 @@ describe("Basic Proxying", () => {
   });
 
   test("returns upstream response status and body", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
 
     const mock = upstream(() =>
@@ -210,7 +220,7 @@ describe("Basic Proxying", () => {
     );
 
     const config = makeConfig(mock.url);
-    const result = await proxyRequest(makeRequest("/v1/messages"), km, config);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config, st);
 
     expect(result.kind).toBe("success");
     if (result.kind === "success") {
@@ -225,7 +235,7 @@ describe("Basic Proxying", () => {
 
 describe("Header Handling", () => {
   test("strips x-api-key from outgoing request", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
 
     let receivedHeaders: Headers | null = null;
@@ -241,6 +251,7 @@ describe("Header Handling", () => {
       }),
       km,
       config,
+      st,
     );
 
     // The x-api-key should be the proxy's key, not the client-supplied one
@@ -249,7 +260,7 @@ describe("Header Handling", () => {
   });
 
   test("strips authorization from outgoing request", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
 
     let receivedHeaders: Headers | null = null;
@@ -265,6 +276,7 @@ describe("Header Handling", () => {
       }),
       km,
       config,
+      st,
     );
 
     // For a non-OAuth key, there should be no authorization header
@@ -272,7 +284,7 @@ describe("Header Handling", () => {
   });
 
   test("strips host, connection, keep-alive, transfer-encoding from client headers", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
 
     let receivedHeaders: Headers | null = null;
@@ -294,6 +306,7 @@ describe("Header Handling", () => {
       }),
       km,
       config,
+      st,
     );
 
     // The proxy strips client-supplied hop-by-hop headers from the built
@@ -308,7 +321,7 @@ describe("Header Handling", () => {
   });
 
   test("adds x-api-key for regular API keys", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
 
     let receivedHeaders: Headers | null = null;
@@ -318,14 +331,14 @@ describe("Header Handling", () => {
     });
 
     const config = makeConfig(mock.url);
-    await proxyRequest(makeRequest("/v1/messages"), km, config);
+    await proxyRequest(makeRequest("/v1/messages"), km, config, st);
 
     expect(receivedHeaders!.get("x-api-key")).toBe(FAKE_KEY_A);
     expect(receivedHeaders!.get("authorization")).toBeNull();
   });
 
   test("adds Authorization: Bearer for OAuth tokens (sk-ant-oat-*)", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_OAUTH, "oauth-key");
 
     let receivedHeaders: Headers | null = null;
@@ -335,14 +348,14 @@ describe("Header Handling", () => {
     });
 
     const config = makeConfig(mock.url);
-    await proxyRequest(makeRequest("/v1/messages"), km, config);
+    await proxyRequest(makeRequest("/v1/messages"), km, config, st);
 
     expect(receivedHeaders!.get("authorization")).toBe(`Bearer ${FAKE_OAUTH}`);
     expect(receivedHeaders!.get("x-api-key")).toBeNull();
   });
 
   test("sets anthropic-version from incoming or defaults to 2023-06-01", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
 
     // Test default
@@ -353,7 +366,7 @@ describe("Header Handling", () => {
     });
 
     const config = makeConfig(mock.url);
-    await proxyRequest(makeRequest("/v1/messages"), km, config);
+    await proxyRequest(makeRequest("/v1/messages"), km, config, st);
     expect(receivedVersion).toBe("2023-06-01");
 
     // Test custom version preserved
@@ -363,12 +376,13 @@ describe("Header Handling", () => {
       }),
       km,
       config,
+      st,
     );
     expect(receivedVersion).toBe("2024-01-01");
   });
 
   test("preserves custom client headers (e.g. content-type, user-agent)", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
 
     let receivedHeaders: Headers | null = null;
@@ -388,6 +402,7 @@ describe("Header Handling", () => {
       }),
       km,
       config,
+      st,
     );
 
     expect(receivedHeaders!.get("content-type")).toBe("application/json");
@@ -396,7 +411,7 @@ describe("Header Handling", () => {
   });
 
   test("strips content-encoding, content-length, transfer-encoding from response", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
 
     // Use "identity" content-encoding (no-op) so fetch() does not try to
@@ -416,7 +431,7 @@ describe("Header Handling", () => {
     );
 
     const config = makeConfig(mock.url);
-    const result = await proxyRequest(makeRequest("/v1/messages"), km, config);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config, st);
 
     expect(result.kind).toBe("success");
     if (result.kind === "success") {
@@ -434,7 +449,7 @@ describe("Header Handling", () => {
 
 describe("Rate Limit Handling (429)", () => {
   test("detects 429 and rotates to next key", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
     km.addKey(FAKE_KEY_B, "key-b");
 
@@ -455,14 +470,14 @@ describe("Rate Limit Handling (429)", () => {
     });
 
     const config = makeConfig(mock.url);
-    const result = await proxyRequest(makeRequest("/v1/messages"), km, config);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config, st);
 
     expect(result.kind).toBe("success");
     expect(callCount).toBe(2);
   });
 
   test("parses Retry-After header", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
     km.addKey(FAKE_KEY_B, "key-b");
 
@@ -478,7 +493,7 @@ describe("Rate Limit Handling (429)", () => {
     });
 
     const config = makeConfig(mock.url);
-    await proxyRequest(makeRequest("/v1/messages"), km, config);
+    await proxyRequest(makeRequest("/v1/messages"), km, config, st);
 
     // key-a should be unavailable for ~120s
     const keys = km.listKeys();
@@ -491,7 +506,7 @@ describe("Rate Limit Handling (429)", () => {
   });
 
   test("defaults retry to 60s when header missing", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
     km.addKey(FAKE_KEY_B, "key-b");
 
@@ -505,7 +520,7 @@ describe("Rate Limit Handling (429)", () => {
     });
 
     const config = makeConfig(mock.url);
-    await proxyRequest(makeRequest("/v1/messages"), km, config);
+    await proxyRequest(makeRequest("/v1/messages"), km, config, st);
 
     const keys = km.listKeys();
     const keyA = keys.find((k) => k.label === "key-a")!;
@@ -516,7 +531,7 @@ describe("Rate Limit Handling (429)", () => {
   });
 
   test("marks key unavailable for retry period", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
     km.addKey(FAKE_KEY_B, "key-b");
 
@@ -532,7 +547,7 @@ describe("Rate Limit Handling (429)", () => {
     });
 
     const config = makeConfig(mock.url);
-    await proxyRequest(makeRequest("/v1/messages"), km, config);
+    await proxyRequest(makeRequest("/v1/messages"), km, config, st);
 
     const keys = km.listKeys();
     const keyA = keys.find((k) => k.label === "key-a")!;
@@ -543,7 +558,7 @@ describe("Rate Limit Handling (429)", () => {
   });
 
   test("returns all_exhausted when all keys rate-limited", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
     km.addKey(FAKE_KEY_B, "key-b");
 
@@ -555,7 +570,7 @@ describe("Rate Limit Handling (429)", () => {
     );
 
     const config = makeConfig(mock.url);
-    const result = await proxyRequest(makeRequest("/v1/messages"), km, config);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config, st);
 
     expect(result.kind).toBe("all_exhausted");
     if (result.kind === "all_exhausted") {
@@ -564,7 +579,7 @@ describe("Rate Limit Handling (429)", () => {
   });
 
   test("tracks rateLimitHits stat", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
     km.addKey(FAKE_KEY_B, "key-b");
 
@@ -580,7 +595,7 @@ describe("Rate Limit Handling (429)", () => {
     });
 
     const config = makeConfig(mock.url);
-    await proxyRequest(makeRequest("/v1/messages"), km, config);
+    await proxyRequest(makeRequest("/v1/messages"), km, config, st);
 
     const keys = km.listKeys();
     const keyA = keys.find((k) => k.label === "key-a")!;
@@ -588,7 +603,7 @@ describe("Rate Limit Handling (429)", () => {
   });
 
   test("emits rate_limit event with user label", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
     km.addKey(FAKE_KEY_B, "key-b");
     const proxyUser = km.addToken("test-token-12345678", "alice");
@@ -606,7 +621,7 @@ describe("Rate Limit Handling (429)", () => {
 
     const config = makeConfig(mock.url);
     const [, events] = await collectEvents(() =>
-      proxyRequest(makeRequest("/v1/messages"), km, config, proxyUser),
+      proxyRequest(makeRequest("/v1/messages"), km, config, st, proxyUser),
     );
 
     const rlEvents = events.filter((e) => e.type === "rate_limit");
@@ -620,12 +635,12 @@ describe("Rate Limit Handling (429)", () => {
 
 describe("Error Handling", () => {
   test("returns 502 on upstream connection failure", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
 
     // Point at a port that is not listening
     const config = makeConfig("http://localhost:1");
-    const result = await proxyRequest(makeRequest("/v1/messages"), km, config);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config, st);
 
     expect(result.kind).toBe("error");
     if (result.kind === "error") {
@@ -635,7 +650,7 @@ describe("Error Handling", () => {
   });
 
   test("returns upstream error status for 4xx/5xx (not 429)", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
 
     const errorBody = JSON.stringify({ error: { type: "invalid_request_error", message: "bad model" } });
@@ -647,7 +662,7 @@ describe("Error Handling", () => {
     );
 
     const config = makeConfig(mock.url);
-    const result = await proxyRequest(makeRequest("/v1/messages"), km, config);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config, st);
 
     expect(result.kind).toBe("error");
     if (result.kind === "error") {
@@ -659,7 +674,7 @@ describe("Error Handling", () => {
   });
 
   test("returns upstream 500 error as-is", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
 
     const mock = upstream(() =>
@@ -667,7 +682,7 @@ describe("Error Handling", () => {
     );
 
     const config = makeConfig(mock.url);
-    const result = await proxyRequest(makeRequest("/v1/messages"), km, config);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config, st);
 
     expect(result.kind).toBe("error");
     if (result.kind === "error") {
@@ -676,7 +691,7 @@ describe("Error Handling", () => {
   });
 
   test("does not retry on non-429 errors", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
     km.addKey(FAKE_KEY_B, "key-b");
 
@@ -687,14 +702,14 @@ describe("Error Handling", () => {
     });
 
     const config = makeConfig(mock.url);
-    await proxyRequest(makeRequest("/v1/messages"), km, config);
+    await proxyRequest(makeRequest("/v1/messages"), km, config, st);
 
     // Should only hit once -- no retry on 403
     expect(callCount).toBe(1);
   });
 
   test("records error stats on key and token", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
     const proxyUser = km.addToken("test-token-12345678", "alice");
 
@@ -703,7 +718,7 @@ describe("Error Handling", () => {
     );
 
     const config = makeConfig(mock.url);
-    await proxyRequest(makeRequest("/v1/messages"), km, config, proxyUser);
+    await proxyRequest(makeRequest("/v1/messages"), km, config, st, proxyUser);
 
     const keys = km.listKeys();
     expect(keys[0]!.stats.errors).toBe(1);
@@ -717,7 +732,7 @@ describe("Error Handling", () => {
 
 describe("Token Tracking - Non-Streaming", () => {
   test("extracts usage.input_tokens from JSON response", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
 
     const mock = upstream(() =>
@@ -732,14 +747,14 @@ describe("Token Tracking - Non-Streaming", () => {
     );
 
     const config = makeConfig(mock.url);
-    await proxyRequest(makeRequest("/v1/messages"), km, config);
+    await proxyRequest(makeRequest("/v1/messages"), km, config, st);
 
     const keys = km.listKeys();
     expect(keys[0]!.stats.totalTokensIn).toBe(150);
   });
 
   test("extracts usage.output_tokens from JSON response", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
 
     const mock = upstream(() =>
@@ -753,14 +768,14 @@ describe("Token Tracking - Non-Streaming", () => {
     );
 
     const config = makeConfig(mock.url);
-    await proxyRequest(makeRequest("/v1/messages"), km, config);
+    await proxyRequest(makeRequest("/v1/messages"), km, config, st);
 
     const keys = km.listKeys();
     expect(keys[0]!.stats.totalTokensOut).toBe(250);
   });
 
   test("defaults to 0 when usage missing", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
 
     const mock = upstream(() =>
@@ -770,7 +785,7 @@ describe("Token Tracking - Non-Streaming", () => {
     );
 
     const config = makeConfig(mock.url);
-    await proxyRequest(makeRequest("/v1/messages"), km, config);
+    await proxyRequest(makeRequest("/v1/messages"), km, config, st);
 
     const keys = km.listKeys();
     expect(keys[0]!.stats.totalTokensIn).toBe(0);
@@ -779,7 +794,7 @@ describe("Token Tracking - Non-Streaming", () => {
   });
 
   test("records token stats on key", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
 
     const mock = upstream(() =>
@@ -791,8 +806,8 @@ describe("Token Tracking - Non-Streaming", () => {
 
     const config = makeConfig(mock.url);
     // Two requests to accumulate
-    await proxyRequest(makeRequest("/v1/messages"), km, config);
-    await proxyRequest(makeRequest("/v1/messages"), km, config);
+    await proxyRequest(makeRequest("/v1/messages"), km, config, st);
+    await proxyRequest(makeRequest("/v1/messages"), km, config, st);
 
     const keys = km.listKeys();
     expect(keys[0]!.stats.totalTokensIn).toBe(100);
@@ -801,7 +816,7 @@ describe("Token Tracking - Non-Streaming", () => {
   });
 
   test("records token stats on proxy user", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
     const proxyUser = km.addToken("test-token-12345678", "alice");
 
@@ -813,7 +828,7 @@ describe("Token Tracking - Non-Streaming", () => {
     );
 
     const config = makeConfig(mock.url);
-    await proxyRequest(makeRequest("/v1/messages"), km, config, proxyUser);
+    await proxyRequest(makeRequest("/v1/messages"), km, config, st, proxyUser);
 
     const tokens = km.listTokens();
     const alice = tokens.find((t) => t.label === "alice")!;
@@ -823,7 +838,7 @@ describe("Token Tracking - Non-Streaming", () => {
   });
 
   test("emits tokens event", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
 
     const mock = upstream(() =>
@@ -835,7 +850,7 @@ describe("Token Tracking - Non-Streaming", () => {
 
     const config = makeConfig(mock.url);
     const [, events] = await collectEvents(() =>
-      proxyRequest(makeRequest("/v1/messages"), km, config),
+      proxyRequest(makeRequest("/v1/messages"), km, config, st),
     );
 
     const tokenEvents = events.filter((e) => e.type === "tokens");
@@ -861,7 +876,7 @@ describe("Token Tracking - Streaming (SSE)", () => {
   }
 
   test("detects text/event-stream content-type", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
 
     const sseData = [
@@ -879,7 +894,7 @@ describe("Token Tracking - Streaming (SSE)", () => {
     );
 
     const config = makeConfig(mock.url);
-    const result = await proxyRequest(makeRequest("/v1/messages"), km, config);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config, st);
 
     expect(result.kind).toBe("success");
     if (result.kind === "success") {
@@ -893,7 +908,7 @@ describe("Token Tracking - Streaming (SSE)", () => {
   });
 
   test("passes stream data through unchanged to client", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
 
     const sseChunks = [
@@ -910,7 +925,7 @@ describe("Token Tracking - Streaming (SSE)", () => {
     );
 
     const config = makeConfig(mock.url);
-    const result = await proxyRequest(makeRequest("/v1/messages"), km, config);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config, st);
 
     expect(result.kind).toBe("success");
     if (result.kind === "success") {
@@ -924,7 +939,7 @@ describe("Token Tracking - Streaming (SSE)", () => {
   });
 
   test("extracts input tokens from message_start event", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
 
     const sseData = [
@@ -940,7 +955,7 @@ describe("Token Tracking - Streaming (SSE)", () => {
     );
 
     const config = makeConfig(mock.url);
-    const result = await proxyRequest(makeRequest("/v1/messages"), km, config);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config, st);
 
     expect(result.kind).toBe("success");
     if (result.kind === "success") {
@@ -951,7 +966,7 @@ describe("Token Tracking - Streaming (SSE)", () => {
   });
 
   test("extracts output tokens from message_delta event", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
 
     const sseData = [
@@ -967,7 +982,7 @@ describe("Token Tracking - Streaming (SSE)", () => {
     );
 
     const config = makeConfig(mock.url);
-    const result = await proxyRequest(makeRequest("/v1/messages"), km, config);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config, st);
 
     expect(result.kind).toBe("success");
     if (result.kind === "success") {
@@ -978,7 +993,7 @@ describe("Token Tracking - Streaming (SSE)", () => {
   });
 
   test("accumulates tokens across multiple events", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
 
     const sseData = [
@@ -996,7 +1011,7 @@ describe("Token Tracking - Streaming (SSE)", () => {
     );
 
     const config = makeConfig(mock.url);
-    const result = await proxyRequest(makeRequest("/v1/messages"), km, config);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config, st);
 
     expect(result.kind).toBe("success");
     if (result.kind === "success") {
@@ -1009,7 +1024,7 @@ describe("Token Tracking - Streaming (SSE)", () => {
   });
 
   test("records stats on flush (stream end)", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
     const proxyUser = km.addToken("test-token-12345678", "alice");
 
@@ -1026,7 +1041,7 @@ describe("Token Tracking - Streaming (SSE)", () => {
     );
 
     const config = makeConfig(mock.url);
-    const result = await proxyRequest(makeRequest("/v1/messages"), km, config, proxyUser);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config, st, proxyUser);
 
     expect(result.kind).toBe("success");
     if (result.kind === "success") {
@@ -1052,7 +1067,7 @@ describe("Token Tracking - Streaming (SSE)", () => {
   });
 
   test("handles invalid JSON in stream events gracefully", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
 
     const sseData = [
@@ -1070,7 +1085,7 @@ describe("Token Tracking - Streaming (SSE)", () => {
     );
 
     const config = makeConfig(mock.url);
-    const result = await proxyRequest(makeRequest("/v1/messages"), km, config);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config, st);
 
     expect(result.kind).toBe("success");
     if (result.kind === "success") {
@@ -1089,7 +1104,7 @@ describe("Token Tracking - Streaming (SSE)", () => {
 
 describe("Key Rotation", () => {
   test("tries multiple keys on successive 429s", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
     km.addKey(FAKE_KEY_B, "key-b");
     km.addKey(FAKE_KEY_C, "key-c");
@@ -1108,7 +1123,7 @@ describe("Key Rotation", () => {
     });
 
     const config = makeConfig(mock.url);
-    const result = await proxyRequest(makeRequest("/v1/messages"), km, config);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config, st);
 
     expect(result.kind).toBe("success");
     expect(keysUsed.length).toBe(3);
@@ -1117,7 +1132,7 @@ describe("Key Rotation", () => {
   });
 
   test("stops when a key succeeds", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
     km.addKey(FAKE_KEY_B, "key-b");
     km.addKey(FAKE_KEY_C, "key-c");
@@ -1137,7 +1152,7 @@ describe("Key Rotation", () => {
     });
 
     const config = makeConfig(mock.url);
-    const result = await proxyRequest(makeRequest("/v1/messages"), km, config);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config, st);
 
     expect(result.kind).toBe("success");
     // Should stop at 2 (key-a 429, key-b success), not try key-c
@@ -1145,7 +1160,7 @@ describe("Key Rotation", () => {
   });
 
   test("stops at max retries", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     // Add many keys but set low max retries
     km.addKey(FAKE_KEY_A, "key-a");
     km.addKey(FAKE_KEY_B, "key-b");
@@ -1161,7 +1176,7 @@ describe("Key Rotation", () => {
     });
 
     const config = makeConfig(mock.url, { maxRetriesPerRequest: 2 });
-    const result = await proxyRequest(makeRequest("/v1/messages"), km, config);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config, st);
 
     // Should stop after 2 attempts
     expect(callCount).toBe(2);
@@ -1169,7 +1184,7 @@ describe("Key Rotation", () => {
   });
 
   test("does not retry same key twice", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
 
     let callCount = 0;
@@ -1182,7 +1197,7 @@ describe("Key Rotation", () => {
     });
 
     const config = makeConfig(mock.url, { maxRetriesPerRequest: 10 });
-    const result = await proxyRequest(makeRequest("/v1/messages"), km, config);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config, st);
 
     // With only 1 key, it should be tried exactly once, then all_exhausted
     expect(callCount).toBe(1);
@@ -1190,7 +1205,7 @@ describe("Key Rotation", () => {
   });
 
   test("returns all_exhausted after all keys tried", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
     km.addKey(FAKE_KEY_B, "key-b");
 
@@ -1202,7 +1217,7 @@ describe("Key Rotation", () => {
     );
 
     const config = makeConfig(mock.url);
-    const result = await proxyRequest(makeRequest("/v1/messages"), km, config);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config, st);
 
     expect(result.kind).toBe("all_exhausted");
     if (result.kind === "all_exhausted") {
@@ -1216,7 +1231,7 @@ describe("Key Rotation", () => {
 
 describe("Proxy User Attribution", () => {
   test("records token request once per top-level request (not per retry)", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
     km.addKey(FAKE_KEY_B, "key-b");
     const proxyUser = km.addToken("test-token-12345678", "alice");
@@ -1236,7 +1251,7 @@ describe("Proxy User Attribution", () => {
     });
 
     const config = makeConfig(mock.url);
-    await proxyRequest(makeRequest("/v1/messages"), km, config, proxyUser);
+    await proxyRequest(makeRequest("/v1/messages"), km, config, st, proxyUser);
 
     const tokens = km.listTokens();
     const alice = tokens.find((t) => t.label === "alice")!;
@@ -1245,7 +1260,7 @@ describe("Proxy User Attribution", () => {
   });
 
   test("records token success with correct token counts", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
     const proxyUser = km.addToken("test-token-12345678", "bob");
 
@@ -1257,7 +1272,7 @@ describe("Proxy User Attribution", () => {
     );
 
     const config = makeConfig(mock.url);
-    await proxyRequest(makeRequest("/v1/messages"), km, config, proxyUser);
+    await proxyRequest(makeRequest("/v1/messages"), km, config, st, proxyUser);
 
     const tokens = km.listTokens();
     const bob = tokens.find((t) => t.label === "bob")!;
@@ -1267,7 +1282,7 @@ describe("Proxy User Attribution", () => {
   });
 
   test("records token error on failure", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
     const proxyUser = km.addToken("test-token-12345678", "charlie");
 
@@ -1276,7 +1291,7 @@ describe("Proxy User Attribution", () => {
     );
 
     const config = makeConfig(mock.url);
-    await proxyRequest(makeRequest("/v1/messages"), km, config, proxyUser);
+    await proxyRequest(makeRequest("/v1/messages"), km, config, st, proxyUser);
 
     const tokens = km.listTokens();
     const charlie = tokens.find((t) => t.label === "charlie")!;
@@ -1285,7 +1300,7 @@ describe("Proxy User Attribution", () => {
   });
 
   test("records token error on all-keys-exhausted", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
     const proxyUser = km.addToken("test-token-12345678", "diana");
 
@@ -1297,7 +1312,7 @@ describe("Proxy User Attribution", () => {
     );
 
     const config = makeConfig(mock.url);
-    await proxyRequest(makeRequest("/v1/messages"), km, config, proxyUser);
+    await proxyRequest(makeRequest("/v1/messages"), km, config, st, proxyUser);
 
     const tokens = km.listTokens();
     const diana = tokens.find((t) => t.label === "diana")!;
@@ -1305,12 +1320,12 @@ describe("Proxy User Attribution", () => {
   });
 
   test("records token error on upstream connection failure", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
     const proxyUser = km.addToken("test-token-12345678", "eve");
 
     const config = makeConfig("http://localhost:1");
-    await proxyRequest(makeRequest("/v1/messages"), km, config, proxyUser);
+    await proxyRequest(makeRequest("/v1/messages"), km, config, st, proxyUser);
 
     const tokens = km.listTokens();
     const eve = tokens.find((t) => t.label === "eve")!;
@@ -1318,7 +1333,7 @@ describe("Proxy User Attribution", () => {
   });
 
   test("includes user label in all emitted events", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
     const proxyUser = km.addToken("test-token-12345678", "frank");
 
@@ -1331,13 +1346,13 @@ describe("Proxy User Attribution", () => {
 
     const config = makeConfig(mock.url);
     const [, events] = await collectEvents(() =>
-      proxyRequest(makeRequest("/v1/messages"), km, config, proxyUser),
+      proxyRequest(makeRequest("/v1/messages"), km, config, st, proxyUser),
     );
 
     // All events should have user set
     for (const event of events) {
-      // "keys" type events from emitWithKeys may not have user, so skip those
-      if (event.type !== "keys") {
+      // "keys" and "schema_change" type events may not have user, so skip those
+      if (event.type !== "keys" && event.type !== "schema_change") {
         expect(event.user).toBe("frank");
       }
     }
@@ -1348,7 +1363,7 @@ describe("Proxy User Attribution", () => {
 
 describe("Event Emission", () => {
   test("emits request event with method, path, attempt, user", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
     const proxyUser = km.addToken("test-token-12345678", "alice");
 
@@ -1360,6 +1375,7 @@ describe("Event Emission", () => {
         makeRequest("/v1/messages", { method: "POST" }),
         km,
         config,
+        st,
         proxyUser,
       ),
     );
@@ -1374,7 +1390,7 @@ describe("Event Emission", () => {
   });
 
   test("emits response event with status and user", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
     const proxyUser = km.addToken("test-token-12345678", "bob");
 
@@ -1384,7 +1400,7 @@ describe("Event Emission", () => {
 
     const config = makeConfig(mock.url);
     const [, events] = await collectEvents(() =>
-      proxyRequest(makeRequest("/v1/messages"), km, config, proxyUser),
+      proxyRequest(makeRequest("/v1/messages"), km, config, st, proxyUser),
     );
 
     const resEvents = events.filter((e) => e.type === "response");
@@ -1394,14 +1410,14 @@ describe("Event Emission", () => {
   });
 
   test("emits error event with details and user", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
     const proxyUser = km.addToken("test-token-12345678", "charlie");
 
     // Use an unreachable port to trigger a connection error
     const config = makeConfig("http://localhost:1");
     const [, events] = await collectEvents(() =>
-      proxyRequest(makeRequest("/v1/messages"), km, config, proxyUser),
+      proxyRequest(makeRequest("/v1/messages"), km, config, st, proxyUser),
     );
 
     const errEvents = events.filter((e) => e.type === "error");
@@ -1411,7 +1427,7 @@ describe("Event Emission", () => {
   });
 
   test("emits error event for non-429 upstream errors", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
     const proxyUser = km.addToken("test-token-12345678", "diana");
 
@@ -1421,7 +1437,7 @@ describe("Event Emission", () => {
 
     const config = makeConfig(mock.url);
     const [, events] = await collectEvents(() =>
-      proxyRequest(makeRequest("/v1/messages"), km, config, proxyUser),
+      proxyRequest(makeRequest("/v1/messages"), km, config, st, proxyUser),
     );
 
     const errEvents = events.filter((e) => e.type === "error");
@@ -1431,7 +1447,7 @@ describe("Event Emission", () => {
   });
 
   test("emits rate_limit event with retryAfter and user", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
     km.addKey(FAKE_KEY_B, "key-b");
     const proxyUser = km.addToken("test-token-12345678", "eve");
@@ -1449,7 +1465,7 @@ describe("Event Emission", () => {
 
     const config = makeConfig(mock.url);
     const [, events] = await collectEvents(() =>
-      proxyRequest(makeRequest("/v1/messages"), km, config, proxyUser),
+      proxyRequest(makeRequest("/v1/messages"), km, config, st, proxyUser),
     );
 
     const rlEvents = events.filter((e) => e.type === "rate_limit");
@@ -1460,7 +1476,7 @@ describe("Event Emission", () => {
   });
 
   test("emits tokens event with input/output counts and user", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
     const proxyUser = km.addToken("test-token-12345678", "frank");
 
@@ -1473,7 +1489,7 @@ describe("Event Emission", () => {
 
     const config = makeConfig(mock.url);
     const [, events] = await collectEvents(() =>
-      proxyRequest(makeRequest("/v1/messages"), km, config, proxyUser),
+      proxyRequest(makeRequest("/v1/messages"), km, config, st, proxyUser),
     );
 
     const tokenEvents = events.filter((e) => e.type === "tokens");
@@ -1485,7 +1501,7 @@ describe("Event Emission", () => {
   });
 
   test("emits request events for each retry attempt", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
     km.addKey(FAKE_KEY_B, "key-b");
     km.addKey(FAKE_KEY_C, "key-c");
@@ -1503,7 +1519,7 @@ describe("Event Emission", () => {
 
     const config = makeConfig(mock.url);
     const [, events] = await collectEvents(() =>
-      proxyRequest(makeRequest("/v1/messages"), km, config),
+      proxyRequest(makeRequest("/v1/messages"), km, config, st),
     );
 
     const reqEvents = events.filter((e) => e.type === "request");
@@ -1514,7 +1530,7 @@ describe("Event Emission", () => {
   });
 
   test("emits response event for each upstream response including 429s", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
     km.addKey(FAKE_KEY_B, "key-b");
 
@@ -1531,7 +1547,7 @@ describe("Event Emission", () => {
 
     const config = makeConfig(mock.url);
     const [, events] = await collectEvents(() =>
-      proxyRequest(makeRequest("/v1/messages"), km, config),
+      proxyRequest(makeRequest("/v1/messages"), km, config, st),
     );
 
     const resEvents = events.filter((e) => e.type === "response");
@@ -1541,7 +1557,7 @@ describe("Event Emission", () => {
   });
 
   test("does not emit tokens event when usage is zero", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
 
     const mock = upstream(() =>
@@ -1552,7 +1568,7 @@ describe("Event Emission", () => {
 
     const config = makeConfig(mock.url);
     const [, events] = await collectEvents(() =>
-      proxyRequest(makeRequest("/v1/messages"), km, config),
+      proxyRequest(makeRequest("/v1/messages"), km, config, st),
     );
 
     const tokenEvents = events.filter((e) => e.type === "tokens");
@@ -1564,7 +1580,7 @@ describe("Event Emission", () => {
 
 describe("Edge Cases", () => {
   test("handles null upstream body", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
 
     const mock = upstream(() =>
@@ -1572,7 +1588,7 @@ describe("Edge Cases", () => {
     );
 
     const config = makeConfig(mock.url);
-    const result = await proxyRequest(makeRequest("/v1/messages"), km, config);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config, st);
 
     expect(result.kind).toBe("success");
     if (result.kind === "success") {
@@ -1585,7 +1601,7 @@ describe("Edge Cases", () => {
   });
 
   test("handles non-JSON response body gracefully", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
 
     const mock = upstream(() =>
@@ -1596,7 +1612,7 @@ describe("Edge Cases", () => {
     );
 
     const config = makeConfig(mock.url);
-    const result = await proxyRequest(makeRequest("/v1/messages"), km, config);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config, st);
 
     expect(result.kind).toBe("success");
     if (result.kind === "success") {
@@ -1611,7 +1627,7 @@ describe("Edge Cases", () => {
   });
 
   test("handles SSE stream with [DONE] marker", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
 
     const sseData = [
@@ -1638,7 +1654,7 @@ describe("Edge Cases", () => {
     );
 
     const config = makeConfig(mock.url);
-    const result = await proxyRequest(makeRequest("/v1/messages"), km, config);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config, st);
 
     expect(result.kind).toBe("success");
     if (result.kind === "success") {
@@ -1650,7 +1666,7 @@ describe("Edge Cases", () => {
   });
 
   test("maxRetriesPerRequest of 1 means only one attempt", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
     km.addKey(FAKE_KEY_B, "key-b");
 
@@ -1664,20 +1680,20 @@ describe("Edge Cases", () => {
     });
 
     const config = makeConfig(mock.url, { maxRetriesPerRequest: 1 });
-    const result = await proxyRequest(makeRequest("/v1/messages"), km, config);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config, st);
 
     expect(callCount).toBe(1);
     expect(result.kind).toBe("all_exhausted");
   });
 
   test("success result includes usedKey reference", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
 
     const mock = upstream(() => new Response("ok"));
 
     const config = makeConfig(mock.url);
-    const result = await proxyRequest(makeRequest("/v1/messages"), km, config);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config, st);
 
     expect(result.kind).toBe("success");
     if (result.kind === "success") {
@@ -1687,7 +1703,7 @@ describe("Edge Cases", () => {
   });
 
   test("error result includes usedKey reference", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
 
     const mock = upstream(() =>
@@ -1695,7 +1711,7 @@ describe("Edge Cases", () => {
     );
 
     const config = makeConfig(mock.url);
-    const result = await proxyRequest(makeRequest("/v1/messages"), km, config);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config, st);
 
     expect(result.kind).toBe("error");
     if (result.kind === "error") {
@@ -1705,7 +1721,7 @@ describe("Edge Cases", () => {
   });
 
   test("streaming tokens event emitted with user label on flush", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
     const proxyUser = km.addToken("test-token-12345678", "alice");
 
@@ -1736,7 +1752,7 @@ describe("Edge Cases", () => {
     const events: ProxyEvent[] = [];
     const unsub = subscribe((e) => events.push(e));
 
-    const result = await proxyRequest(makeRequest("/v1/messages"), km, config, proxyUser);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config, st, proxyUser);
     expect(result.kind).toBe("success");
     if (result.kind === "success") {
       await result.response.text();
@@ -1752,7 +1768,7 @@ describe("Edge Cases", () => {
   });
 
   test("properly increments totalRequests on key for each attempt", async () => {
-    const { km } = setup();
+    const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
     km.addKey(FAKE_KEY_B, "key-b");
 
@@ -1768,7 +1784,7 @@ describe("Edge Cases", () => {
     });
 
     const config = makeConfig(mock.url);
-    await proxyRequest(makeRequest("/v1/messages"), km, config);
+    await proxyRequest(makeRequest("/v1/messages"), km, config, st);
 
     const keys = km.listKeys();
     const keyA = keys.find((k) => k.label === "key-a")!;
@@ -1778,5 +1794,197 @@ describe("Edge Cases", () => {
     expect(keyA.stats.rateLimitHits).toBe(1);
     expect(keyB.stats.totalRequests).toBe(1);
     expect(keyB.stats.successfulRequests).toBe(1);
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────
+
+describe("Schema Tracking Integration", () => {
+  test("headers are tracked on each proxied response", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    const mock = upstream(() =>
+      new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: {
+          "content-type": "application/json",
+          "x-request-id": "req-123",
+        },
+      }),
+    );
+
+    const config = makeConfig(mock.url);
+    await proxyRequest(makeRequest("/v1/messages"), km, config, st);
+
+    const headers = st.listHeaders();
+    const headerNames = headers.map((h) => h.name);
+    expect(headerNames).toContain("content-type");
+    expect(headerNames).toContain("x-request-id");
+  });
+
+  test("non-streaming response body fields are tracked", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    const responseBody = {
+      id: "msg_abc123",
+      type: "message",
+      role: "assistant",
+      content: [{ type: "text", text: "Hello" }],
+      model: "claude-sonnet-4-20250514",
+      stop_reason: "end_turn",
+      usage: { input_tokens: 25, output_tokens: 10 },
+    };
+
+    const mock = upstream(() =>
+      new Response(JSON.stringify(responseBody), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+
+    const config = makeConfig(mock.url);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config, st);
+    expect(result.kind).toBe("success");
+
+    const fields = st.listFields();
+    const paths = fields.map((f) => f.path);
+    expect(paths).toContain("id");
+    expect(paths).toContain("type");
+    expect(paths).toContain("model");
+    expect(paths).toContain("stop_reason");
+    expect(paths).toContain("usage.input_tokens");
+    expect(paths).toContain("usage.output_tokens");
+    expect(paths).toContain("content[].type");
+    expect(paths).toContain("content[].text");
+
+    // Verify endpoint is set correctly
+    const idField = fields.find((f) => f.path === "id");
+    expect(idField!.endpoint).toBe("/v1/messages");
+    expect(idField!.context).toBe("response");
+  });
+
+  test("streaming SSE response body fields are tracked", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    const encoder = new TextEncoder();
+    function makeSSE(events: string[]): ReadableStream<Uint8Array> {
+      return new ReadableStream({
+        start(controller) {
+          for (const e of events) controller.enqueue(encoder.encode(e));
+          controller.close();
+        },
+      });
+    }
+
+    const sseData = [
+      'data: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":10}}}\n\n',
+      'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hi"}}\n\n',
+      'data: {"type":"message_delta","usage":{"output_tokens":5}}\n\n',
+      "data: [DONE]\n\n",
+    ];
+
+    const mock = upstream(() =>
+      new Response(makeSSE(sseData), {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }),
+    );
+
+    const config = makeConfig(mock.url);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config, st);
+    expect(result.kind).toBe("success");
+    if (result.kind === "success") {
+      // Must consume the stream to trigger schema tracking
+      await result.response.text();
+    }
+
+    const fields = st.listFields();
+    const contexts = [...new Set(fields.map((f) => f.context))];
+    // Should have fields from message_start, content_block_delta, message_delta
+    expect(contexts).toContain("message_start");
+    expect(contexts).toContain("content_block_delta");
+    expect(contexts).toContain("message_delta");
+
+    // Check specific fields from message_start
+    const messageStartFields = fields.filter((f) => f.context === "message_start");
+    const msPaths = messageStartFields.map((f) => f.path);
+    expect(msPaths).toContain("type");
+    expect(msPaths).toContain("message.id");
+    expect(msPaths).toContain("message.usage.input_tokens");
+  });
+
+  test("headers are tracked on error responses (4xx/5xx)", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    const mock = upstream(() =>
+      new Response(JSON.stringify({ type: "error", error: { type: "overloaded_error" } }), {
+        status: 529,
+        headers: {
+          "content-type": "application/json",
+          "x-error-id": "err-456",
+        },
+      }),
+    );
+
+    const config = makeConfig(mock.url);
+    await proxyRequest(makeRequest("/v1/messages"), km, config, st);
+
+    const headers = st.listHeaders();
+    const headerNames = headers.map((h) => h.name);
+    expect(headerNames).toContain("x-error-id");
+    expect(headerNames).toContain("content-type");
+  });
+
+  test("headers are tracked on 429 rate-limit responses", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    km.addKey(FAKE_KEY_B, "key-b");
+
+    let callCount = 0;
+    const mock = upstream(() => {
+      callCount++;
+      if (callCount === 1) {
+        return new Response("rate limited", {
+          status: 429,
+          headers: { "retry-after": "30", "x-ratelimit-header": "seen" },
+        });
+      }
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+
+    const config = makeConfig(mock.url);
+    await proxyRequest(makeRequest("/v1/messages"), km, config, st);
+
+    const headers = st.listHeaders();
+    const headerNames = headers.map((h) => h.name);
+    // Headers from the 429 response should be tracked
+    expect(headerNames).toContain("x-ratelimit-header");
+    expect(headerNames).toContain("retry-after");
+  });
+
+  test("body fields are NOT tracked on error responses", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    const mock = upstream(() =>
+      new Response(JSON.stringify({ type: "error", error: { type: "overloaded_error", message: "Server overloaded" } }), {
+        status: 529,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+
+    const config = makeConfig(mock.url);
+    await proxyRequest(makeRequest("/v1/messages"), km, config, st);
+
+    // Body fields from error responses should NOT be tracked
+    const fields = st.listFields();
+    expect(fields).toHaveLength(0);
   });
 });

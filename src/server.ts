@@ -4,6 +4,8 @@ import { KeyManager } from "./key-manager.ts";
 import { handleAdminRoute } from "./admin.ts";
 import { proxyRequest } from "./proxy.ts";
 import { log } from "./logger.ts";
+import { SchemaTracker } from "./schema-tracker.ts";
+import { WebhookNotifier } from "./webhook-notifier.ts";
 import { join } from "node:path";
 import { serviceInstall, serviceStatus, serviceUninstall } from "./service.ts";
 import { claudeConfigInstall, claudeConfigUninstall, claudeConfigStatus } from "./claude-config.ts";
@@ -66,6 +68,7 @@ Environment:
   DATA_DIR          Where to store the database (default: ./data)
   DB_PATH           Full path to SQLite database (overrides DATA_DIR; default: DATA_DIR/state.db)
   MAX_RETRIES       Max key rotation attempts per request (default: 10)
+  WEBHOOK_URL       Slack-compatible webhook URL for API schema change notifications (optional)
   LOG_LEVEL         debug | info | warn | error (default: info)`);
 } else {
   startServer();
@@ -73,7 +76,28 @@ Environment:
 
 function startServer(): void {
   const config = loadConfig();
-  const keyManager = new KeyManager(config.dataDir, { registerShutdownHandler: true });
+  const keyManager = new KeyManager(config.dataDir);
+  const webhookNotifier = config.webhookUrl ? new WebhookNotifier(config.webhookUrl) : null;
+  const schemaTracker = new SchemaTracker(keyManager.dbPath, webhookNotifier);
+
+  let shuttingDown = false;
+  const shutdown = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    if (webhookNotifier) {
+      try {
+        await Promise.race([
+          webhookNotifier.flush(),
+          new Promise((resolve) => setTimeout(resolve, 5_000)),
+        ]);
+      } catch {}
+    }
+    schemaTracker.close();
+    keyManager.close();
+    process.exit(0);
+  };
+  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", shutdown);
 
   const server = Bun.serve({
     port: config.port,
@@ -90,7 +114,7 @@ function startServer(): void {
         });
       }
 
-      const adminResponse = handleAdminRoute(req, keyManager, config);
+      const adminResponse = handleAdminRoute(req, keyManager, config, schemaTracker);
       if (adminResponse !== null) {
         return adminResponse;
       }
@@ -117,7 +141,7 @@ function startServer(): void {
         authorizationPrefix: incomingAuth?.slice(0, 30),
       });
 
-      const result = await proxyRequest(req, keyManager, config, proxyUser);
+      const result = await proxyRequest(req, keyManager, config, schemaTracker, proxyUser);
 
       switch (result.kind) {
         case "success":

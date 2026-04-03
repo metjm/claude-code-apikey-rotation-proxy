@@ -2,6 +2,7 @@ import type { KeyManager } from "./key-manager.ts";
 import type { ProxyConfig, ProxyResult, ProxyTokenEntry } from "./types.ts";
 import { log } from "./logger.ts";
 import { emitWithKeys } from "./events.ts";
+import type { SchemaTracker } from "./schema-tracker.ts";
 
 const RATE_LIMIT_STATUS = 429 as const;
 
@@ -42,6 +43,7 @@ export async function proxyRequest(
   req: Request,
   keyManager: KeyManager,
   config: ProxyConfig,
+  schemaTracker: SchemaTracker,
   proxyUser?: ProxyTokenEntry | null,
 ): Promise<ProxyResult> {
   if (keyManager.totalCount() === 0) {
@@ -127,6 +129,14 @@ export async function proxyRequest(
       user: proxyUser?.label, status: upstream.status,
     }, keyManager.listKeys());
 
+    const headerChanges = schemaTracker.recordHeaders(upstream.headers);
+    if (headerChanges.length > 0) {
+      emitWithKeys({
+        type: "schema_change", ts: new Date().toISOString(),
+        changes: headerChanges,
+      }, keyManager.listKeys());
+    }
+
     if (upstream.status === RATE_LIMIT_STATUS) {
       const retryAfter = parseRetryAfter(upstream.headers.get("retry-after"));
       keyManager.recordRateLimit(entry, retryAfter);
@@ -173,10 +183,17 @@ export async function proxyRequest(
     let body: ReadableStream<Uint8Array> | string | null;
 
     if (isStreaming && upstream.body !== null) {
-      body = createTokenTrackingStream(upstream.body, entry, keyManager, proxyUser);
+      body = createTokenTrackingStream(upstream.body, entry, keyManager, proxyUser, schemaTracker, url.pathname);
     } else if (upstream.body !== null) {
       const text = await upstream.text();
       extractTokensFromJson(text, entry, keyManager, proxyUser);
+      const bodyChanges = schemaTracker.recordResponseJson(url.pathname, text);
+      if (bodyChanges.length > 0) {
+        emitWithKeys({
+          type: "schema_change", ts: new Date().toISOString(),
+          changes: bodyChanges,
+        }, keyManager.listKeys());
+      }
       body = text;
     } else {
       keyManager.recordSuccess(entry, 0, 0);
@@ -301,7 +318,9 @@ function createTokenTrackingStream(
   source: ReadableStream<Uint8Array>,
   entry: import("./types.ts").ApiKeyEntry,
   keyManager: KeyManager,
-  proxyUser?: ProxyTokenEntry | null,
+  proxyUser: ProxyTokenEntry | null | undefined,
+  schemaTracker: SchemaTracker,
+  endpoint: string,
 ): ReadableStream<Uint8Array> {
   const decoder = new TextDecoder();
   let buffer = "";
@@ -332,6 +351,14 @@ function createTokenTrackingStream(
           }
           if (event.type === "message_delta" && event.usage) {
             outputTokens += event.usage.output_tokens ?? 0;
+          }
+
+          const eventChanges = schemaTracker.recordStreamEvent(endpoint, event.type ?? "unknown", event);
+          if (eventChanges.length > 0) {
+            emitWithKeys({
+              type: "schema_change", ts: new Date().toISOString(),
+              changes: eventChanges,
+            }, keyManager.listKeys());
           }
         } catch {
           // Not valid JSON — skip

@@ -6,6 +6,7 @@ import { KeyManager } from "../src/key-manager.ts";
 import { handleAdminRoute } from "../src/admin.ts";
 import { proxyRequest } from "../src/proxy.ts";
 import type { ProxyConfig, ProxyTokenEntry } from "../src/types.ts";
+import { SchemaTracker } from "../src/schema-tracker.ts";
 
 // ── Test helpers ──────────────────────────────────────────────────
 
@@ -106,12 +107,14 @@ function startProxy(opts: {
   adminToken?: string | null;
 }): ProxyInstance {
   const km = new KeyManager(opts.dataDir);
+  const st = new SchemaTracker(km.dbPath, null);
   const config: ProxyConfig = {
     port: 0,
     upstream: opts.upstream,
     adminToken: opts.adminToken ?? null,
     dataDir: opts.dataDir,
     maxRetriesPerRequest: 10,
+    webhookUrl: null,
   };
 
   const server = Bun.serve({
@@ -127,7 +130,7 @@ function startProxy(opts: {
       }
 
       // Admin routes
-      const adminResponse = handleAdminRoute(req, km, config);
+      const adminResponse = handleAdminRoute(req, km, config, st);
       if (adminResponse !== null) return adminResponse;
 
       // Auth gate
@@ -163,7 +166,7 @@ function startProxy(opts: {
         }
       }
 
-      const result = await proxyRequest(req, km, config, proxyUser);
+      const result = await proxyRequest(req, km, config, st, proxyUser);
 
       switch (result.kind) {
         case "success":
@@ -229,7 +232,7 @@ function startProxy(opts: {
     port: server.port,
     km,
     config,
-    stop: () => server.stop(true),
+    stop: () => { server.stop(true); st.close(); km.close(); },
   };
 }
 
@@ -2663,6 +2666,110 @@ describe("Add Key/Token Response Format", () => {
     expect(res.status).toBe(400);
     const body = await res.json();
     expect(body.error).toContain("label");
+
+    p.stop();
+    up.stop();
+    cleanupTempDir(dir);
+  });
+});
+
+// ── Schema Tracking End-to-End ─────────────────────────────────
+
+describe("Schema Tracking End-to-End", () => {
+  test("proxy request populates GET /admin/schema with tracked headers and fields", async () => {
+    const dir = makeTempDir();
+
+    // Mock upstream returns a realistic Claude API response
+    const up = startMockUpstream(() =>
+      new Response(
+        JSON.stringify({
+          id: "msg_e2e",
+          type: "message",
+          role: "assistant",
+          content: [{ type: "text", text: "Hello" }],
+          model: "claude-sonnet-4-20250514",
+          stop_reason: "end_turn",
+          usage: { input_tokens: 50, output_tokens: 20 },
+        }),
+        {
+          status: 200,
+          headers: {
+            "content-type": "application/json",
+            "x-request-id": "e2e-req-id",
+            "anthropic-organization-id": "org-123",
+          },
+        },
+      ),
+    );
+
+    const p = startProxy({ dataDir: dir, upstream: up.url });
+
+    // 1. Add a key
+    await fetch(`${p.url}/admin/keys`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ key: FAKE_KEY_1, label: "e2e-key" }),
+    });
+
+    // 2. Make a proxied request
+    const proxyRes = await fetch(`${p.url}/v1/messages`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": "doesnt-matter",
+      },
+      body: JSON.stringify({ model: "claude-sonnet-4-20250514", messages: [{ role: "user", content: "Hi" }] }),
+    });
+    expect(proxyRes.status).toBe(200);
+    // Consume the body to ensure tracking completes
+    await proxyRes.json();
+
+    // 3. GET /admin/schema and verify tracked data
+    const schemaRes = await fetch(`${p.url}/admin/schema`);
+    expect(schemaRes.status).toBe(200);
+    const schema = (await schemaRes.json()) as {
+      headers: { name: string; sampleValues: string[]; hitCount: number }[];
+      fields: { endpoint: string; context: string; path: string; jsonTypes: string[] }[];
+    };
+
+    // Verify headers were tracked
+    const headerNames = schema.headers.map((h) => h.name);
+    expect(headerNames).toContain("content-type");
+    expect(headerNames).toContain("x-request-id");
+    expect(headerNames).toContain("anthropic-organization-id");
+
+    // Verify response body fields were tracked
+    expect(schema.fields.length).toBeGreaterThan(0);
+    const fieldPaths = schema.fields.map((f) => f.path);
+    expect(fieldPaths).toContain("id");
+    expect(fieldPaths).toContain("type");
+    expect(fieldPaths).toContain("model");
+    expect(fieldPaths).toContain("stop_reason");
+    expect(fieldPaths).toContain("usage.input_tokens");
+    expect(fieldPaths).toContain("usage.output_tokens");
+    expect(fieldPaths).toContain("content[].type");
+
+    // Verify fields are associated with the correct endpoint
+    const idField = schema.fields.find((f) => f.path === "id");
+    expect(idField!.endpoint).toBe("/v1/messages");
+    expect(idField!.context).toBe("response");
+    expect(idField!.jsonTypes).toContain("string");
+
+    p.stop();
+    up.stop();
+    cleanupTempDir(dir);
+  });
+
+  test("GET /admin/schema returns empty arrays with no prior requests", async () => {
+    const dir = makeTempDir();
+    const up = startMockUpstream(jsonOkHandler());
+    const p = startProxy({ dataDir: dir, upstream: up.url });
+
+    const res = await fetch(`${p.url}/admin/schema`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { headers: unknown[]; fields: unknown[] };
+    expect(body.headers).toEqual([]);
+    expect(body.fields).toEqual([]);
 
     p.stop();
     up.stop();

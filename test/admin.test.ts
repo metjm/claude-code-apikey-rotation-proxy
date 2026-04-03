@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { handleAdminRoute } from "../src/admin.ts";
 import { KeyManager } from "../src/key-manager.ts";
+import { SchemaTracker } from "../src/schema-tracker.ts";
 import type { ProxyConfig } from "../src/types.ts";
 
 // ── Helpers ───────────────────────────────────────────────────────
@@ -50,6 +51,7 @@ function makeConfig(overrides?: Partial<ProxyConfig>): ProxyConfig {
     adminToken: null,
     dataDir: "/tmp",
     maxRetriesPerRequest: 3,
+    webhookUrl: null,
     ...overrides,
   };
 }
@@ -62,13 +64,17 @@ function makeTempDir(): string {
 
 let tempDir: string;
 let km: KeyManager;
+let st: SchemaTracker;
 
 beforeEach(() => {
   tempDir = makeTempDir();
-  km = new KeyManager(tempDir, { registerShutdownHandler: false });
+  km = new KeyManager(tempDir);
+  st = new SchemaTracker(km.dbPath, null);
 });
 
 afterEach(() => {
+  try { st.close(); } catch {}
+  try { km.close(); } catch {}
   try {
     rmSync(tempDir, { recursive: true, force: true });
   } catch {}
@@ -83,31 +89,31 @@ describe("Route Dispatch", () => {
 
   test("returns null for non-admin path /v1/messages", () => {
     const req = makeReq("GET", "/v1/messages");
-    const result = handleAdminRoute(req, km, config);
+    const result = handleAdminRoute(req, km, config, st);
     expect(result).toBeNull();
   });
 
   test("returns null for root path /", () => {
     const req = makeReq("GET", "/");
-    const result = handleAdminRoute(req, km, config);
+    const result = handleAdminRoute(req, km, config, st);
     expect(result).toBeNull();
   });
 
   test("returns null for non-admin path /health", () => {
     const req = makeReq("GET", "/health");
-    const result = handleAdminRoute(req, km, config);
+    const result = handleAdminRoute(req, km, config, st);
     expect(result).toBeNull();
   });
 
   test("returns null for path that starts with /admin but not /admin/", () => {
     const req = makeReq("GET", "/administrator");
-    const result = handleAdminRoute(req, km, config);
+    const result = handleAdminRoute(req, km, config, st);
     expect(result).toBeNull();
   });
 
   test("routes GET /admin/keys", async () => {
     const req = makeReq("GET", "/admin/keys");
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res).not.toBeNull();
     expect(res!.status).toBe(200);
     const body = await jsonBody(res!);
@@ -116,14 +122,14 @@ describe("Route Dispatch", () => {
 
   test("routes POST /admin/keys", async () => {
     const req = makeReq("POST", "/admin/keys", { key: VALID_KEY });
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res).not.toBeNull();
     expect(res!.status).toBe(201);
   });
 
   test("routes POST /admin/keys/remove", async () => {
     const req = makeReq("POST", "/admin/keys/remove", { key: "nonexistent" });
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res).not.toBeNull();
     // Returns 404 because the key does not exist, but route was matched
     expect(res!.status).toBe(404);
@@ -131,7 +137,7 @@ describe("Route Dispatch", () => {
 
   test("routes GET /admin/tokens", async () => {
     const req = makeReq("GET", "/admin/tokens");
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res).not.toBeNull();
     expect(res!.status).toBe(200);
     const body = await jsonBody(res!);
@@ -140,7 +146,7 @@ describe("Route Dispatch", () => {
 
   test("routes POST /admin/tokens", async () => {
     const req = makeReq("POST", "/admin/tokens", { token: VALID_TOKEN });
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res).not.toBeNull();
     expect(res!.status).toBe(201);
   });
@@ -149,14 +155,14 @@ describe("Route Dispatch", () => {
     const req = makeReq("POST", "/admin/tokens/remove", {
       token: "nonexistent",
     });
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res).not.toBeNull();
     expect(res!.status).toBe(404);
   });
 
   test("routes GET /admin/stats", async () => {
     const req = makeReq("GET", "/admin/stats");
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res).not.toBeNull();
     expect(res!.status).toBe(200);
     const body = await jsonBody(res!);
@@ -165,7 +171,7 @@ describe("Route Dispatch", () => {
 
   test("routes GET /admin/health", async () => {
     const req = makeReq("GET", "/admin/health");
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res).not.toBeNull();
     expect(res!.status).toBe(200);
     const body = await jsonBody(res!);
@@ -178,7 +184,7 @@ describe("Route Dispatch", () => {
       method: "GET",
       signal: controller.signal,
     });
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res).not.toBeNull();
     expect(res!.status).toBe(200);
     expect(res!.headers.get("content-type")).toBe("text/event-stream");
@@ -187,7 +193,7 @@ describe("Route Dispatch", () => {
 
   test("returns 404 for unknown admin path /admin/unknown", async () => {
     const req = makeReq("GET", "/admin/unknown");
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res).not.toBeNull();
     expect(res!.status).toBe(404);
     const body = await jsonBody(res!);
@@ -196,14 +202,14 @@ describe("Route Dispatch", () => {
 
   test("returns 404 for /admin/keys/foo", async () => {
     const req = makeReq("GET", "/admin/keys/foo");
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res).not.toBeNull();
     expect(res!.status).toBe(404);
   });
 
   test("returns 405 for DELETE /admin/keys", async () => {
     const req = makeReq("DELETE", "/admin/keys");
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res).not.toBeNull();
     expect(res!.status).toBe(405);
     const body = await jsonBody(res!);
@@ -212,42 +218,42 @@ describe("Route Dispatch", () => {
 
   test("returns 405 for PUT /admin/keys", async () => {
     const req = makeReq("PUT", "/admin/keys");
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res).not.toBeNull();
     expect(res!.status).toBe(405);
   });
 
   test("returns 405 for PATCH /admin/stats", async () => {
     const req = makeReq("PATCH", "/admin/stats");
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res).not.toBeNull();
     expect(res!.status).toBe(405);
   });
 
   test("returns 405 for POST /admin/health", async () => {
     const req = makeReq("POST", "/admin/health");
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res).not.toBeNull();
     expect(res!.status).toBe(405);
   });
 
   test("returns 405 for DELETE /admin/tokens", async () => {
     const req = makeReq("DELETE", "/admin/tokens");
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res).not.toBeNull();
     expect(res!.status).toBe(405);
   });
 
   test("returns 405 for GET /admin/keys/remove", async () => {
     const req = makeReq("GET", "/admin/keys/remove");
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res).not.toBeNull();
     expect(res!.status).toBe(405);
   });
 
   test("returns 405 for GET /admin/tokens/remove", async () => {
     const req = makeReq("GET", "/admin/tokens/remove");
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res).not.toBeNull();
     expect(res!.status).toBe(405);
   });
@@ -262,7 +268,7 @@ describe("Admin Auth", () => {
 
   test("returns 401 without token when ADMIN_TOKEN is set", async () => {
     const req = makeReq("GET", "/admin/keys");
-    const res = await handleAdminRoute(req, km, authedConfig);
+    const res = await handleAdminRoute(req, km, authedConfig, st);
     expect(res).not.toBeNull();
     expect(res!.status).toBe(401);
     const body = await jsonBody(res!);
@@ -273,7 +279,7 @@ describe("Admin Auth", () => {
     const req = makeReq("GET", "/admin/keys", undefined, {
       authorization: "Bearer wrong-token",
     });
-    const res = await handleAdminRoute(req, km, authedConfig);
+    const res = await handleAdminRoute(req, km, authedConfig, st);
     expect(res).not.toBeNull();
     expect(res!.status).toBe(401);
   });
@@ -282,42 +288,42 @@ describe("Admin Auth", () => {
     const req = makeReq("GET", "/admin/keys", undefined, {
       authorization: ADMIN_SECRET,
     });
-    const res = await handleAdminRoute(req, km, authedConfig);
+    const res = await handleAdminRoute(req, km, authedConfig, st);
     expect(res).not.toBeNull();
     expect(res!.status).toBe(401);
   });
 
   test("returns 401 for POST /admin/keys without auth", async () => {
     const req = makeReq("POST", "/admin/keys", { key: VALID_KEY });
-    const res = await handleAdminRoute(req, km, authedConfig);
+    const res = await handleAdminRoute(req, km, authedConfig, st);
     expect(res).not.toBeNull();
     expect(res!.status).toBe(401);
   });
 
   test("returns 401 for POST /admin/keys/remove without auth", async () => {
     const req = makeReq("POST", "/admin/keys/remove", { key: VALID_KEY });
-    const res = await handleAdminRoute(req, km, authedConfig);
+    const res = await handleAdminRoute(req, km, authedConfig, st);
     expect(res).not.toBeNull();
     expect(res!.status).toBe(401);
   });
 
   test("returns 401 for GET /admin/stats without auth", async () => {
     const req = makeReq("GET", "/admin/stats");
-    const res = await handleAdminRoute(req, km, authedConfig);
+    const res = await handleAdminRoute(req, km, authedConfig, st);
     expect(res).not.toBeNull();
     expect(res!.status).toBe(401);
   });
 
   test("returns 401 for GET /admin/tokens without auth", async () => {
     const req = makeReq("GET", "/admin/tokens");
-    const res = await handleAdminRoute(req, km, authedConfig);
+    const res = await handleAdminRoute(req, km, authedConfig, st);
     expect(res).not.toBeNull();
     expect(res!.status).toBe(401);
   });
 
   test("returns 401 for POST /admin/tokens without auth", async () => {
     const req = makeReq("POST", "/admin/tokens", { token: VALID_TOKEN });
-    const res = await handleAdminRoute(req, km, authedConfig);
+    const res = await handleAdminRoute(req, km, authedConfig, st);
     expect(res).not.toBeNull();
     expect(res!.status).toBe(401);
   });
@@ -326,28 +332,28 @@ describe("Admin Auth", () => {
     const req = makeReq("POST", "/admin/tokens/remove", {
       token: VALID_TOKEN,
     });
-    const res = await handleAdminRoute(req, km, authedConfig);
+    const res = await handleAdminRoute(req, km, authedConfig, st);
     expect(res).not.toBeNull();
     expect(res!.status).toBe(401);
   });
 
   test("accepts correct Bearer token", async () => {
     const req = makeAuthedReq("GET", "/admin/keys");
-    const res = await handleAdminRoute(req, km, authedConfig);
+    const res = await handleAdminRoute(req, km, authedConfig, st);
     expect(res).not.toBeNull();
     expect(res!.status).toBe(200);
   });
 
   test("accepts correct Bearer token for POST", async () => {
     const req = makeAuthedReq("POST", "/admin/keys", { key: VALID_KEY });
-    const res = await handleAdminRoute(req, km, authedConfig);
+    const res = await handleAdminRoute(req, km, authedConfig, st);
     expect(res).not.toBeNull();
     expect(res!.status).toBe(201);
   });
 
   test("skips auth for /admin/health even when ADMIN_TOKEN set", async () => {
     const req = makeReq("GET", "/admin/health");
-    const res = await handleAdminRoute(req, km, authedConfig);
+    const res = await handleAdminRoute(req, km, authedConfig, st);
     expect(res).not.toBeNull();
     expect(res!.status).toBe(200);
     const body = await jsonBody(res!);
@@ -360,7 +366,7 @@ describe("Admin Auth", () => {
       method: "GET",
       signal: controller.signal,
     });
-    const res = await handleAdminRoute(req, km, authedConfig);
+    const res = await handleAdminRoute(req, km, authedConfig, st);
     expect(res).not.toBeNull();
     expect(res!.status).toBe(200);
     expect(res!.headers.get("content-type")).toBe("text/event-stream");
@@ -370,7 +376,7 @@ describe("Admin Auth", () => {
   test("skips auth entirely when adminToken is null", async () => {
     const noAuthConfig = makeConfig({ adminToken: null });
     const req = makeReq("GET", "/admin/keys");
-    const res = await handleAdminRoute(req, km, noAuthConfig);
+    const res = await handleAdminRoute(req, km, noAuthConfig, st);
     expect(res).not.toBeNull();
     expect(res!.status).toBe(200);
   });
@@ -378,7 +384,7 @@ describe("Admin Auth", () => {
   test("auth check happens before 404/405 for protected paths", async () => {
     // Even a wrong method on a valid path should still return 401 first
     const req = makeReq("DELETE", "/admin/keys");
-    const res = await handleAdminRoute(req, km, authedConfig);
+    const res = await handleAdminRoute(req, km, authedConfig, st);
     expect(res).not.toBeNull();
     // Auth is checked before method dispatch, so we get 401
     expect(res!.status).toBe(401);
@@ -394,7 +400,7 @@ describe("GET /admin/keys", () => {
 
   test("returns 200 with empty keys array", async () => {
     const req = makeReq("GET", "/admin/keys");
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res!.status).toBe(200);
     expect(res!.headers.get("content-type")).toBe("application/json");
     const body = (await jsonBody(res!)) as { keys: unknown[] };
@@ -405,7 +411,7 @@ describe("GET /admin/keys", () => {
     km.addKey(VALID_KEY, "my-key");
 
     const req = makeReq("GET", "/admin/keys");
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res!.status).toBe(200);
     const body = (await jsonBody(res!)) as { keys: Record<string, unknown>[] };
     expect(body.keys).toHaveLength(1);
@@ -421,7 +427,7 @@ describe("GET /admin/keys", () => {
     km.addKey(VALID_KEY);
 
     const req = makeReq("GET", "/admin/keys");
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     const body = (await jsonBody(res!)) as { keys: Record<string, unknown>[] };
     const k = body.keys[0]!;
     const stats = k["stats"] as Record<string, unknown>;
@@ -448,7 +454,7 @@ describe("GET /admin/keys", () => {
     km.addKey(VALID_KEY);
 
     const req = makeReq("GET", "/admin/keys");
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     const body = (await jsonBody(res!)) as { keys: Record<string, unknown>[] };
     const k = body.keys[0]!;
 
@@ -463,7 +469,7 @@ describe("GET /admin/keys", () => {
     km.addKey(VALID_KEY_2, "second-key");
 
     const req = makeReq("GET", "/admin/keys");
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     const body = (await jsonBody(res!)) as { keys: Record<string, unknown>[] };
     expect(body.keys).toHaveLength(2);
     const labels = body.keys.map((k) => k["label"]);
@@ -481,7 +487,7 @@ describe("POST /admin/keys", () => {
 
   test("returns 201 with added key info", async () => {
     const req = makeReq("POST", "/admin/keys", { key: VALID_KEY });
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res!.status).toBe(201);
     expect(res!.headers.get("content-type")).toBe("application/json");
     const body = (await jsonBody(res!)) as {
@@ -500,7 +506,7 @@ describe("POST /admin/keys", () => {
       key: VALID_KEY,
       label: "production-key",
     });
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res!.status).toBe(201);
     const body = (await jsonBody(res!)) as {
       added: { label: string; maskedKey: string };
@@ -510,7 +516,7 @@ describe("POST /admin/keys", () => {
 
   test("returns 400 for missing key field", async () => {
     const req = makeReq("POST", "/admin/keys", { label: "no-key" });
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res!.status).toBe(400);
     const body = (await jsonBody(res!)) as { error: string };
     expect(body.error).toContain("Missing or empty 'key' field");
@@ -518,7 +524,7 @@ describe("POST /admin/keys", () => {
 
   test("returns 400 for empty key string", async () => {
     const req = makeReq("POST", "/admin/keys", { key: "" });
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res!.status).toBe(400);
     const body = (await jsonBody(res!)) as { error: string };
     expect(body.error).toContain("Missing or empty 'key' field");
@@ -526,7 +532,7 @@ describe("POST /admin/keys", () => {
 
   test("returns 400 for non-string key (number)", async () => {
     const req = makeReq("POST", "/admin/keys", { key: 12345 });
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res!.status).toBe(400);
     const body = (await jsonBody(res!)) as { error: string };
     expect(body.error).toContain("Missing or empty 'key' field");
@@ -534,13 +540,13 @@ describe("POST /admin/keys", () => {
 
   test("returns 400 for non-string key (null)", async () => {
     const req = makeReq("POST", "/admin/keys", { key: null });
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res!.status).toBe(400);
   });
 
   test("returns 400 for non-string key (boolean)", async () => {
     const req = makeReq("POST", "/admin/keys", { key: true });
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res!.status).toBe(400);
   });
 
@@ -549,7 +555,7 @@ describe("POST /admin/keys", () => {
       key: VALID_KEY,
       label: 12345,
     });
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res!.status).toBe(400);
     const body = (await jsonBody(res!)) as { error: string };
     expect(body.error).toContain("'label' must be a string");
@@ -560,7 +566,7 @@ describe("POST /admin/keys", () => {
       key: VALID_KEY,
       label: false,
     });
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res!.status).toBe(400);
     const body = (await jsonBody(res!)) as { error: string };
     expect(body.error).toContain("'label' must be a string");
@@ -568,7 +574,7 @@ describe("POST /admin/keys", () => {
 
   test("returns 400 for invalid key format (not sk-ant-*)", async () => {
     const req = makeReq("POST", "/admin/keys", { key: "invalid-api-key" });
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res!.status).toBe(400);
     const body = (await jsonBody(res!)) as { error: string };
     expect(body.error).toContain("sk-ant-");
@@ -578,7 +584,7 @@ describe("POST /admin/keys", () => {
     km.addKey(VALID_KEY, "first");
 
     const req = makeReq("POST", "/admin/keys", { key: VALID_KEY });
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res!.status).toBe(400);
     const body = (await jsonBody(res!)) as { error: string };
     expect(body.error).toContain("already registered");
@@ -590,7 +596,7 @@ describe("POST /admin/keys", () => {
       headers: { "content-type": "application/json" },
       body: "not json at all {{{",
     });
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res!.status).toBe(400);
     const body = (await jsonBody(res!)) as { error: string };
     expect(body.error).toContain("Invalid JSON body");
@@ -598,11 +604,11 @@ describe("POST /admin/keys", () => {
 
   test("key is actually stored after adding", async () => {
     const req = makeReq("POST", "/admin/keys", { key: VALID_KEY });
-    await handleAdminRoute(req, km, config);
+    await handleAdminRoute(req, km, config, st);
 
     // Verify via list
     const listReq = makeReq("GET", "/admin/keys");
-    const listRes = await handleAdminRoute(listReq, km, config);
+    const listRes = await handleAdminRoute(listReq, km, config, st);
     const body = (await jsonBody(listRes!)) as {
       keys: Record<string, unknown>[];
     };
@@ -612,7 +618,7 @@ describe("POST /admin/keys", () => {
   test("second key gets default label key-2", async () => {
     km.addKey(VALID_KEY);
     const req = makeReq("POST", "/admin/keys", { key: VALID_KEY_2 });
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res!.status).toBe(201);
     const body = (await jsonBody(res!)) as {
       added: { label: string; maskedKey: string };
@@ -632,7 +638,7 @@ describe("POST /admin/keys/remove", () => {
     km.addKey(VALID_KEY, "to-remove");
 
     const req = makeReq("POST", "/admin/keys/remove", { key: VALID_KEY });
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res!.status).toBe(200);
     const body = await jsonBody(res!);
     expect(body).toEqual({ removed: true });
@@ -643,10 +649,10 @@ describe("POST /admin/keys/remove", () => {
     const removeReq = makeReq("POST", "/admin/keys/remove", {
       key: VALID_KEY,
     });
-    await handleAdminRoute(removeReq, km, config);
+    await handleAdminRoute(removeReq, km, config, st);
 
     const listReq = makeReq("GET", "/admin/keys");
-    const listRes = await handleAdminRoute(listReq, km, config);
+    const listRes = await handleAdminRoute(listReq, km, config, st);
     const body = (await jsonBody(listRes!)) as {
       keys: unknown[];
     };
@@ -657,7 +663,7 @@ describe("POST /admin/keys/remove", () => {
     const req = makeReq("POST", "/admin/keys/remove", {
       key: "sk-ant-api03-nonexistent-key",
     });
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res!.status).toBe(404);
     const body = (await jsonBody(res!)) as { error: string };
     expect(body.error).toContain("Key not found");
@@ -665,7 +671,7 @@ describe("POST /admin/keys/remove", () => {
 
   test("returns 400 for missing key field", async () => {
     const req = makeReq("POST", "/admin/keys/remove", { notKey: "value" });
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res!.status).toBe(400);
     const body = (await jsonBody(res!)) as { error: string };
     expect(body.error).toContain("'key'");
@@ -673,7 +679,7 @@ describe("POST /admin/keys/remove", () => {
 
   test("returns 400 for non-string key field", async () => {
     const req = makeReq("POST", "/admin/keys/remove", { key: 12345 });
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res!.status).toBe(400);
   });
 
@@ -683,7 +689,7 @@ describe("POST /admin/keys/remove", () => {
       headers: { "content-type": "application/json" },
       body: "{{broken json",
     });
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res!.status).toBe(400);
     const body = (await jsonBody(res!)) as { error: string };
     expect(body.error).toContain("Invalid JSON body");
@@ -695,7 +701,7 @@ describe("POST /admin/keys/remove", () => {
       headers: { "content-type": "application/json" },
       body: "",
     });
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res!.status).toBe(400);
   });
 });
@@ -709,7 +715,7 @@ describe("GET /admin/tokens", () => {
 
   test("returns 200 with empty tokens array", async () => {
     const req = makeReq("GET", "/admin/tokens");
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res!.status).toBe(200);
     expect(res!.headers.get("content-type")).toBe("application/json");
     const body = (await jsonBody(res!)) as { tokens: unknown[] };
@@ -720,7 +726,7 @@ describe("GET /admin/tokens", () => {
     km.addToken(VALID_TOKEN, "alice");
 
     const req = makeReq("GET", "/admin/tokens");
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res!.status).toBe(200);
     const body = (await jsonBody(res!)) as {
       tokens: Record<string, unknown>[];
@@ -740,7 +746,7 @@ describe("GET /admin/tokens", () => {
     km.addToken(VALID_TOKEN);
 
     const req = makeReq("GET", "/admin/tokens");
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     const body = (await jsonBody(res!)) as {
       tokens: Record<string, unknown>[];
     };
@@ -768,7 +774,7 @@ describe("GET /admin/tokens", () => {
     km.addToken(VALID_TOKEN_2, "bob");
 
     const req = makeReq("GET", "/admin/tokens");
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     const body = (await jsonBody(res!)) as {
       tokens: Record<string, unknown>[];
     };
@@ -788,7 +794,7 @@ describe("POST /admin/tokens", () => {
 
   test("returns 201 with added token info", async () => {
     const req = makeReq("POST", "/admin/tokens", { token: VALID_TOKEN });
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res!.status).toBe(201);
     expect(res!.headers.get("content-type")).toBe("application/json");
     const body = (await jsonBody(res!)) as { added: { label: string } };
@@ -801,7 +807,7 @@ describe("POST /admin/tokens", () => {
       token: VALID_TOKEN,
       label: "alice-token",
     });
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res!.status).toBe(201);
     const body = (await jsonBody(res!)) as { added: { label: string } };
     expect(body.added.label).toBe("alice-token");
@@ -809,7 +815,7 @@ describe("POST /admin/tokens", () => {
 
   test("returns 400 for missing token field", async () => {
     const req = makeReq("POST", "/admin/tokens", { label: "no-token" });
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res!.status).toBe(400);
     const body = (await jsonBody(res!)) as { error: string };
     expect(body.error).toContain("Missing or empty 'token' field");
@@ -817,7 +823,7 @@ describe("POST /admin/tokens", () => {
 
   test("returns 400 for empty token string", async () => {
     const req = makeReq("POST", "/admin/tokens", { token: "" });
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res!.status).toBe(400);
     const body = (await jsonBody(res!)) as { error: string };
     expect(body.error).toContain("Missing or empty 'token' field");
@@ -825,7 +831,7 @@ describe("POST /admin/tokens", () => {
 
   test("returns 400 for non-string token (number)", async () => {
     const req = makeReq("POST", "/admin/tokens", { token: 99999 });
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res!.status).toBe(400);
     const body = (await jsonBody(res!)) as { error: string };
     expect(body.error).toContain("Missing or empty 'token' field");
@@ -833,7 +839,7 @@ describe("POST /admin/tokens", () => {
 
   test("returns 400 for non-string token (null)", async () => {
     const req = makeReq("POST", "/admin/tokens", { token: null });
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res!.status).toBe(400);
   });
 
@@ -842,7 +848,7 @@ describe("POST /admin/tokens", () => {
       token: VALID_TOKEN,
       label: 12345,
     });
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res!.status).toBe(400);
     const body = (await jsonBody(res!)) as { error: string };
     expect(body.error).toContain("'label' must be a string");
@@ -853,7 +859,7 @@ describe("POST /admin/tokens", () => {
       token: VALID_TOKEN,
       label: { name: "bad" },
     });
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res!.status).toBe(400);
     const body = (await jsonBody(res!)) as { error: string };
     expect(body.error).toContain("'label' must be a string");
@@ -861,7 +867,7 @@ describe("POST /admin/tokens", () => {
 
   test("returns 400 for token too short (< 8 chars)", async () => {
     const req = makeReq("POST", "/admin/tokens", { token: "short" });
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res!.status).toBe(400);
     const body = (await jsonBody(res!)) as { error: string };
     expect(body.error).toContain("at least 8 characters");
@@ -869,13 +875,13 @@ describe("POST /admin/tokens", () => {
 
   test("returns 400 for token exactly 7 chars", async () => {
     const req = makeReq("POST", "/admin/tokens", { token: "1234567" });
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res!.status).toBe(400);
   });
 
   test("accepts token exactly 8 chars", async () => {
     const req = makeReq("POST", "/admin/tokens", { token: "12345678" });
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res!.status).toBe(201);
   });
 
@@ -883,7 +889,7 @@ describe("POST /admin/tokens", () => {
     km.addToken(VALID_TOKEN, "first");
 
     const req = makeReq("POST", "/admin/tokens", { token: VALID_TOKEN });
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res!.status).toBe(400);
     const body = (await jsonBody(res!)) as { error: string };
     expect(body.error).toContain("already registered");
@@ -895,7 +901,7 @@ describe("POST /admin/tokens", () => {
       headers: { "content-type": "application/json" },
       body: "{{{not json",
     });
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res!.status).toBe(400);
     const body = (await jsonBody(res!)) as { error: string };
     expect(body.error).toContain("Invalid JSON body");
@@ -903,10 +909,10 @@ describe("POST /admin/tokens", () => {
 
   test("token is actually stored after adding", async () => {
     const addReq = makeReq("POST", "/admin/tokens", { token: VALID_TOKEN });
-    await handleAdminRoute(addReq, km, config);
+    await handleAdminRoute(addReq, km, config, st);
 
     const listReq = makeReq("GET", "/admin/tokens");
-    const listRes = await handleAdminRoute(listReq, km, config);
+    const listRes = await handleAdminRoute(listReq, km, config, st);
     const body = (await jsonBody(listRes!)) as {
       tokens: Record<string, unknown>[];
     };
@@ -916,7 +922,7 @@ describe("POST /admin/tokens", () => {
   test("second token gets default label user-2", async () => {
     km.addToken(VALID_TOKEN);
     const req = makeReq("POST", "/admin/tokens", { token: VALID_TOKEN_2 });
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res!.status).toBe(201);
     const body = (await jsonBody(res!)) as { added: { label: string } };
     expect(body.added.label).toBe("user-2");
@@ -936,7 +942,7 @@ describe("POST /admin/tokens/remove", () => {
     const req = makeReq("POST", "/admin/tokens/remove", {
       token: VALID_TOKEN,
     });
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res!.status).toBe(200);
     const body = await jsonBody(res!);
     expect(body).toEqual({ removed: true });
@@ -947,10 +953,10 @@ describe("POST /admin/tokens/remove", () => {
     const removeReq = makeReq("POST", "/admin/tokens/remove", {
       token: VALID_TOKEN,
     });
-    await handleAdminRoute(removeReq, km, config);
+    await handleAdminRoute(removeReq, km, config, st);
 
     const listReq = makeReq("GET", "/admin/tokens");
-    const listRes = await handleAdminRoute(listReq, km, config);
+    const listRes = await handleAdminRoute(listReq, km, config, st);
     const body = (await jsonBody(listRes!)) as { tokens: unknown[] };
     expect(body.tokens).toHaveLength(0);
   });
@@ -959,7 +965,7 @@ describe("POST /admin/tokens/remove", () => {
     const req = makeReq("POST", "/admin/tokens/remove", {
       token: "nonexistent-token-value",
     });
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res!.status).toBe(404);
     const body = (await jsonBody(res!)) as { error: string };
     expect(body.error).toContain("Token not found");
@@ -969,7 +975,7 @@ describe("POST /admin/tokens/remove", () => {
     const req = makeReq("POST", "/admin/tokens/remove", {
       notToken: "value",
     });
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res!.status).toBe(400);
     const body = (await jsonBody(res!)) as { error: string };
     expect(body.error).toContain("'token'");
@@ -977,7 +983,7 @@ describe("POST /admin/tokens/remove", () => {
 
   test("returns 400 for non-string token field", async () => {
     const req = makeReq("POST", "/admin/tokens/remove", { token: 12345 });
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res!.status).toBe(400);
   });
 
@@ -987,7 +993,7 @@ describe("POST /admin/tokens/remove", () => {
       headers: { "content-type": "application/json" },
       body: "{{broken json",
     });
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res!.status).toBe(400);
     const body = (await jsonBody(res!)) as { error: string };
     expect(body.error).toContain("Invalid JSON body");
@@ -999,7 +1005,7 @@ describe("POST /admin/tokens/remove", () => {
       headers: { "content-type": "application/json" },
       body: "",
     });
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res!.status).toBe(400);
   });
 });
@@ -1013,7 +1019,7 @@ describe("POST /admin/keys/update", () => {
 
   test("returns 200 and updates label", async () => {
     km.addKey("sk-ant-api03-key-to-rename-0000", "old-name");
-    const res = await handleAdminRoute(makeReq("POST", "/admin/keys/update", { key: "sk-ant-api03-key-to-rename-0000", label: "new-name" }), km, config)!;
+    const res = await handleAdminRoute(makeReq("POST", "/admin/keys/update", { key: "sk-ant-api03-key-to-rename-0000", label: "new-name" }), km, config, st)!;
     expect(res!.status).toBe(200);
     const body = await res!.json();
     expect(body.updated).toBe(true);
@@ -1024,40 +1030,40 @@ describe("POST /admin/keys/update", () => {
   });
 
   test("returns 404 for unknown key", async () => {
-    const res = await handleAdminRoute(makeReq("POST", "/admin/keys/update", { key: "sk-ant-api03-nonexistent-999", label: "x" }), km, config)!;
+    const res = await handleAdminRoute(makeReq("POST", "/admin/keys/update", { key: "sk-ant-api03-nonexistent-999", label: "x" }), km, config, st)!;
     expect(res!.status).toBe(404);
   });
 
   test("returns 400 for missing key field", async () => {
-    const res = await handleAdminRoute(makeReq("POST", "/admin/keys/update", { label: "x" }), km, config)!;
+    const res = await handleAdminRoute(makeReq("POST", "/admin/keys/update", { label: "x" }), km, config, st)!;
     expect(res!.status).toBe(400);
   });
 
   test("returns 400 when neither label nor priority is provided", async () => {
-    const res = await handleAdminRoute(makeReq("POST", "/admin/keys/update", { key: "sk-ant-api03-x" }), km, config)!;
+    const res = await handleAdminRoute(makeReq("POST", "/admin/keys/update", { key: "sk-ant-api03-x" }), km, config, st)!;
     expect(res!.status).toBe(400);
   });
 
   test("returns 400 for empty label", async () => {
     km.addKey("sk-ant-api03-empty-label-test-0", "something");
-    const res = await handleAdminRoute(makeReq("POST", "/admin/keys/update", { key: "sk-ant-api03-empty-label-test-0", label: "" }), km, config)!;
+    const res = await handleAdminRoute(makeReq("POST", "/admin/keys/update", { key: "sk-ant-api03-empty-label-test-0", label: "" }), km, config, st)!;
     expect(res!.status).toBe(400);
   });
 
   test("returns 400 for non-string label", async () => {
-    const res = await handleAdminRoute(makeReq("POST", "/admin/keys/update", { key: "sk-ant-api03-x", label: 123 }), km, config)!;
+    const res = await handleAdminRoute(makeReq("POST", "/admin/keys/update", { key: "sk-ant-api03-x", label: 123 }), km, config, st)!;
     expect(res!.status).toBe(400);
   });
 
   test("returns 400 for invalid JSON", async () => {
     const req = new Request("http://localhost/admin/keys/update", { method: "POST", body: "not json", headers: { "content-type": "application/json" } });
-    const res = await handleAdminRoute(req, km, config)!;
+    const res = await handleAdminRoute(req, km, config, st)!;
     expect(res!.status).toBe(400);
   });
 
   test("updates priority via full key", async () => {
     km.addKey("sk-ant-api03-priority-test-0000", "pri-test");
-    const res = await handleAdminRoute(makeReq("POST", "/admin/keys/update", { key: "sk-ant-api03-priority-test-0000", priority: 1 }), km, config)!;
+    const res = await handleAdminRoute(makeReq("POST", "/admin/keys/update", { key: "sk-ant-api03-priority-test-0000", priority: 1 }), km, config, st)!;
     expect(res!.status).toBe(200);
     const body = await res!.json();
     expect(body.updated).toBe(true);
@@ -1068,19 +1074,19 @@ describe("POST /admin/keys/update", () => {
   test("updates priority via masked key", async () => {
     km.addKey("sk-ant-api03-masked-priority-test", "masked-pri");
     const masked = km.listKeys().find(k => k.label === "masked-pri")!.maskedKey;
-    const res = await handleAdminRoute(makeReq("POST", "/admin/keys/update", { maskedKey: masked, priority: 3 }), km, config)!;
+    const res = await handleAdminRoute(makeReq("POST", "/admin/keys/update", { maskedKey: masked, priority: 3 }), km, config, st)!;
     expect(res!.status).toBe(200);
     expect(km.listKeys().find(k => k.label === "masked-pri")!.priority).toBe(3);
   });
 
   test("returns 400 for invalid priority value", async () => {
-    const res = await handleAdminRoute(makeReq("POST", "/admin/keys/update", { key: "sk-ant-api03-x", priority: 5 }), km, config)!;
+    const res = await handleAdminRoute(makeReq("POST", "/admin/keys/update", { key: "sk-ant-api03-x", priority: 5 }), km, config, st)!;
     expect(res!.status).toBe(400);
   });
 
   test("updates both label and priority together", async () => {
     km.addKey("sk-ant-api03-both-update-test-00", "old");
-    const res = await handleAdminRoute(makeReq("POST", "/admin/keys/update", { key: "sk-ant-api03-both-update-test-00", label: "new", priority: 1 }), km, config)!;
+    const res = await handleAdminRoute(makeReq("POST", "/admin/keys/update", { key: "sk-ant-api03-both-update-test-00", label: "new", priority: 1 }), km, config, st)!;
     expect(res!.status).toBe(200);
     const entry = km.listKeys().find(k => k.label === "new");
     expect(entry).toBeDefined();
@@ -1090,7 +1096,7 @@ describe("POST /admin/keys/update", () => {
   test("label update works via masked key", async () => {
     km.addKey("sk-ant-api03-label-needs-key-000", "lbl");
     const masked = km.listKeys().find(k => k.label === "lbl")!.maskedKey;
-    const res = await handleAdminRoute(makeReq("POST", "/admin/keys/update", { maskedKey: masked, label: "new-lbl" }), km, config)!;
+    const res = await handleAdminRoute(makeReq("POST", "/admin/keys/update", { maskedKey: masked, label: "new-lbl" }), km, config, st)!;
     expect(res!.status).toBe(200);
     expect(km.listKeys().find(k => k.label === "new-lbl")).toBeDefined();
   });
@@ -1104,7 +1110,7 @@ describe("POST /admin/tokens/update", () => {
 
   test("returns 200 and updates label", async () => {
     km.addToken("old-token-rename-test", "old-name");
-    const res = await handleAdminRoute(makeReq("POST", "/admin/tokens/update", { token: "old-token-rename-test", label: "alice@co.com" }), km, config)!;
+    const res = await handleAdminRoute(makeReq("POST", "/admin/tokens/update", { token: "old-token-rename-test", label: "alice@co.com" }), km, config, st)!;
     expect(res!.status).toBe(200);
     const body = await res!.json();
     expect(body.updated).toBe(true);
@@ -1114,28 +1120,28 @@ describe("POST /admin/tokens/update", () => {
   });
 
   test("returns 404 for unknown token", async () => {
-    const res = await handleAdminRoute(makeReq("POST", "/admin/tokens/update", { token: "nonexistent-token-value", label: "x" }), km, config)!;
+    const res = await handleAdminRoute(makeReq("POST", "/admin/tokens/update", { token: "nonexistent-token-value", label: "x" }), km, config, st)!;
     expect(res!.status).toBe(404);
   });
 
   test("returns 400 for missing token field", async () => {
-    const res = await handleAdminRoute(makeReq("POST", "/admin/tokens/update", { label: "x" }), km, config)!;
+    const res = await handleAdminRoute(makeReq("POST", "/admin/tokens/update", { label: "x" }), km, config, st)!;
     expect(res!.status).toBe(400);
   });
 
   test("returns 400 for missing label field", async () => {
-    const res = await handleAdminRoute(makeReq("POST", "/admin/tokens/update", { token: "something" }), km, config)!;
+    const res = await handleAdminRoute(makeReq("POST", "/admin/tokens/update", { token: "something" }), km, config, st)!;
     expect(res!.status).toBe(400);
   });
 
   test("returns 400 for empty label", async () => {
     km.addToken("empty-label-token-test", "something");
-    const res = await handleAdminRoute(makeReq("POST", "/admin/tokens/update", { token: "empty-label-token-test", label: "" }), km, config)!;
+    const res = await handleAdminRoute(makeReq("POST", "/admin/tokens/update", { token: "empty-label-token-test", label: "" }), km, config, st)!;
     expect(res!.status).toBe(400);
   });
 
   test("returns 400 for non-string label", async () => {
-    const res = await handleAdminRoute(makeReq("POST", "/admin/tokens/update", { token: "x", label: 42 }), km, config)!;
+    const res = await handleAdminRoute(makeReq("POST", "/admin/tokens/update", { token: "x", label: 42 }), km, config, st)!;
     expect(res!.status).toBe(400);
   });
 });
@@ -1148,7 +1154,7 @@ describe("GET /admin/stats", () => {
 
   test("returns 200 with aggregated stats structure", async () => {
     const req = makeReq("GET", "/admin/stats");
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res!.status).toBe(200);
     expect(res!.headers.get("content-type")).toBe("application/json");
     const body = (await jsonBody(res!)) as Record<string, unknown>;
@@ -1160,7 +1166,7 @@ describe("GET /admin/stats", () => {
 
   test("returns zeros when no keys", async () => {
     const req = makeReq("GET", "/admin/stats");
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     const body = (await jsonBody(res!)) as {
       keyCount: number;
       availableKeys: number;
@@ -1184,7 +1190,7 @@ describe("GET /admin/stats", () => {
     km.addKey(VALID_KEY_2);
 
     const req = makeReq("GET", "/admin/stats");
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     const body = (await jsonBody(res!)) as { keyCount: number };
     expect(body.keyCount).toBe(2);
   });
@@ -1194,7 +1200,7 @@ describe("GET /admin/stats", () => {
     km.addKey(VALID_KEY_2);
 
     const req = makeReq("GET", "/admin/stats");
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     const body = (await jsonBody(res!)) as { availableKeys: number };
     expect(body.availableKeys).toBe(2);
   });
@@ -1207,7 +1213,7 @@ describe("GET /admin/stats", () => {
     km.recordRateLimit(entry1, 60);
 
     const req = makeReq("GET", "/admin/stats");
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     const body = (await jsonBody(res!)) as { availableKeys: number; keyCount: number };
     expect(body.keyCount).toBe(2);
     expect(body.availableKeys).toBe(1);
@@ -1222,7 +1228,7 @@ describe("GET /admin/stats", () => {
     km.recordRequest(entry2);
 
     const req = makeReq("GET", "/admin/stats");
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     const body = (await jsonBody(res!)) as {
       totals: Record<string, number>;
     };
@@ -1237,7 +1243,7 @@ describe("GET /admin/stats", () => {
     km.recordSuccess(entry2, 50, 75);
 
     const req = makeReq("GET", "/admin/stats");
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     const body = (await jsonBody(res!)) as {
       totals: Record<string, number>;
     };
@@ -1253,7 +1259,7 @@ describe("GET /admin/stats", () => {
     km.recordRateLimit(entry2, 60);
 
     const req = makeReq("GET", "/admin/stats");
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     const body = (await jsonBody(res!)) as {
       totals: Record<string, number>;
     };
@@ -1271,7 +1277,7 @@ describe("GET /admin/stats", () => {
     km.recordError(entry2);
 
     const req = makeReq("GET", "/admin/stats");
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     const body = (await jsonBody(res!)) as {
       totals: Record<string, number>;
     };
@@ -1287,7 +1293,7 @@ describe("GET /admin/stats", () => {
     km.recordSuccess(entry2, 300, 0);
 
     const req = makeReq("GET", "/admin/stats");
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     const body = (await jsonBody(res!)) as {
       totals: Record<string, number>;
     };
@@ -1302,7 +1308,7 @@ describe("GET /admin/stats", () => {
     km.recordSuccess(entry2, 0, 750);
 
     const req = makeReq("GET", "/admin/stats");
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     const body = (await jsonBody(res!)) as {
       totals: Record<string, number>;
     };
@@ -1313,7 +1319,7 @@ describe("GET /admin/stats", () => {
     km.addKey(VALID_KEY, "stats-key");
 
     const req = makeReq("GET", "/admin/stats");
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     const body = (await jsonBody(res!)) as {
       keys: Record<string, unknown>[];
     };
@@ -1336,7 +1342,7 @@ describe("GET /admin/stats", () => {
     km.recordRateLimit(entry2, 30);
 
     const req = makeReq("GET", "/admin/stats");
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     const body = (await jsonBody(res!)) as {
       keyCount: number;
       totals: Record<string, number>;
@@ -1361,7 +1367,7 @@ describe("GET /admin/health", () => {
 
   test("returns status no_keys when empty", async () => {
     const req = makeReq("GET", "/admin/health");
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res!.status).toBe(200);
     expect(res!.headers.get("content-type")).toBe("application/json");
     const body = (await jsonBody(res!)) as {
@@ -1377,7 +1383,7 @@ describe("GET /admin/health", () => {
     km.addKey(VALID_KEY);
 
     const req = makeReq("GET", "/admin/health");
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     const body = (await jsonBody(res!)) as {
       status: string;
       keys: { total: number; available: number };
@@ -1390,7 +1396,7 @@ describe("GET /admin/health", () => {
     km.addKey(VALID_KEY_2);
 
     const req = makeReq("GET", "/admin/health");
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     const body = (await jsonBody(res!)) as {
       status: string;
       keys: { total: number; available: number };
@@ -1405,7 +1411,7 @@ describe("GET /admin/health", () => {
     km.recordRateLimit(entry, 60);
 
     const req = makeReq("GET", "/admin/health");
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     const body = (await jsonBody(res!)) as {
       status: string;
       keys: { total: number; available: number };
@@ -1420,7 +1426,7 @@ describe("GET /admin/health", () => {
     km.recordRateLimit(entry, 300);
 
     const req = makeReq("GET", "/admin/health");
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     const body = (await jsonBody(res!)) as { status: string };
     expect(body.status).toBe("ok");
   });
@@ -1430,7 +1436,7 @@ describe("GET /admin/health", () => {
     km.recordRateLimit(entry, 300);
 
     const req = makeReq("GET", "/admin/health");
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     const body = (await jsonBody(res!)) as {
       status: string;
       keys: { total: number; available: number };
@@ -1455,7 +1461,7 @@ describe("GET /admin/events", () => {
       method: "GET",
       signal: controller.signal,
     });
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res).not.toBeNull();
     expect(res!.status).toBe(200);
     expect(res!.headers.get("content-type")).toBe("text/event-stream");
@@ -1472,7 +1478,7 @@ describe("GET /admin/events", () => {
       method: "GET",
       signal: controller.signal,
     });
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res).not.toBeNull();
 
     const reader = res!.body!.getReader();
@@ -1514,7 +1520,7 @@ describe("GET /admin/events", () => {
       method: "GET",
       signal: controller.signal,
     });
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
 
     const reader = res!.body!.getReader();
 
@@ -1540,7 +1546,7 @@ describe("GET /admin/events", () => {
       method: "GET",
       signal: controller.signal,
     });
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
 
     const reader = res!.body!.getReader();
 
@@ -1563,7 +1569,7 @@ describe("GET /admin/events", () => {
       method: "GET",
       signal: controller.signal,
     });
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
 
     const reader = res!.body!.getReader();
 
@@ -1600,33 +1606,33 @@ describe("Response format", () => {
 
     for (const [method, path] of endpoints) {
       const req = makeReq(method, path);
-      const res = await handleAdminRoute(req, km, config);
+      const res = await handleAdminRoute(req, km, config, st);
       expect(res!.headers.get("content-type")).toBe("application/json");
     }
   });
 
   test("error responses have application/json content-type", async () => {
     const req = makeReq("GET", "/admin/unknown");
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res!.headers.get("content-type")).toBe("application/json");
   });
 
   test("401 responses have application/json content-type", async () => {
     const authedConfig = makeConfig({ adminToken: ADMIN_SECRET });
     const req = makeReq("GET", "/admin/keys");
-    const res = await handleAdminRoute(req, km, authedConfig);
+    const res = await handleAdminRoute(req, km, authedConfig, st);
     expect(res!.headers.get("content-type")).toBe("application/json");
   });
 
   test("405 responses have application/json content-type", async () => {
     const req = makeReq("DELETE", "/admin/keys");
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     expect(res!.headers.get("content-type")).toBe("application/json");
   });
 
   test("JSON responses are pretty-printed (indented)", async () => {
     const req = makeReq("GET", "/admin/health");
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     const text = await res!.text();
     // JSON.stringify with null, 2 produces indented output
     expect(text).toContain("\n");
@@ -1647,7 +1653,7 @@ describe("Cross-cutting scenarios", () => {
     km.removeKey(VALID_KEY);
 
     const req = makeReq("GET", "/admin/tokens");
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     const body = (await jsonBody(res!)) as {
       tokens: Record<string, unknown>[];
     };
@@ -1661,7 +1667,7 @@ describe("Cross-cutting scenarios", () => {
     km.removeToken(VALID_TOKEN);
 
     const req = makeReq("GET", "/admin/keys");
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     const body = (await jsonBody(res!)) as {
       keys: Record<string, unknown>[];
     };
@@ -1674,7 +1680,7 @@ describe("Cross-cutting scenarios", () => {
     km.addToken(VALID_TOKEN);
 
     const req = makeReq("GET", "/admin/stats");
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     const body = (await jsonBody(res!)) as { keyCount: number };
     // keyCount counts only API keys
     expect(body.keyCount).toBe(1);
@@ -1685,7 +1691,7 @@ describe("Cross-cutting scenarios", () => {
     km.addToken(VALID_TOKEN);
 
     const req = makeReq("GET", "/admin/health");
-    const res = await handleAdminRoute(req, km, config);
+    const res = await handleAdminRoute(req, km, config, st);
     const body = (await jsonBody(res!)) as {
       keys: { total: number; available: number };
     };
@@ -1695,7 +1701,7 @@ describe("Cross-cutting scenarios", () => {
 
   test("full CRUD workflow for keys via admin routes", async () => {
     // 1. List (empty)
-    let res = await handleAdminRoute(makeReq("GET", "/admin/keys"), km, config);
+    let res = await handleAdminRoute(makeReq("GET", "/admin/keys"), km, config, st);
     let body = (await jsonBody(res!)) as { keys: unknown[] };
     expect(body.keys).toHaveLength(0);
 
@@ -1704,11 +1710,12 @@ describe("Cross-cutting scenarios", () => {
       makeReq("POST", "/admin/keys", { key: VALID_KEY, label: "test" }),
       km,
       config,
+      st,
     );
     expect(res!.status).toBe(201);
 
     // 3. List (one key)
-    res = await handleAdminRoute(makeReq("GET", "/admin/keys"), km, config);
+    res = await handleAdminRoute(makeReq("GET", "/admin/keys"), km, config, st);
     body = (await jsonBody(res!)) as { keys: unknown[] };
     expect(body.keys).toHaveLength(1);
 
@@ -1717,11 +1724,12 @@ describe("Cross-cutting scenarios", () => {
       makeReq("POST", "/admin/keys/remove", { key: VALID_KEY }),
       km,
       config,
+      st,
     );
     expect(res!.status).toBe(200);
 
     // 5. List (empty again)
-    res = await handleAdminRoute(makeReq("GET", "/admin/keys"), km, config);
+    res = await handleAdminRoute(makeReq("GET", "/admin/keys"), km, config, st);
     body = (await jsonBody(res!)) as { keys: unknown[] };
     expect(body.keys).toHaveLength(0);
   });
@@ -1732,6 +1740,7 @@ describe("Cross-cutting scenarios", () => {
       makeReq("GET", "/admin/tokens"),
       km,
       config,
+      st,
     );
     let body = (await jsonBody(res!)) as { tokens: unknown[] };
     expect(body.tokens).toHaveLength(0);
@@ -1744,6 +1753,7 @@ describe("Cross-cutting scenarios", () => {
       }),
       km,
       config,
+      st,
     );
     expect(res!.status).toBe(201);
 
@@ -1752,6 +1762,7 @@ describe("Cross-cutting scenarios", () => {
       makeReq("GET", "/admin/tokens"),
       km,
       config,
+      st,
     );
     body = (await jsonBody(res!)) as { tokens: unknown[] };
     expect(body.tokens).toHaveLength(1);
@@ -1761,6 +1772,7 @@ describe("Cross-cutting scenarios", () => {
       makeReq("POST", "/admin/tokens/remove", { token: VALID_TOKEN }),
       km,
       config,
+      st,
     );
     expect(res!.status).toBe(200);
 
@@ -1769,8 +1781,105 @@ describe("Cross-cutting scenarios", () => {
       makeReq("GET", "/admin/tokens"),
       km,
       config,
+      st,
     );
     body = (await jsonBody(res!)) as { tokens: unknown[] };
     expect(body.tokens).toHaveLength(0);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// Schema Admin Endpoints
+// ═══════════════════════════════════════════════════════════════════
+
+describe("POST /admin/schema/webhooks/test (no webhook)", () => {
+  const config = makeConfig();
+
+  test("returns 422 with sent:false when no webhook URL configured", async () => {
+    const req = makeReq("POST", "/admin/schema/webhooks/test");
+    const res = await handleAdminRoute(req, km, config, st);
+    expect(res).not.toBeNull();
+    expect(res!.status).toBe(422);
+    const body = await jsonBody(res!);
+    expect(body).toEqual({ sent: false, error: "No webhook URL configured" });
+  });
+});
+
+describe("Schema endpoints require authentication", () => {
+  const authedConfig = makeConfig({ adminToken: ADMIN_SECRET });
+
+  test("GET /admin/schema returns 401 without bearer token", async () => {
+    const req = makeReq("GET", "/admin/schema");
+    const res = await handleAdminRoute(req, km, authedConfig, st);
+    expect(res).not.toBeNull();
+    expect(res!.status).toBe(401);
+    const body = await jsonBody(res!);
+    expect(body).toEqual({ error: "Unauthorized" });
+  });
+
+  test("POST /admin/schema/webhooks/test returns 401 without bearer token", async () => {
+    const req = makeReq("POST", "/admin/schema/webhooks/test");
+    const res = await handleAdminRoute(req, km, authedConfig, st);
+    expect(res).not.toBeNull();
+    expect(res!.status).toBe(401);
+    const body = await jsonBody(res!);
+    expect(body).toEqual({ error: "Unauthorized" });
+  });
+
+  test("GET /admin/schema returns 200 with valid bearer token", async () => {
+    const req = makeAuthedReq("GET", "/admin/schema");
+    const res = await handleAdminRoute(req, km, authedConfig, st);
+    expect(res).not.toBeNull();
+    expect(res!.status).toBe(200);
+    const body = (await jsonBody(res!)) as { headers: unknown[]; fields: unknown[] };
+    expect(body).toHaveProperty("headers");
+    expect(body).toHaveProperty("fields");
+  });
+
+  test("POST /admin/schema/webhooks/test returns 422 with valid bearer token (no webhook)", async () => {
+    const req = makeAuthedReq("POST", "/admin/schema/webhooks/test");
+    const res = await handleAdminRoute(req, km, authedConfig, st);
+    expect(res).not.toBeNull();
+    expect(res!.status).toBe(422);
+    const body = await jsonBody(res!);
+    expect(body).toEqual({ sent: false, error: "No webhook URL configured" });
+  });
+});
+
+describe("GET /admin/schema returns recorded data", () => {
+  const config = makeConfig();
+
+  test("returns headers and fields after recording schema data", async () => {
+    // Record some schema data directly
+    st.recordHeaders(new Headers({ "x-test-header": "test-value", "content-type": "application/json" }));
+    st.recordResponseJson("/v1/messages", JSON.stringify({ id: "msg_1", type: "message" }));
+
+    const req = makeReq("GET", "/admin/schema");
+    const res = await handleAdminRoute(req, km, config, st);
+    expect(res).not.toBeNull();
+    expect(res!.status).toBe(200);
+
+    const body = (await jsonBody(res!)) as {
+      headers: { name: string; sampleValues: string[] }[];
+      fields: { endpoint: string; path: string; jsonTypes: string[] }[];
+    };
+
+    // Verify headers
+    expect(body.headers.length).toBeGreaterThanOrEqual(2);
+    const headerNames = body.headers.map((h) => h.name);
+    expect(headerNames).toContain("x-test-header");
+    expect(headerNames).toContain("content-type");
+
+    // Verify fields
+    expect(body.fields.length).toBeGreaterThanOrEqual(2);
+    const fieldPaths = body.fields.map((f) => f.path);
+    expect(fieldPaths).toContain("id");
+    expect(fieldPaths).toContain("type");
+
+    // Verify field structure
+    const idField = body.fields.find((f) => f.path === "id");
+    expect(idField).toBeDefined();
+    expect(idField!.endpoint).toBe("/v1/messages");
+    expect(idField!.jsonTypes).toContain("string");
   });
 });

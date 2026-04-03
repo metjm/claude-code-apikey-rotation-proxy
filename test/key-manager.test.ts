@@ -50,11 +50,9 @@ afterEach(() => {
   }
 });
 
-/** Create a KeyManager that never installs process signal handlers. */
+/** Create a KeyManager for testing. */
 function create(dataDir?: string): KeyManager {
-  return new KeyManager(dataDir ?? tempDir, {
-    registerShutdownHandler: false,
-  });
+  return new KeyManager(dataDir ?? tempDir);
 }
 
 /** Build a legacy state.json payload for migration tests. */
@@ -1013,5 +1011,20 @@ describe("Persistence", () => {
     expect(keys.length).toBe(1);
     expect(keys[0]!.availableAt).toBe(savedAvailableAt);
     expect(keys[0]!.isAvailable).toBe(false);
+  });
+});
+
+// ── close() ────────────────────────────────────────────────────────────────────
+
+describe("close()", () => {
+  test("flushes data and persists across close/reopen", () => {
+    const km1 = create();
+    km1.addKey(VALID_KEY_1, "close-test");
+    km1.close();
+
+    const km2 = create();
+    const keys = km2.listKeys();
+    expect(keys).toHaveLength(1);
+    expect(keys[0]!.label).toBe("close-test");
   });
 });

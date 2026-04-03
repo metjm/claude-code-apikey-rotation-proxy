@@ -2,6 +2,7 @@ import type { KeyManager } from "./key-manager.ts";
 import type { ProxyConfig, AddKeyRequest, AddTokenRequest } from "./types.ts";
 import { log } from "./logger.ts";
 import { subscribe, type ProxyEvent } from "./events.ts";
+import type { SchemaTracker } from "./schema-tracker.ts";
 
 type RouteHandler = (
   req: Request,
@@ -64,6 +65,7 @@ export function handleAdminRoute(
   req: Request,
   keyManager: KeyManager,
   config: ProxyConfig,
+  schemaTracker: SchemaTracker,
 ): Response | Promise<Response> | null {
   const url = new URL(req.url);
 
@@ -75,6 +77,16 @@ export function handleAdminRoute(
     if (bearer !== `Bearer ${config.adminToken}`) {
       return json({ error: "Unauthorized" }, 401);
     }
+  }
+
+  // Schema-specific routes (after auth, before generic dispatch)
+  if (url.pathname === "/admin/schema" && req.method === "GET") {
+    return json({ headers: schemaTracker.listHeaders(), fields: schemaTracker.listFields() });
+  }
+  if (url.pathname === "/admin/schema/webhooks/test" && req.method === "POST") {
+    const sent = schemaTracker.sendTestNotification();
+    if (!sent) return json({ sent: false, error: "No webhook URL configured" }, 422);
+    return json({ sent: true });
   }
 
   const methodHandlers = routes.get(url.pathname);

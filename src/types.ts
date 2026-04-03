@@ -162,6 +162,7 @@ export interface ProxyConfig {
   readonly adminToken: string | null;
   readonly dataDir: string;
   readonly maxRetriesPerRequest: number;
+  readonly webhookUrl: string | null;
 }
 
 // ── Timeseries statistics ────────────────────────────────────────
