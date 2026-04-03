@@ -156,8 +156,11 @@ export class SchemaTracker {
   }
 
   private enqueueToAll(changes: SchemaChange[]): void {
+    // Only notify webhooks for header-related changes
+    const headerChanges = changes.filter((c) => c.type === "new_header" || c.type === "new_header_value");
+    if (headerChanges.length === 0) return;
     for (const notifier of this.notifiers.values()) {
-      notifier.enqueue(changes);
+      notifier.enqueue(headerChanges);
     }
   }
 

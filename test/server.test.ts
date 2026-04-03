@@ -2831,7 +2831,9 @@ describe("Schema Tracking End-to-End", () => {
 
       expect(webhookPayloads.length).toBeGreaterThanOrEqual(1);
       const allChanges = webhookPayloads.flatMap((p) => p.changes) as { type: string }[];
-      expect(allChanges.some((c) => c.type === "new_header" || c.type === "new_field")).toBe(true);
+      // Only header changes should be delivered to webhooks (not body field changes)
+      expect(allChanges.some((c) => c.type === "new_header")).toBe(true);
+      expect(allChanges.every((c) => c.type === "new_header" || c.type === "new_header_value")).toBe(true);
     } finally {
       p.stop();
       up.stop();

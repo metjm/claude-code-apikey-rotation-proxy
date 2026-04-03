@@ -354,15 +354,11 @@ describe("SchemaTracker → WebhookNotifier wiring", () => {
     }
   });
 
-  test("recording new body fields fires a webhook with field changes", async () => {
-    const received: { text: string; changes: unknown[] }[] = [];
+  test("recording new body fields does NOT fire a webhook", async () => {
+    const received: unknown[] = [];
     const webhookServer = Bun.serve({
       port: 0,
-      async fetch(req) {
-        const body = (await req.json()) as { text: string; changes: unknown[] };
-        received.push(body);
-        return new Response("ok");
-      },
+      async fetch(req) { received.push(await req.json()); return new Response("ok"); },
     });
 
     try {
@@ -371,11 +367,8 @@ describe("SchemaTracker → WebhookNotifier wiring", () => {
       st.recordResponseJson("/v1/messages", JSON.stringify({ id: "msg_1", type: "message" }));
       await st.flushAllWebhooks();
 
-      expect(received).toHaveLength(1);
-      const changes = received[0]!.changes as { type: string; path?: string }[];
-      expect(changes.length).toBeGreaterThanOrEqual(2);
-      expect(changes.some((c) => c.type === "new_field" && c.path === "id")).toBe(true);
-      expect(changes.some((c) => c.type === "new_field" && c.path === "type")).toBe(true);
+      // Body field changes should not trigger webhooks
+      expect(received).toHaveLength(0);
 
       st.close();
     } finally {
