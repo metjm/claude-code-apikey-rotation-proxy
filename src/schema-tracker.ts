@@ -6,6 +6,33 @@ const MAX_SAMPLE_VALUES = 50;
 const MAX_STRING_LENGTH_FOR_SAMPLE = 200;
 const MAX_FIELD_PATHS = 10_000;
 
+/** Headers whose new values should NOT trigger webhook notifications (high-cardinality / noisy). */
+const VALUE_NOTIFY_SUPPRESS_EXACT = new Set([
+  "anthropic-organization-id",
+  "cf-ray",
+  "content-length",
+  "date",
+  "request-id",
+  "retry-after",
+  "server-timing",
+  "set-cookie",
+  "x-envoy-upstream-service-time",
+]);
+const VALUE_NOTIFY_SUPPRESS_SUFFIXES = [
+  "-reset",
+  "-utilization",
+  "-surpassed-threshold",
+  "-percentage",
+];
+
+function shouldSuppressValueNotify(headerName: string): boolean {
+  if (VALUE_NOTIFY_SUPPRESS_EXACT.has(headerName)) return true;
+  for (const suffix of VALUE_NOTIFY_SUPPRESS_SUFFIXES) {
+    if (headerName.endsWith(suffix)) return true;
+  }
+  return false;
+}
+
 interface ObservedHeader {
   name: string;
   firstSeenAt: string;
@@ -156,8 +183,12 @@ export class SchemaTracker {
   }
 
   private enqueueToAll(changes: SchemaChange[]): void {
-    // Only notify webhooks for header-related changes
-    const headerChanges = changes.filter((c) => c.type === "new_header" || c.type === "new_header_value");
+    // Only notify webhooks for header-related changes, excluding noisy value changes
+    const headerChanges = changes.filter((c) => {
+      if (c.type === "new_header") return true;
+      if (c.type === "new_header_value") return !shouldSuppressValueNotify(c.name);
+      return false;
+    });
     if (headerChanges.length === 0) return;
     for (const notifier of this.notifiers.values()) {
       notifier.enqueue(headerChanges);

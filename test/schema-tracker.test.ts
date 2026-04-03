@@ -376,6 +376,60 @@ describe("SchemaTracker → WebhookNotifier wiring", () => {
     }
   });
 
+  test("suppressed headers still track values but do not fire value-change webhooks", async () => {
+    const received: { changes: { type: string; name: string }[] }[] = [];
+    const webhookServer = Bun.serve({
+      port: 0,
+      async fetch(req) { received.push((await req.json()) as { changes: { type: string; name: string }[] }); return new Response("ok"); },
+    });
+
+    try {
+      const st = createTracker(`http://localhost:${webhookServer.port}`);
+
+      // First call: new headers → webhook fires for all (new_header type)
+      st.recordHeaders(new Headers({
+        "date": "Fri, 03 Apr 2026 12:00:00 GMT",
+        "cf-ray": "abc123",
+        "x-custom": "val1",
+        "anthropic-ratelimit-unified-5h-utilization": "0.81",
+        "request-id": "req_001",
+        "server-timing": "x-originResponse;dur=3000",
+      }));
+      await st.flushAllWebhooks();
+      expect(received).toHaveLength(1);
+      // All 6 should fire as new_header
+      expect(received[0]!.changes).toHaveLength(6);
+
+      // Second call: new values for suppressed headers + new value for x-custom
+      st.recordHeaders(new Headers({
+        "date": "Fri, 03 Apr 2026 13:00:00 GMT",
+        "cf-ray": "def456",
+        "x-custom": "val2",
+        "anthropic-ratelimit-unified-5h-utilization": "0.95",
+        "request-id": "req_002",
+        "server-timing": "x-originResponse;dur=5000",
+      }));
+      await st.flushAllWebhooks();
+
+      // Only x-custom new value should fire — all others are suppressed
+      expect(received).toHaveLength(2);
+      expect(received[1]!.changes).toHaveLength(1);
+      expect(received[1]!.changes[0]!.type).toBe("new_header_value");
+      expect(received[1]!.changes[0]!.name).toBe("x-custom");
+
+      // But the suppressed headers still track the values
+      const headers = st.listHeaders();
+      const dateHeader = headers.find((h) => h.name === "date");
+      expect(dateHeader!.sampleValues).toContain("Fri, 03 Apr 2026 13:00:00 GMT");
+      const cfRay = headers.find((h) => h.name === "cf-ray");
+      expect(cfRay!.sampleValues).toContain("def456");
+
+      st.close();
+    } finally {
+      webhookServer.stop(true);
+    }
+  });
+
   test("no webhook fires when recording already-known data", async () => {
     const received: unknown[] = [];
     const webhookServer = Bun.serve({
