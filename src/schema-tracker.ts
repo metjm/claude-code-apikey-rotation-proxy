@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { log } from "./logger.ts";
-import type { WebhookNotifier } from "./webhook-notifier.ts";
+import { WebhookNotifier } from "./webhook-notifier.ts";
 
 const MAX_SAMPLE_VALUES = 50;
 const MAX_STRING_LENGTH_FOR_SAMPLE = 200;
@@ -48,6 +48,12 @@ interface FieldRow {
   hit_count: number;
 }
 
+interface WebhookRow {
+  url: string;
+  label: string;
+  created_at: string;
+}
+
 export type SchemaChange =
   | { readonly type: "new_header"; readonly name: string; readonly value: string }
   | { readonly type: "new_header_value"; readonly name: string; readonly value: string; readonly previousValues: readonly string[] }
@@ -57,20 +63,20 @@ export type SchemaChange =
 
 export class SchemaTracker {
   private readonly db: Database;
-  private readonly webhookNotifier: WebhookNotifier | null;
+  private readonly notifiers = new Map<string, WebhookNotifier>();
   private readonly headers = new Map<string, ObservedHeader>();
   private readonly fields = new Map<string, ObservedField>();
   private readonly dirtyHeaders = new Set<string>();
   private readonly dirtyFields = new Set<string>();
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
 
-  constructor(dbPath: string, webhookNotifier: WebhookNotifier | null) {
+  constructor(dbPath: string, seedWebhookUrl?: string | null) {
     this.db = new Database(dbPath, { create: true });
     this.db.exec("PRAGMA journal_mode = WAL");
     this.db.exec("PRAGMA busy_timeout = 5000");
-    this.webhookNotifier = webhookNotifier;
     this.initSchema();
     this.loadFromDb();
+    this.loadWebhooks(seedWebhookUrl ?? null);
   }
 
   private initSchema(): void {
@@ -94,6 +100,11 @@ export class SchemaTracker {
         value_overflow  INTEGER NOT NULL DEFAULT 0,
         hit_count       INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (endpoint, context, path)
+      );
+      CREATE TABLE IF NOT EXISTS webhooks (
+        url         TEXT PRIMARY KEY,
+        label       TEXT NOT NULL DEFAULT '',
+        created_at  TEXT NOT NULL
       );
     `);
   }
@@ -130,6 +141,30 @@ export class SchemaTracker {
     log("info", `Schema tracker loaded ${headerRows.length} header(s) and ${fieldRows.length} field(s)`);
   }
 
+  private loadWebhooks(seedUrl: string | null): void {
+    // Seed env-var webhook into DB if not already present
+    if (seedUrl) {
+      this.db.prepare(
+        "INSERT OR IGNORE INTO webhooks (url, label, created_at) VALUES (?, '', ?)",
+      ).run(seedUrl, new Date().toISOString());
+    }
+    const rows = this.db.query("SELECT * FROM webhooks").all() as WebhookRow[];
+    for (const r of rows) {
+      this.notifiers.set(r.url, new WebhookNotifier(r.url));
+    }
+    log("info", `Schema tracker loaded ${rows.length} webhook(s)`);
+  }
+
+  private enqueueToAll(changes: SchemaChange[]): void {
+    for (const notifier of this.notifiers.values()) {
+      notifier.enqueue(changes);
+    }
+  }
+
+  async flushAllWebhooks(): Promise<void> {
+    await Promise.all([...this.notifiers.values()].map((n) => n.flush()));
+  }
+
   recordHeaders(headers: Headers): SchemaChange[] {
     const changes: SchemaChange[] = [];
     const ts = new Date().toISOString();
@@ -160,7 +195,7 @@ export class SchemaTracker {
     }
 
     this.scheduleSave();
-    if (changes.length > 0) this.webhookNotifier?.enqueue(changes);
+    if (changes.length > 0) this.enqueueToAll(changes);
     return changes;
   }
 
@@ -230,7 +265,7 @@ export class SchemaTracker {
     });
 
     if (this.dirtyFields.size > 0) this.scheduleSave();
-    if (changes.length > 0) this.webhookNotifier?.enqueue(changes);
+    if (changes.length > 0) this.enqueueToAll(changes);
     return changes;
   }
 
@@ -253,13 +288,42 @@ export class SchemaTracker {
       }));
   }
 
-  sendTestNotification(): boolean {
-    if (!this.webhookNotifier) return false;
-    this.webhookNotifier.enqueue([{
+  listWebhooks(): { url: string; label: string; createdAt: string }[] {
+    return (this.db.query("SELECT * FROM webhooks ORDER BY created_at").all() as WebhookRow[])
+      .map((r) => ({ url: r.url, label: r.label, createdAt: r.created_at }));
+  }
+
+  addWebhook(url: string, label?: string): void {
+    const ts = new Date().toISOString();
+    this.db.prepare("INSERT INTO webhooks (url, label, created_at) VALUES (?, ?, ?)").run(url, label ?? "", ts);
+    this.notifiers.set(url, new WebhookNotifier(url));
+    log("info", "Webhook added", { url, label });
+  }
+
+  removeWebhook(url: string): void {
+    const notifier = this.notifiers.get(url);
+    if (notifier) {
+      notifier.flush().catch(() => {});
+      this.notifiers.delete(url);
+    }
+    this.db.prepare("DELETE FROM webhooks WHERE url = ?").run(url);
+    log("info", "Webhook removed", { url });
+  }
+
+  sendTestNotification(url?: string): boolean {
+    const testPayload: SchemaChange[] = [{
       type: "new_header",
       name: "x-test-notification",
       value: "This is a test notification from the API schema tracker",
-    }]);
+    }];
+    if (url) {
+      const notifier = this.notifiers.get(url);
+      if (!notifier) return false;
+      notifier.enqueue(testPayload);
+      return true;
+    }
+    if (this.notifiers.size === 0) return false;
+    this.enqueueToAll(testPayload);
     return true;
   }
 
@@ -314,6 +378,7 @@ export class SchemaTracker {
       this.saveTimer = null;
     }
     this.saveNow();
+    this.notifiers.clear();
     this.db.close();
   }
 }

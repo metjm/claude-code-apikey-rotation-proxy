@@ -107,7 +107,7 @@ function startProxy(opts: {
   adminToken?: string | null;
 }): ProxyInstance {
   const km = new KeyManager(opts.dataDir);
-  const st = new SchemaTracker(km.dbPath, null);
+  const st = new SchemaTracker(km.dbPath);
   const config: ProxyConfig = {
     port: 0,
     upstream: opts.upstream,
@@ -130,7 +130,7 @@ function startProxy(opts: {
       }
 
       // Admin routes
-      const adminResponse = handleAdminRoute(req, km, config, st);
+      const adminResponse = await handleAdminRoute(req, km, config, st);
       if (adminResponse !== null) return adminResponse;
 
       // Auth gate
@@ -2774,5 +2774,114 @@ describe("Schema Tracking End-to-End", () => {
     p.stop();
     up.stop();
     cleanupTempDir(dir);
+  });
+
+  test("proxy request delivers schema changes to dynamically-added webhook", async () => {
+    const dir = makeTempDir();
+
+    const webhookPayloads: { text: string; changes: unknown[] }[] = [];
+    const webhookServer = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        webhookPayloads.push((await req.json()) as { text: string; changes: unknown[] });
+        return new Response("ok");
+      },
+    });
+
+    const up = startMockUpstream(() =>
+      new Response(
+        JSON.stringify({
+          id: "msg_wh",
+          type: "message",
+          usage: { input_tokens: 10, output_tokens: 5 },
+        }),
+        { status: 200, headers: { "content-type": "application/json", "x-request-id": "wh-req-1" } },
+      ),
+    );
+
+    const p = startProxy({ dataDir: dir, upstream: up.url });
+
+    try {
+      // Add a key
+      await fetch(`${p.url}/admin/keys`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ key: FAKE_KEY_1, label: "wh-key" }),
+      });
+
+      // Add a webhook via admin API
+      const addRes = await fetch(`${p.url}/admin/schema/webhooks`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ url: `http://localhost:${webhookServer.port}`, label: "e2e-hook" }),
+      });
+      expect(addRes.status).toBe(200);
+
+      // Proxy a request — triggers schema changes and webhook delivery
+      const proxyRes = await fetch(`${p.url}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-api-key": "doesnt-matter" },
+        body: JSON.stringify({ model: "claude-sonnet-4-20250514", messages: [{ role: "user", content: "Hi" }] }),
+      });
+      expect(proxyRes.status).toBe(200);
+      await proxyRes.json();
+
+      // Wait for webhook batch window (default 5s) to expire and deliver
+      await new Promise((r) => setTimeout(r, 6_000));
+
+      expect(webhookPayloads.length).toBeGreaterThanOrEqual(1);
+      const allChanges = webhookPayloads.flatMap((p) => p.changes) as { type: string }[];
+      expect(allChanges.some((c) => c.type === "new_header" || c.type === "new_field")).toBe(true);
+    } finally {
+      p.stop();
+      up.stop();
+      webhookServer.stop(true);
+      cleanupTempDir(dir);
+    }
+  }, 15_000);
+
+  test("webhook CRUD lifecycle via admin API", async () => {
+    const dir = makeTempDir();
+    const up = startMockUpstream(jsonOkHandler());
+    const p = startProxy({ dataDir: dir, upstream: up.url });
+
+    try {
+      // Initially empty
+      const listRes1 = await fetch(`${p.url}/admin/schema/webhooks`);
+      const list1 = (await listRes1.json()) as { webhooks: unknown[] };
+      expect(list1.webhooks).toHaveLength(0);
+
+      // Add two webhooks
+      await fetch(`${p.url}/admin/schema/webhooks`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ url: "http://example.com/hook1", label: "first" }),
+      });
+      await fetch(`${p.url}/admin/schema/webhooks`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ url: "http://example.com/hook2", label: "second" }),
+      });
+
+      const listRes2 = await fetch(`${p.url}/admin/schema/webhooks`);
+      const list2 = (await listRes2.json()) as { webhooks: { url: string; label: string }[] };
+      expect(list2.webhooks).toHaveLength(2);
+
+      // Remove one
+      await fetch(`${p.url}/admin/schema/webhooks/remove`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ url: "http://example.com/hook1" }),
+      });
+
+      const listRes3 = await fetch(`${p.url}/admin/schema/webhooks`);
+      const list3 = (await listRes3.json()) as { webhooks: { url: string }[] };
+      expect(list3.webhooks).toHaveLength(1);
+      expect(list3.webhooks[0]!.url).toBe("http://example.com/hook2");
+    } finally {
+      p.stop();
+      up.stop();
+      cleanupTempDir(dir);
+    }
   });
 });

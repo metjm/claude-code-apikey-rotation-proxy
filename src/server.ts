@@ -5,7 +5,6 @@ import { handleAdminRoute } from "./admin.ts";
 import { proxyRequest } from "./proxy.ts";
 import { log } from "./logger.ts";
 import { SchemaTracker } from "./schema-tracker.ts";
-import { WebhookNotifier } from "./webhook-notifier.ts";
 import { join } from "node:path";
 import { serviceInstall, serviceStatus, serviceUninstall } from "./service.ts";
 import { claudeConfigInstall, claudeConfigUninstall, claudeConfigStatus } from "./claude-config.ts";
@@ -77,21 +76,18 @@ Environment:
 function startServer(): void {
   const config = loadConfig();
   const keyManager = new KeyManager(config.dataDir);
-  const webhookNotifier = config.webhookUrl ? new WebhookNotifier(config.webhookUrl) : null;
-  const schemaTracker = new SchemaTracker(keyManager.dbPath, webhookNotifier);
+  const schemaTracker = new SchemaTracker(keyManager.dbPath, config.webhookUrl);
 
   let shuttingDown = false;
   const shutdown = async () => {
     if (shuttingDown) return;
     shuttingDown = true;
-    if (webhookNotifier) {
-      try {
-        await Promise.race([
-          webhookNotifier.flush(),
-          new Promise((resolve) => setTimeout(resolve, 5_000)),
-        ]);
-      } catch {}
-    }
+    try {
+      await Promise.race([
+        schemaTracker.flushAllWebhooks(),
+        new Promise((resolve) => setTimeout(resolve, 5_000)),
+      ]);
+    } catch {}
     schemaTracker.close();
     keyManager.close();
     process.exit(0);
@@ -114,7 +110,7 @@ function startServer(): void {
         });
       }
 
-      const adminResponse = handleAdminRoute(req, keyManager, config, schemaTracker);
+      const adminResponse = await handleAdminRoute(req, keyManager, config, schemaTracker);
       if (adminResponse !== null) {
         return adminResponse;
       }

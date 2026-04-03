@@ -3,8 +3,6 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SchemaTracker } from "../src/schema-tracker.ts";
-import { WebhookNotifier } from "../src/webhook-notifier.ts";
-import type { Server } from "bun";
 
 // ── Helpers ───────────────────────────────────────────────────────
 
@@ -20,9 +18,9 @@ afterEach(() => {
   } catch {}
 });
 
-function createTracker(webhookNotifier?: WebhookNotifier | null): SchemaTracker {
+function createTracker(seedWebhookUrl?: string | null): SchemaTracker {
   const dbPath = join(tempDir, "test-state.db");
-  return new SchemaTracker(dbPath, webhookNotifier ?? null);
+  return new SchemaTracker(dbPath, seedWebhookUrl ?? undefined);
 }
 
 // ── Test 1: New header detection ─────────────────────────────────
@@ -273,8 +271,8 @@ describe("Persistence", () => {
 // ── Test 11: No-webhook-configured path ──────────────────────────
 
 describe("Webhook Integration", () => {
-  test("works without webhook notifier", () => {
-    const st = createTracker(null);
+  test("works without any webhooks configured", () => {
+    const st = createTracker();
 
     const changes = st.recordHeaders(new Headers({ "x-foo": "bar" }));
     expect(changes).toHaveLength(1);
@@ -283,16 +281,43 @@ describe("Webhook Integration", () => {
     st.close();
   });
 
-  // ── Test: sendTestNotification with webhook configured ───────
-
   test("sendTestNotification returns true when webhook configured", () => {
-    // Use a dummy URL — we won't actually flush
-    const notifier = new WebhookNotifier("http://localhost:1/webhook", 60_000);
-    const st = createTracker(notifier);
+    const st = createTracker("http://localhost:1/webhook");
 
     expect(st.sendTestNotification()).toBe(true);
 
     st.close();
+  });
+
+  test("addWebhook / listWebhooks / removeWebhook CRUD", () => {
+    const st = createTracker();
+
+    expect(st.listWebhooks()).toHaveLength(0);
+
+    st.addWebhook("http://example.com/hook1", "slack");
+    st.addWebhook("http://example.com/hook2");
+    expect(st.listWebhooks()).toHaveLength(2);
+    expect(st.listWebhooks()[0]!.label).toBe("slack");
+    expect(st.listWebhooks()[1]!.url).toBe("http://example.com/hook2");
+
+    st.removeWebhook("http://example.com/hook1");
+    expect(st.listWebhooks()).toHaveLength(1);
+    expect(st.listWebhooks()[0]!.url).toBe("http://example.com/hook2");
+
+    st.close();
+  });
+
+  test("seed URL is persisted to webhooks table", () => {
+    const dbPath = join(tempDir, "seed-test.db");
+    const st1 = new SchemaTracker(dbPath, "http://example.com/seed");
+    expect(st1.listWebhooks()).toHaveLength(1);
+    expect(st1.listWebhooks()[0]!.url).toBe("http://example.com/seed");
+    st1.close();
+
+    // Re-opening should NOT duplicate the seed
+    const st2 = new SchemaTracker(dbPath, "http://example.com/seed");
+    expect(st2.listWebhooks()).toHaveLength(1);
+    st2.close();
   });
 });
 
@@ -300,7 +325,6 @@ describe("Webhook Integration", () => {
 
 describe("SchemaTracker → WebhookNotifier wiring", () => {
   test("recording new headers fires a webhook with the changes", async () => {
-    // Start a real HTTP server to receive webhooks
     const received: { text: string; changes: unknown[] }[] = [];
     const webhookServer = Bun.serve({
       port: 0,
@@ -312,14 +336,10 @@ describe("SchemaTracker → WebhookNotifier wiring", () => {
     });
 
     try {
-      const notifier = new WebhookNotifier(`http://localhost:${webhookServer.port}`, 50);
-      const st = createTracker(notifier);
+      const st = createTracker(`http://localhost:${webhookServer.port}`);
 
-      // Record new headers — this should enqueue webhook changes
       st.recordHeaders(new Headers({ "x-new-header": "hello" }));
-
-      // Flush synchronously to ensure delivery
-      await notifier.flush();
+      await st.flushAllWebhooks();
 
       expect(received).toHaveLength(1);
       expect(received[0]!.changes).toHaveLength(1);
@@ -346,11 +366,10 @@ describe("SchemaTracker → WebhookNotifier wiring", () => {
     });
 
     try {
-      const notifier = new WebhookNotifier(`http://localhost:${webhookServer.port}`, 50);
-      const st = createTracker(notifier);
+      const st = createTracker(`http://localhost:${webhookServer.port}`);
 
       st.recordResponseJson("/v1/messages", JSON.stringify({ id: "msg_1", type: "message" }));
-      await notifier.flush();
+      await st.flushAllWebhooks();
 
       expect(received).toHaveLength(1);
       const changes = received[0]!.changes as { type: string; path?: string }[];
@@ -375,17 +394,16 @@ describe("SchemaTracker → WebhookNotifier wiring", () => {
     });
 
     try {
-      const notifier = new WebhookNotifier(`http://localhost:${webhookServer.port}`, 50);
-      const st = createTracker(notifier);
+      const st = createTracker(`http://localhost:${webhookServer.port}`);
 
       // First call: new data → webhook
       st.recordHeaders(new Headers({ "x-known": "val" }));
-      await notifier.flush();
+      await st.flushAllWebhooks();
       expect(received).toHaveLength(1);
 
       // Second call: same data → no webhook
       st.recordHeaders(new Headers({ "x-known": "val" }));
-      await notifier.flush();
+      await st.flushAllWebhooks();
       // Should still be 1 — no new changes, so no new webhook
       expect(received).toHaveLength(1);
 
@@ -393,6 +411,154 @@ describe("SchemaTracker → WebhookNotifier wiring", () => {
     } finally {
       webhookServer.stop(true);
     }
+  });
+
+  test("dynamically added webhook receives notifications", async () => {
+    const received: unknown[] = [];
+    const webhookServer = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        received.push(await req.json());
+        return new Response("ok");
+      },
+    });
+
+    try {
+      const st = createTracker(); // no seed URL
+      st.addWebhook(`http://localhost:${webhookServer.port}`, "test-hook");
+
+      st.recordHeaders(new Headers({ "x-dynamic": "yes" }));
+      await st.flushAllWebhooks();
+
+      expect(received).toHaveLength(1);
+
+      st.close();
+    } finally {
+      webhookServer.stop(true);
+    }
+  });
+});
+
+// ── Multi-webhook and removal tests ─────────────────────────────
+
+describe("Multiple webhooks fan-out", () => {
+  test("both webhooks receive the same schema change notification", async () => {
+    const received1: unknown[] = [];
+    const received2: unknown[] = [];
+    const server1 = Bun.serve({
+      port: 0,
+      async fetch(req) { received1.push(await req.json()); return new Response("ok"); },
+    });
+    const server2 = Bun.serve({
+      port: 0,
+      async fetch(req) { received2.push(await req.json()); return new Response("ok"); },
+    });
+
+    try {
+      const st = createTracker();
+      st.addWebhook(`http://localhost:${server1.port}`, "hook-1");
+      st.addWebhook(`http://localhost:${server2.port}`, "hook-2");
+
+      st.recordHeaders(new Headers({ "x-fanout": "test" }));
+      await st.flushAllWebhooks();
+
+      expect(received1).toHaveLength(1);
+      expect(received2).toHaveLength(1);
+      // Both should contain the same change
+      const c1 = (received1[0] as { changes: { type: string; name: string }[] }).changes;
+      const c2 = (received2[0] as { changes: { type: string; name: string }[] }).changes;
+      expect(c1[0]!.type).toBe("new_header");
+      expect(c1[0]!.name).toBe("x-fanout");
+      expect(c2[0]!.type).toBe("new_header");
+      expect(c2[0]!.name).toBe("x-fanout");
+
+      st.close();
+    } finally {
+      server1.stop(true);
+      server2.stop(true);
+    }
+  });
+});
+
+describe("Webhook removal stops delivery", () => {
+  test("removed webhook does not receive subsequent notifications", async () => {
+    const received: unknown[] = [];
+    const server = Bun.serve({
+      port: 0,
+      async fetch(req) { received.push(await req.json()); return new Response("ok"); },
+    });
+
+    try {
+      const st = createTracker();
+      const url = `http://localhost:${server.port}`;
+      st.addWebhook(url, "temp");
+
+      // First change — webhook should fire
+      st.recordHeaders(new Headers({ "x-before-remove": "yes" }));
+      await st.flushAllWebhooks();
+      expect(received).toHaveLength(1);
+
+      // Remove webhook
+      st.removeWebhook(url);
+
+      // Second change — webhook should NOT fire
+      st.recordHeaders(new Headers({ "x-after-remove": "yes" }));
+      await st.flushAllWebhooks();
+      expect(received).toHaveLength(1); // still 1, not 2
+
+      st.close();
+    } finally {
+      server.stop(true);
+    }
+  });
+});
+
+describe("sendTestNotification targeting specific URL", () => {
+  test("sends test only to the specified webhook URL", async () => {
+    const received1: unknown[] = [];
+    const received2: unknown[] = [];
+    const server1 = Bun.serve({
+      port: 0,
+      async fetch(req) { received1.push(await req.json()); return new Response("ok"); },
+    });
+    const server2 = Bun.serve({
+      port: 0,
+      async fetch(req) { received2.push(await req.json()); return new Response("ok"); },
+    });
+
+    try {
+      const st = createTracker();
+      const url1 = `http://localhost:${server1.port}`;
+      const url2 = `http://localhost:${server2.port}`;
+      st.addWebhook(url1, "target");
+      st.addWebhook(url2, "bystander");
+
+      // Send test only to url1
+      const sent = st.sendTestNotification(url1);
+      expect(sent).toBe(true);
+      await st.flushAllWebhooks();
+
+      expect(received1).toHaveLength(1);
+      expect(received2).toHaveLength(0);
+
+      // Verify the test payload
+      const payload = received1[0] as { changes: { type: string; name: string }[] };
+      expect(payload.changes[0]!.name).toBe("x-test-notification");
+
+      st.close();
+    } finally {
+      server1.stop(true);
+      server2.stop(true);
+    }
+  });
+
+  test("returns false for non-existent webhook URL", () => {
+    const st = createTracker();
+    st.addWebhook("http://example.com/real", "real");
+
+    expect(st.sendTestNotification("http://example.com/fake")).toBe(false);
+
+    st.close();
   });
 });
 

@@ -27,7 +27,7 @@ interface TestSetup {
 
 function createTestSchemaTracker(tmpDir: string): SchemaTracker {
   const dbPath = join(tmpDir, "test-state.db");
-  return new SchemaTracker(dbPath, null);
+  return new SchemaTracker(dbPath);
 }
 
 function createTestSetup(): TestSetup {

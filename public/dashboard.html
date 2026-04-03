@@ -129,6 +129,34 @@
   .kc0 { color: #39d2c0; } .kc1 { color: #d2a8ff; } .kc2 { color: #ffa657; }
   .kc3 { color: #79c0ff; } .kc4 { color: #f778ba; } .kc5 { color: #7ee787; }
   .kc6 { color: #ff7b72; } .kc7 { color: #d29922; }
+
+  /* Schema section */
+  .schema-section { margin-bottom: 16px; }
+  .schema-sub { margin-bottom: 16px; }
+  .schema-sub-header { font-size: 12px; font-weight: 600; color: var(--text-bright); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; }
+  .schema-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .schema-table th { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); color: var(--text-dim); font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600; }
+  .schema-table td { padding: 5px 8px; border-bottom: 1px solid rgba(48,54,61,0.3); vertical-align: top; }
+  .schema-table tr:hover td { background: rgba(88,166,255,0.04); }
+  .schema-table .path-col { color: var(--cyan); font-weight: 500; }
+  .type-badge { display: inline-block; padding: 1px 5px; border-radius: 3px; font-size: 10px; font-weight: 600; margin-right: 3px; }
+  .type-string { background: rgba(88,166,255,0.15); color: var(--blue); }
+  .type-number { background: rgba(63,185,80,0.15); color: var(--green); }
+  .type-boolean { background: rgba(210,153,34,0.15); color: var(--yellow); }
+  .type-null { background: rgba(139,148,158,0.15); color: var(--text-dim); }
+  .type-object { background: rgba(210,168,255,0.15); color: #d2a8ff; }
+  .type-array { background: rgba(255,166,87,0.15); color: #ffa657; }
+  .sample-val { color: var(--text-dim); font-size: 11px; max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .endpoint-group { cursor: pointer; user-select: none; }
+  .endpoint-group td { padding: 8px 8px 6px; font-weight: 600; color: var(--text-bright); font-size: 12px; }
+  .endpoint-group:hover td { background: rgba(88,166,255,0.06); }
+  .endpoint-group .chevron { display: inline-block; transition: transform 0.15s; margin-right: 4px; color: var(--text-dim); }
+  .endpoint-group .chevron.open { transform: rotate(90deg); }
+  .webhook-row { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-bottom: 1px solid rgba(48,54,61,0.3); font-size: 12px; }
+  .webhook-row .webhook-url { flex: 1; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .webhook-row .webhook-label { color: var(--text-dim); flex-shrink: 0; max-width: 120px; overflow: hidden; text-overflow: ellipsis; }
+  .webhook-row .webhook-date { color: var(--text-dim); flex-shrink: 0; font-size: 11px; }
+  .webhook-actions { display: flex; gap: 4px; flex-shrink: 0; }
 </style>
 </head>
 <body>
@@ -230,6 +258,60 @@
         <span class="panel-title">Token Usage</span>
       </div>
       <div style="flex:1;position:relative;min-height:200px"><canvas id="chart-tokens"></canvas></div>
+    </div>
+  </div>
+
+  <!-- API Schema -->
+  <div class="log-panel schema-section">
+    <div class="log-header" style="cursor:pointer" onclick="document.getElementById('schema-body').classList.toggle('collapsed'); this.querySelector('.btn').textContent = document.getElementById('schema-body').classList.contains('collapsed') ? 'Show' : 'Hide'">
+      <span class="panel-title">API Schema</span>
+      <div style="display:flex;gap:6px;align-items:center">
+        <button class="btn" onclick="event.stopPropagation();refreshSchema()">Refresh</button>
+        <button class="btn">Hide</button>
+      </div>
+    </div>
+    <div id="schema-body">
+
+      <!-- Webhooks -->
+      <div class="schema-sub">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+          <span class="schema-sub-header" style="margin-bottom:0">Webhooks</span>
+          <button class="btn" onclick="toggleForm('webhook')">+ Add</button>
+        </div>
+        <div class="add-form" id="webhook-form">
+          <div class="field" style="flex:2;min-width:200px">
+            <label>Webhook URL</label>
+            <input type="url" id="webhook-url-input" placeholder="https://hooks.slack.com/services/...">
+          </div>
+          <div class="field" style="max-width:120px">
+            <label>Label</label>
+            <input type="text" id="webhook-label-input" placeholder="optional">
+          </div>
+          <button class="btn-submit" onclick="addWebhook()">Add</button>
+          <button class="btn btn-cancel" onclick="toggleForm('webhook')">Cancel</button>
+        </div>
+        <div class="form-error" id="webhook-error"></div>
+        <div id="webhook-list">
+          <div class="empty-state" style="padding:10px 0">No webhooks configured</div>
+        </div>
+      </div>
+
+      <!-- Response Headers -->
+      <div class="schema-sub">
+        <span class="schema-sub-header">Response Headers</span>
+        <div id="schema-headers">
+          <div class="empty-state" style="padding:10px 0">No headers tracked yet</div>
+        </div>
+      </div>
+
+      <!-- Body Fields -->
+      <div class="schema-sub">
+        <span class="schema-sub-header">Body Fields</span>
+        <div id="schema-fields">
+          <div class="empty-state" style="padding:10px 0">No fields tracked yet</div>
+        </div>
+      </div>
+
     </div>
   </div>
 
@@ -902,12 +984,157 @@ function updateChartLastBucket(bucket) {
   tokensChart.update('none');
 }
 
+// ── Schema ────────────────────────────────────────────────────
+let schemaHeaders = [];
+let schemaFields = [];
+let webhooks = [];
+const collapsedGroups = new Set();
+
+function fmtRelative(iso) {
+  if (!iso) return '--';
+  const diff = Date.now() - new Date(iso).getTime();
+  if (diff < 60000) return 'just now';
+  if (diff < 3600000) return Math.floor(diff / 60000) + 'm ago';
+  if (diff < 86400000) return Math.floor(diff / 3600000) + 'h ago';
+  return Math.floor(diff / 86400000) + 'd ago';
+}
+
+function typeBadge(t) {
+  const cls = { string: 'type-string', number: 'type-number', boolean: 'type-boolean', null: 'type-null', object: 'type-object', array: 'type-array' };
+  return `<span class="type-badge ${cls[t] || 'type-null'}">${esc(t)}</span>`;
+}
+
+async function refreshSchema() {
+  try {
+    const [schemaData, webhookData] = await Promise.all([
+      api('GET', '/admin/schema'),
+      api('GET', '/admin/schema/webhooks'),
+    ]);
+    schemaHeaders = schemaData.headers;
+    schemaFields = schemaData.fields;
+    webhooks = webhookData.webhooks;
+    renderSchemaHeaders();
+    renderSchemaFields();
+    renderWebhooks();
+  } catch (err) {
+    console.warn('Schema refresh failed:', err);
+  }
+}
+
+function renderSchemaHeaders() {
+  const el = document.getElementById('schema-headers');
+  if (schemaHeaders.length === 0) {
+    el.innerHTML = '<div class="empty-state" style="padding:10px 0">No headers tracked yet</div>';
+    return;
+  }
+  let html = '<table class="schema-table"><thead><tr><th>Header</th><th>Hits</th><th>Last Seen</th><th>Sample Values</th></tr></thead><tbody>';
+  for (const h of schemaHeaders) {
+    const samples = h.sampleValues.slice(0, 5).map(v => `<code>${esc(v)}</code>`).join(', ');
+    const overflow = h.sampleValues.length > 5 ? ` <span class="c-dim">+${h.sampleValues.length - 5}</span>` : '';
+    html += `<tr><td class="path-col">${esc(h.name)}</td><td>${fmtNum(h.hitCount)}</td><td>${fmtRelative(h.lastSeenAt)}</td><td class="sample-val">${samples}${overflow}${h.valueOverflow ? ' <span class="c-dim">(overflow)</span>' : ''}</td></tr>`;
+  }
+  html += '</tbody></table>';
+  el.innerHTML = html;
+}
+
+function renderSchemaFields() {
+  const el = document.getElementById('schema-fields');
+  if (schemaFields.length === 0) {
+    el.innerHTML = '<div class="empty-state" style="padding:10px 0">No fields tracked yet</div>';
+    return;
+  }
+
+  // Group by endpoint+context
+  const groups = new Map();
+  for (const f of schemaFields) {
+    const key = f.endpoint + '|' + f.context;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(f);
+  }
+
+  let html = '<table class="schema-table"><thead><tr><th>Path</th><th>Types</th><th>Hits</th><th>Last Seen</th><th>Sample Values</th></tr></thead><tbody>';
+  for (const [key, fields] of groups) {
+    const [endpoint, context] = key.split('|');
+    const isOpen = !collapsedGroups.has(key);
+    html += `<tr class="endpoint-group" onclick="toggleSchemaGroup('${esc(key)}')"><td colspan="5"><span class="chevron ${isOpen ? 'open' : ''}">&#9656;</span>${esc(endpoint)} <span class="c-dim">— ${esc(context)}</span> <span class="c-dim">(${fields.length})</span></td></tr>`;
+    if (isOpen) {
+      for (const f of fields) {
+        const types = f.jsonTypes.map(typeBadge).join('');
+        const samples = f.sampleValues.slice(0, 3).map(v => `<code>${esc(v.length > 40 ? v.slice(0, 37) + '...' : v)}</code>`).join(', ');
+        const overflow = f.sampleValues.length > 3 ? ` <span class="c-dim">+${f.sampleValues.length - 3}</span>` : '';
+        html += `<tr><td class="path-col" style="padding-left:24px">${esc(f.path)}</td><td>${types}</td><td>${fmtNum(f.hitCount)}</td><td>${fmtRelative(f.lastSeenAt)}</td><td class="sample-val">${samples}${overflow}</td></tr>`;
+      }
+    }
+  }
+  html += '</tbody></table>';
+  el.innerHTML = html;
+}
+
+function toggleSchemaGroup(key) {
+  if (collapsedGroups.has(key)) collapsedGroups.delete(key);
+  else collapsedGroups.add(key);
+  renderSchemaFields();
+}
+
+function renderWebhooks() {
+  const el = document.getElementById('webhook-list');
+  if (webhooks.length === 0) {
+    el.innerHTML = '<div class="empty-state" style="padding:10px 0">No webhooks configured</div>';
+    return;
+  }
+  el.innerHTML = '';
+  for (const w of webhooks) {
+    const row = document.createElement('div');
+    row.className = 'webhook-row';
+    row.innerHTML = `<span class="webhook-url" title="${esc(w.url)}">${esc(w.url)}</span>`
+      + (w.label ? `<span class="webhook-label" title="${esc(w.label)}">${esc(w.label)}</span>` : '')
+      + `<span class="webhook-date">${fmtRelative(w.createdAt)}</span>`
+      + `<div class="webhook-actions"><button class="btn" onclick="testWebhook('${esc(w.url)}')">Test</button><button class="btn btn-danger" onclick="removeWebhook('${esc(w.url)}')">Remove</button></div>`;
+    el.appendChild(row);
+  }
+}
+
+async function addWebhook() {
+  const urlVal = document.getElementById('webhook-url-input').value.trim();
+  const label = document.getElementById('webhook-label-input').value.trim() || undefined;
+  if (!urlVal) { showError('webhook-error', 'URL is required'); return; }
+  try {
+    await api('POST', '/admin/schema/webhooks', { url: urlVal, label });
+    document.getElementById('webhook-url-input').value = '';
+    document.getElementById('webhook-label-input').value = '';
+    toggleForm('webhook');
+    refreshSchema();
+  } catch (err) {
+    showError('webhook-error', err.message);
+  }
+}
+
+async function removeWebhook(url) {
+  if (!confirm('Remove webhook ' + url + '?')) return;
+  try {
+    await api('POST', '/admin/schema/webhooks/remove', { url });
+    refreshSchema();
+  } catch (err) {
+    alert('Failed to remove: ' + err.message);
+  }
+}
+
+async function testWebhook(url) {
+  try {
+    const result = await api('POST', '/admin/schema/webhooks/test', { url });
+    alert(result.sent ? 'Test notification sent!' : 'Failed: ' + (result.error || 'unknown'));
+  } catch (err) {
+    alert('Failed: ' + err.message);
+  }
+}
+
 // ── Init ───────────────────────────────────────────────────────
 let countdownInterval = null;
 function init() {
   connectSSE();
   refreshTokens();
   loadCharts();
+  refreshSchema();
   if (countdownInterval) clearInterval(countdownInterval);
   countdownInterval = setInterval(() => { renderKeys(); renderHeader(); }, 1000);
 }

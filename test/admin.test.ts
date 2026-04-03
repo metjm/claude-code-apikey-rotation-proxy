@@ -69,7 +69,7 @@ let st: SchemaTracker;
 beforeEach(() => {
   tempDir = makeTempDir();
   km = new KeyManager(tempDir);
-  st = new SchemaTracker(km.dbPath, null);
+  st = new SchemaTracker(km.dbPath);
 });
 
 afterEach(() => {
@@ -87,27 +87,27 @@ afterEach(() => {
 describe("Route Dispatch", () => {
   const config = makeConfig();
 
-  test("returns null for non-admin path /v1/messages", () => {
+  test("returns null for non-admin path /v1/messages", async () => {
     const req = makeReq("GET", "/v1/messages");
-    const result = handleAdminRoute(req, km, config, st);
+    const result = await handleAdminRoute(req, km, config, st);
     expect(result).toBeNull();
   });
 
-  test("returns null for root path /", () => {
+  test("returns null for root path /", async () => {
     const req = makeReq("GET", "/");
-    const result = handleAdminRoute(req, km, config, st);
+    const result = await handleAdminRoute(req, km, config, st);
     expect(result).toBeNull();
   });
 
-  test("returns null for non-admin path /health", () => {
+  test("returns null for non-admin path /health", async () => {
     const req = makeReq("GET", "/health");
-    const result = handleAdminRoute(req, km, config, st);
+    const result = await handleAdminRoute(req, km, config, st);
     expect(result).toBeNull();
   });
 
-  test("returns null for path that starts with /admin but not /admin/", () => {
+  test("returns null for path that starts with /admin but not /admin/", async () => {
     const req = makeReq("GET", "/administrator");
-    const result = handleAdminRoute(req, km, config, st);
+    const result = await handleAdminRoute(req, km, config, st);
     expect(result).toBeNull();
   });
 
@@ -1881,5 +1881,74 @@ describe("GET /admin/schema returns recorded data", () => {
     expect(idField).toBeDefined();
     expect(idField!.endpoint).toBe("/v1/messages");
     expect(idField!.jsonTypes).toContain("string");
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// Webhook CRUD endpoints
+// ═══════════════════════════════════════════════════════════════════
+
+describe("Webhook CRUD admin endpoints", () => {
+  const config = makeConfig();
+
+  test("GET /admin/schema/webhooks returns empty list initially", async () => {
+    const req = makeReq("GET", "/admin/schema/webhooks");
+    const res = await handleAdminRoute(req, km, config, st);
+    expect(res).not.toBeNull();
+    expect(res!.status).toBe(200);
+    const body = (await jsonBody(res!)) as { webhooks: unknown[] };
+    expect(body.webhooks).toHaveLength(0);
+  });
+
+  test("POST /admin/schema/webhooks adds a webhook", async () => {
+    const req = makeReq("POST", "/admin/schema/webhooks", { url: "http://example.com/hook", label: "test" });
+    const res = await handleAdminRoute(req, km, config, st);
+    expect(res).not.toBeNull();
+    expect(res!.status).toBe(200);
+    const body = await jsonBody(res!);
+    expect(body).toEqual({ ok: true });
+
+    // Verify it appears in the list
+    const listReq = makeReq("GET", "/admin/schema/webhooks");
+    const listRes = await handleAdminRoute(listReq, km, config, st);
+    const listBody = (await jsonBody(listRes!)) as { webhooks: { url: string; label: string }[] };
+    expect(listBody.webhooks).toHaveLength(1);
+    expect(listBody.webhooks[0]!.url).toBe("http://example.com/hook");
+    expect(listBody.webhooks[0]!.label).toBe("test");
+  });
+
+  test("POST /admin/schema/webhooks rejects invalid URL", async () => {
+    const req = makeReq("POST", "/admin/schema/webhooks", { url: "not-a-url" });
+    const res = await handleAdminRoute(req, km, config, st);
+    expect(res).not.toBeNull();
+    expect(res!.status).toBe(400);
+  });
+
+  test("POST /admin/schema/webhooks rejects missing URL", async () => {
+    const req = makeReq("POST", "/admin/schema/webhooks", { label: "test" });
+    const res = await handleAdminRoute(req, km, config, st);
+    expect(res).not.toBeNull();
+    expect(res!.status).toBe(400);
+  });
+
+  test("POST /admin/schema/webhooks rejects duplicate URL", async () => {
+    st.addWebhook("http://example.com/dup");
+    const req = makeReq("POST", "/admin/schema/webhooks", { url: "http://example.com/dup" });
+    const res = await handleAdminRoute(req, km, config, st);
+    expect(res).not.toBeNull();
+    expect(res!.status).toBe(409);
+  });
+
+  test("POST /admin/schema/webhooks/remove removes a webhook", async () => {
+    st.addWebhook("http://example.com/to-remove", "doomed");
+    expect(st.listWebhooks().length).toBeGreaterThanOrEqual(1);
+
+    const req = makeReq("POST", "/admin/schema/webhooks/remove", { url: "http://example.com/to-remove" });
+    const res = await handleAdminRoute(req, km, config, st);
+    expect(res).not.toBeNull();
+    expect(res!.status).toBe(200);
+
+    const remaining = st.listWebhooks().filter(w => w.url === "http://example.com/to-remove");
+    expect(remaining).toHaveLength(0);
   });
 });

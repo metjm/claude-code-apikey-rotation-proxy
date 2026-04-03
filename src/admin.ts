@@ -61,12 +61,12 @@ const routes: ReadonlyMap<string, ReadonlyMap<string, RouteHandler>> = new Map([
 /**
  * Try to handle an admin route. Returns null if the path isn't an admin route.
  */
-export function handleAdminRoute(
+export async function handleAdminRoute(
   req: Request,
   keyManager: KeyManager,
   config: ProxyConfig,
   schemaTracker: SchemaTracker,
-): Response | Promise<Response> | null {
+): Promise<Response | null> {
   const url = new URL(req.url);
 
   if (!url.pathname.startsWith("/admin/")) return null;
@@ -83,8 +83,31 @@ export function handleAdminRoute(
   if (url.pathname === "/admin/schema" && req.method === "GET") {
     return json({ headers: schemaTracker.listHeaders(), fields: schemaTracker.listFields() });
   }
+  if (url.pathname === "/admin/schema/webhooks" && req.method === "GET") {
+    return json({ webhooks: schemaTracker.listWebhooks() });
+  }
+  if (url.pathname === "/admin/schema/webhooks" && req.method === "POST") {
+    const body = await req.json() as { url?: string; label?: string };
+    if (!body.url || typeof body.url !== "string") return json({ error: "url is required" }, 400);
+    try { new URL(body.url); } catch { return json({ error: "Invalid URL" }, 400); }
+    try {
+      schemaTracker.addWebhook(body.url, body.label);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("UNIQUE constraint")) return json({ error: "Webhook URL already exists" }, 409);
+      throw err;
+    }
+    return json({ ok: true });
+  }
+  if (url.pathname === "/admin/schema/webhooks/remove" && req.method === "POST") {
+    const body = await req.json() as { url?: string };
+    if (!body.url || typeof body.url !== "string") return json({ error: "url is required" }, 400);
+    schemaTracker.removeWebhook(body.url);
+    return json({ ok: true });
+  }
   if (url.pathname === "/admin/schema/webhooks/test" && req.method === "POST") {
-    const sent = schemaTracker.sendTestNotification();
+    const body = await req.json().catch(() => ({})) as { url?: string };
+    const sent = schemaTracker.sendTestNotification(body.url);
     if (!sent) return json({ sent: false, error: "No webhook URL configured" }, 422);
     return json({ sent: true });
   }
