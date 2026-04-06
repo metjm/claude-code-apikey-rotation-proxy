@@ -875,7 +875,7 @@ function compactQuotaState(key) {
   if (warningWindow) {
     return {
       className: 'badge-warning',
-      label: 'Near limit',
+      label: `Near ${compactWindowName(warningWindow.windowName)} limit`,
       title: summarizeWindow(warningWindow),
     };
   }
