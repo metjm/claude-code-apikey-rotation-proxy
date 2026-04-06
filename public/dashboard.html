@@ -698,7 +698,7 @@ function routingBadge(key) {
   if (!key.isAvailable) {
     if (key.availableAt > Date.now()) {
       const rem = key.availableAt - Date.now();
-      return `<span class="badge badge-ratelimited">Cooling ${fmtCountdown(rem)}</span>`;
+      return `<span class="badge badge-rejected">Cooling ${fmtCountdown(rem)}</span>`;
     }
     return '<span class="badge badge-unknown" title="Key is not scheduled for today">Day Off</span>';
   }
@@ -907,7 +907,7 @@ function capacityHeadline(key) {
   if (!key.isAvailable) {
     const rem = key.availableAt - Date.now();
     return {
-      badgeClass: 'badge-ratelimited',
+      badgeClass: 'badge-rejected',
       badgeLabel: 'Paused after rate-limit',
       title: 'Routing is paused because the proxy recently received a real rate-limit response.',
       subtitle: rem > 0 ? `The proxy will try this key again in ${fmtCountdown(rem)}.` : 'The cooldown window has nearly expired.',
@@ -1009,7 +1009,7 @@ function capacityTableSummary(key, telemetry) {
 }
 function keyRowTone(key, telemetry) {
   if (!key.isAvailable) return 'row-cooling';
-  if (telemetry.badgeClass === 'badge-warning' || telemetry.badgeClass === 'badge-ratelimited') return 'row-warning';
+  if (telemetry.badgeClass === 'badge-warning' || telemetry.badgeClass === 'badge-ratelimited' || telemetry.badgeClass === 'badge-rejected') return 'row-warning';
   if (telemetry.badgeClass === 'badge-ok') return 'row-ok';
   return 'row-unknown';
 }
@@ -1178,7 +1178,7 @@ function renderKeys() {
         <div class="table-stack" title="${esc(telemetry.title)}&#10;&#10;${esc(telemetry.subtitle)}">
           <div class="badge-row">
             ${routingBadge(k)}
-            <span class="badge ${esc(quotaState.className)}" title="${esc(quotaState.title)}">${esc(quotaState.label)}</span>
+            ${k.isAvailable ? `<span class="badge ${esc(quotaState.className)}" title="${esc(quotaState.title)}">${esc(quotaState.label)}</span>` : ''}
             ${retryBadge(k)}
           </div>
           <div class="metric-inline">${esc(routingDetail || '--')}</div>
