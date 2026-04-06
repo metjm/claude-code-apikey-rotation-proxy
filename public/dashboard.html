@@ -897,7 +897,7 @@ function compactQuotaState(key) {
 }
 function retryBadge(key) {
   if (key.capacity?.shouldRetry === true) return '<span class="badge badge-ok">auto-retry OK</span>';
-  if (key.capacity?.shouldRetry === false) return '<span class="badge badge-warning">avoid auto-retry</span>';
+  if (key.capacity?.shouldRetry === false) return '';
   return '';
 }
 function capacityHeadline(key) {
