@@ -844,12 +844,15 @@ function telemetryCoverageLabel(key) {
   if (missing) return 'Coverage partial';
   return 'Coverage intermittent';
 }
+function isWindowWarning(window) {
+  return window.status === 'allowed_warning' || (window.surpassedThreshold && window.utilization >= window.surpassedThreshold);
+}
 function compactQuotaState(key) {
   const responseCount = key.capacity?.responseCount || 0;
   const normalizedCount = key.capacity?.normalizedHeaderCount || 0;
   const windows = sortedCapacityWindows(key);
   const conflictingWindow = windows.find(window => window.status === 'rejected');
-  const warningWindow = windows.find(window => window.surpassedThreshold || window.status === 'allowed_warning');
+  const warningWindow = windows.find(isWindowWarning);
   const healthyWindow = windows.find(window => window.status === 'allowed') || windows[0] || null;
   if (responseCount === 0) {
     return {
@@ -902,7 +905,7 @@ function capacityHeadline(key) {
   const normalizedCount = key.capacity?.normalizedHeaderCount || 0;
   const windows = sortedCapacityWindows(key);
   const conflictingWindow = windows.find(window => window.status === 'rejected');
-  const warningWindow = windows.find(window => window.surpassedThreshold || window.status === 'allowed_warning');
+  const warningWindow = windows.find(isWindowWarning);
   const healthyWindow = windows.find(window => window.status === 'allowed') || windows[0] || null;
   if (!key.isAvailable) {
     const rem = key.availableAt - Date.now();
@@ -963,7 +966,7 @@ function capacityHeadline(key) {
 function capacityTableSummary(key, telemetry) {
   const windows = sortedCapacityWindows(key);
   const conflictingWindow = windows.find(window => window.status === 'rejected');
-  const warningWindow = windows.find(window => window.surpassedThreshold || window.status === 'allowed_warning');
+  const warningWindow = windows.find(isWindowWarning);
   const healthyWindow = windows.find(window => window.status === 'allowed') || windows[0] || null;
   if (!key.isAvailable) {
     const rem = key.availableAt - Date.now();
