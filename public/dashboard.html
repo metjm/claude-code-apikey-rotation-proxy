@@ -554,14 +554,26 @@ document.getElementById('auth-input').addEventListener('keydown', (e) => {
 });
 // On load: validate stored token, or check if server has no auth configured
 (async () => {
-  const testToken = adminToken || '';
-  const headers = testToken ? { 'Authorization': `Bearer ${testToken}` } : {};
   try {
-    const res = await fetch('/admin/keys', { headers });
-    if (res.ok) {
+    const bootstrap = await fetch('/admin/bootstrap');
+    if (!bootstrap.ok) throw new Error();
+    const { authRequired } = await bootstrap.json();
+
+    if (!authRequired) {
       document.getElementById('auth-overlay').classList.add('hidden');
       init();
       return;
+    }
+
+    if (adminToken) {
+      const res = await fetch('/admin/keys', {
+        headers: { 'Authorization': `Bearer ${adminToken}` },
+      });
+      if (res.ok) {
+        document.getElementById('auth-overlay').classList.add('hidden');
+        init();
+        return;
+      }
     }
   } catch {}
   // Auth required — clear stale token and show prompt
@@ -1217,10 +1229,10 @@ function renderKeys() {
           <div class="day-picker" title="Days this key is eligible for routing">
             ${[['Su',0],['Mo',1],['Tu',2],['We',3],['Th',4],['Fr',5],['Sa',6]].map(([label, day]) => {
               const active = (k.allowedDays || [0,1,2,3,4,5,6]).includes(day);
-              return \`<button class="day-btn\${active ? ' day-active' : ''}"
-                onclick='toggleKeyDay(\${keyRef}, \${day}, \${!active})'
-                title="\${['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'][day]}"
-              >\${label}</button>\`;
+              return `<button class="day-btn${active ? ' day-active' : ''}"
+                onclick='toggleKeyDay(${keyRef}, ${day}, ${!active})'
+                title="${['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'][day]}"
+              >${label}</button>`;
             }).join('')}
           </div>
           <div class="badge-row">

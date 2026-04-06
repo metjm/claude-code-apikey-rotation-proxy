@@ -1,5 +1,5 @@
 import { describe, test, expect, afterAll, beforeAll } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { KeyManager } from "../src/key-manager.ts";
@@ -127,6 +127,12 @@ function startProxy(opts: {
         return new Response("<html><body>dashboard</body></html>", {
           headers: { "content-type": "text/html" },
         });
+      }
+      if (url.pathname === "/dashboard/chart.umd.min.js.map") {
+        return new Response(null, { status: 204 });
+      }
+      if (url.pathname === "/favicon.ico") {
+        return new Response(null, { status: 204 });
       }
 
       // Admin routes
@@ -294,6 +300,36 @@ describe("Dashboard", () => {
     const body = await res.text();
     expect(body).toContain("dashboard");
   });
+
+  test("GET /admin/bootstrap reports auth disabled when no admin token is configured", async () => {
+    const res = await fetch(`${proxy.url}/admin/bootstrap`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body).toEqual({ authRequired: false });
+  });
+
+  test("dashboard inline script parses without syntax errors", () => {
+    const html = readFileSync(new URL("../public/dashboard.html", import.meta.url), "utf8");
+    const scriptStart = html.lastIndexOf("<script>");
+    const scriptEnd = html.lastIndexOf("</script>");
+
+    expect(scriptStart).toBeGreaterThanOrEqual(0);
+    expect(scriptEnd).toBeGreaterThan(scriptStart);
+
+    const script = html.slice(scriptStart + "<script>".length, scriptEnd);
+
+    expect(() => new Function(script)).not.toThrow();
+  });
+
+  test("GET /favicon.ico returns 204", async () => {
+    const res = await fetch(`${proxy.url}/favicon.ico`);
+    expect(res.status).toBe(204);
+  });
+
+  test("GET /dashboard/chart.umd.min.js.map returns 204", async () => {
+    const res = await fetch(`${proxy.url}/dashboard/chart.umd.min.js.map`);
+    expect(res.status).toBe(204);
+  });
 });
 
 // ── Admin Auth End-to-End ────────────────────────────────────────
@@ -325,6 +361,13 @@ describe("Admin Auth End-to-End", () => {
     const body = await res.json();
     expect(body.status).toBeDefined();
     expect(body.keys).toBeDefined();
+  });
+
+  test("GET /admin/bootstrap reports auth required without auth", async () => {
+    const res = await fetch(`${proxy.url}/admin/bootstrap`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body).toEqual({ authRequired: true });
   });
 
   test("GET /admin/events works without auth", async () => {

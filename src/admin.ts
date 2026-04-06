@@ -79,8 +79,13 @@ export async function handleAdminRoute(
 
   if (!url.pathname.startsWith("/admin/")) return null;
 
-  // Auth check (skip for /admin/health and /admin/events which are local-only)
-  if (url.pathname !== "/admin/health" && url.pathname !== "/admin/events" && config.adminToken !== null) {
+  // Auth check (skip for public bootstrap/health/event endpoints)
+  if (
+    url.pathname !== "/admin/bootstrap"
+    && url.pathname !== "/admin/health"
+    && url.pathname !== "/admin/events"
+    && config.adminToken !== null
+  ) {
     const bearer = req.headers.get("authorization");
     if (bearer !== `Bearer ${config.adminToken}`) {
       return json({ error: "Unauthorized" }, 401);
@@ -88,6 +93,9 @@ export async function handleAdminRoute(
   }
 
   // Schema-specific routes (after auth, before generic dispatch)
+  if (url.pathname === "/admin/bootstrap" && req.method === "GET") {
+    return json({ authRequired: config.adminToken !== null });
+  }
   if (url.pathname === "/admin/schema" && req.method === "GET") {
     return json({ headers: schemaTracker.listHeaders(), fields: schemaTracker.listFields() });
   }

@@ -109,6 +109,12 @@ function startServer(): void {
           headers: { "content-type": "application/javascript" },
         });
       }
+      if (url.pathname === "/dashboard/chart.umd.min.js.map") {
+        return new Response(null, { status: 204 });
+      }
+      if (url.pathname === "/favicon.ico") {
+        return new Response(null, { status: 204 });
+      }
 
       const adminResponse = await handleAdminRoute(req, keyManager, config, schemaTracker);
       if (adminResponse !== null) {
