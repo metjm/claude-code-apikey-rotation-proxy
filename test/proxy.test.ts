@@ -2231,3 +2231,33 @@ describe("Capacity observation integration", () => {
     expect(keyA.capacityHealth).toBe("cooling_down");
   });
 });
+
+describe("Day-restricted keys", () => {
+  test("returns all_exhausted with future earliestAvailableAt when all keys are day-restricted", async () => {
+    const { km, st, cleanup } = createTestSetup();
+    const mock = startMockUpstream(() => new Response("OK"));
+    try {
+      km.addKey(FAKE_KEY_A, "restricted");
+
+      // Restrict to a day that is NOT today
+      const today = new Date().getDay();
+      const notToday = (today + 1) % 7;
+      km.updateKeyAllowedDays(FAKE_KEY_A, [notToday]);
+
+      const config = makeConfig(mock.url);
+      const req = new Request(`${mock.url}/v1/messages`, { method: "POST", body: "{}" });
+      const result = await proxyRequest(req, km, config, st);
+
+      expect(result.kind).toBe("all_exhausted");
+      if (result.kind === "all_exhausted") {
+        // earliestAvailableAt should be midnight (in the future)
+        expect(result.earliestAvailableAt).toBeGreaterThan(Date.now());
+        // And at most ~24 hours from now
+        expect(result.earliestAvailableAt - Date.now()).toBeLessThanOrEqual(24 * 60 * 60 * 1000);
+      }
+    } finally {
+      mock.stop();
+      cleanup();
+    }
+  });
+});

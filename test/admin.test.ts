@@ -2085,3 +2085,67 @@ describe("Webhook CRUD admin endpoints", () => {
     expect(remaining).toHaveLength(0);
   });
 });
+
+describe("POST /admin/keys/update — allowedDays", () => {
+  const config = makeConfig();
+
+  test("updates allowedDays via full key", async () => {
+    km.addKey(VALID_KEY, "ad-test");
+    const req = makeReq("POST", "/admin/keys/update", { key: VALID_KEY, allowedDays: [1, 2, 3, 4, 5] });
+    const res = await handleAdminRoute(req, km, config, st);
+    expect(res!.status).toBe(200);
+    const body = (await jsonBody(res!)) as { updated: boolean; allowedDays: number[] };
+    expect(body.updated).toBe(true);
+    expect(body.allowedDays).toEqual([1, 2, 3, 4, 5]);
+    expect(km.listKeys()[0]!.allowedDays).toEqual([1, 2, 3, 4, 5]);
+  });
+
+  test("updates allowedDays via masked key", async () => {
+    km.addKey(VALID_KEY, "ad-test");
+    const masked = km.listKeys()[0]!.maskedKey;
+    const req = makeReq("POST", "/admin/keys/update", { maskedKey: masked, allowedDays: [0, 6] });
+    const res = await handleAdminRoute(req, km, config, st);
+    expect(res!.status).toBe(200);
+    const body = (await jsonBody(res!)) as { updated: boolean; allowedDays: number[] };
+    expect(body.allowedDays).toEqual([0, 6]);
+  });
+
+  test("returns 400 for empty allowedDays array", async () => {
+    km.addKey(VALID_KEY, "ad-test");
+    const req = makeReq("POST", "/admin/keys/update", { key: VALID_KEY, allowedDays: [] });
+    const res = await handleAdminRoute(req, km, config, st);
+    expect(res!.status).toBe(400);
+  });
+
+  test("returns 400 for invalid day values", async () => {
+    km.addKey(VALID_KEY, "ad-test");
+    const req = makeReq("POST", "/admin/keys/update", { key: VALID_KEY, allowedDays: [7] });
+    const res = await handleAdminRoute(req, km, config, st);
+    expect(res!.status).toBe(400);
+  });
+
+  test("combined update: label + priority + allowedDays", async () => {
+    km.addKey(VALID_KEY, "ad-test");
+    const req = makeReq("POST", "/admin/keys/update", {
+      key: VALID_KEY,
+      label: "new-label",
+      priority: 1,
+      allowedDays: [1, 3, 5],
+    });
+    const res = await handleAdminRoute(req, km, config, st);
+    expect(res!.status).toBe(200);
+    const body = (await jsonBody(res!)) as { updated: boolean; label: string; priority: number; allowedDays: number[] };
+    expect(body.label).toBe("new-label");
+    expect(body.priority).toBe(1);
+    expect(body.allowedDays).toEqual([1, 3, 5]);
+  });
+
+  test("allowedDays appears in response and deduplicates/sorts", async () => {
+    km.addKey(VALID_KEY, "ad-test");
+    const req = makeReq("POST", "/admin/keys/update", { key: VALID_KEY, allowedDays: [5, 3, 1, 3, 5] });
+    const res = await handleAdminRoute(req, km, config, st);
+    expect(res!.status).toBe(200);
+    const body = (await jsonBody(res!)) as { allowedDays: number[] };
+    expect(body.allowedDays).toEqual([1, 3, 5]);
+  });
+});

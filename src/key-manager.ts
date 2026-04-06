@@ -48,6 +48,7 @@ interface KeyRow {
   total_cache_creation: number;
   available_at: number;
   priority: number;
+  allowed_days: string;
 }
 
 interface TokenRow {
@@ -323,6 +324,11 @@ export class KeyManager {
     } catch {
       // Column already exists — ignore
     }
+
+    // Add allowed_days column (JSON array, default = all days)
+    try {
+      this.db.exec("ALTER TABLE api_keys ADD COLUMN allowed_days TEXT NOT NULL DEFAULT '[0,1,2,3,4,5,6]'");
+    } catch {}
   }
 
   // ── Migration from legacy state.json ────────────────────────────
@@ -419,8 +425,9 @@ export class KeyManager {
     if (this.keys.length === 0) return null;
 
     const currentTime = now();
+    const currentDay = new Date().getDay();
     const available = this.keys
-      .filter((k) => k.availableAt <= currentTime)
+      .filter((k) => k.availableAt <= currentTime && k.allowedDays.includes(currentDay))
       .sort((a, b) => {
         // Hard routing still follows the original rules: priority first, then sticky reuse.
         if (a.priority !== b.priority) return a.priority - b.priority;
@@ -431,14 +438,25 @@ export class KeyManager {
     return null;
   }
 
-  getEarliestAvailableKey(): ApiKeyEntry | null {
-    if (this.keys.length === 0) return null;
-    return [...this.keys].sort((a, b) => a.availableAt - b.availableAt)[0]!;
+  getEarliestAvailableAt(): UnixMs {
+    const currentDay = new Date().getDay();
+    const midnight = midnightLocalMs();
+
+    let earliest = Infinity;
+    for (const k of this.keys) {
+      if (k.allowedDays.includes(currentDay)) {
+        earliest = Math.min(earliest, k.availableAt);
+      } else {
+        earliest = Math.min(earliest, midnight);
+      }
+    }
+    return earliest === Infinity ? unixMs(0) : unixMs(earliest);
   }
 
   availableCount(): number {
     const currentTime = now();
-    return this.keys.filter((k) => k.availableAt <= currentTime).length;
+    const currentDay = new Date().getDay();
+    return this.keys.filter((k) => k.availableAt <= currentTime && k.allowedDays.includes(currentDay)).length;
   }
 
   totalCount(): number {
@@ -692,6 +710,7 @@ export class KeyManager {
       capacity: freshCapacityState(),
       availableAt: unixMs(0),
       priority: 2,
+      allowedDays: ALL_DAYS,
     };
 
     this.keys.push(entry);
@@ -732,6 +751,24 @@ export class KeyManager {
     return true;
   }
 
+  updateKeyAllowedDays(rawKey: string, allowedDays: readonly number[]): boolean {
+    const entry = this.keys.find((k) => k.key === rawKey);
+    if (!entry) return false;
+    entry.allowedDays = allowedDays;
+    this.db.run("UPDATE api_keys SET allowed_days = ? WHERE key = ?", [JSON.stringify(allowedDays), rawKey]);
+    log("info", "Key allowed days updated", { label: entry.label, allowedDays });
+    return true;
+  }
+
+  updateKeyAllowedDaysByMask(masked: string, allowedDays: readonly number[]): boolean {
+    const entry = this.keys.find((k) => maskKey(k.key) === masked);
+    if (!entry) return false;
+    entry.allowedDays = allowedDays;
+    this.db.run("UPDATE api_keys SET allowed_days = ? WHERE key = ?", [JSON.stringify(allowedDays), entry.key]);
+    log("info", "Key allowed days updated", { label: entry.label, allowedDays });
+    return true;
+  }
+
   removeKey(rawKey: string): boolean {
     const idx = this.keys.findIndex((k) => k.key === rawKey);
     if (idx === -1) return false;
@@ -767,6 +804,7 @@ export class KeyManager {
 
   listKeys(): readonly MaskedKeyEntry[] {
     const currentTime = now();
+    const currentDay = new Date().getDay();
     const recentErrs = this.recentErrorsByDimension("key_label", "user_label", "__all__");
     return this.keys.map(
       (k): MaskedKeyEntry => ({
@@ -776,8 +814,9 @@ export class KeyManager {
         capacity: k.capacity,
         capacityHealth: this.getCapacityHealth(k),
         availableAt: k.availableAt,
-        isAvailable: k.availableAt <= currentTime,
+        isAvailable: k.availableAt <= currentTime && k.allowedDays.includes(currentDay),
         priority: k.priority,
+        allowedDays: k.allowedDays,
         recentErrors: recentErrs.get(k.label) ?? 0,
       })
     );
@@ -1319,6 +1358,7 @@ function rowToKeyEntry(
     capacity: stateToCapacity(state, coverage, windows),
     availableAt: r.available_at as UnixMs,
     priority: r.priority,
+    allowedDays: parseAllowedDays(r.allowed_days),
   };
 }
 
@@ -1488,4 +1528,25 @@ function inferObservedSignals(observation: CapacityObservation): Set<string> {
   if (observation.overageStatus !== undefined || observation.overageDisabledReason !== undefined) signals.add("overage");
   if ((observation.windows?.length ?? 0) > 0) signals.add("windows");
   return signals;
+}
+
+const ALL_DAYS: readonly number[] = [0, 1, 2, 3, 4, 5, 6];
+
+function parseAllowedDays(raw: string): readonly number[] {
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return ALL_DAYS;
+    const days = parsed.filter((d: unknown): d is number =>
+      typeof d === "number" && Number.isInteger(d) && d >= 0 && d <= 6
+    );
+    return days.length === 0 ? ALL_DAYS : [...new Set(days)].sort((a, b) => a - b);
+  } catch {
+    return ALL_DAYS;
+  }
+}
+
+function midnightLocalMs(): number {
+  const d = new Date();
+  d.setHours(24, 0, 0, 0);
+  return d.getTime();
 }

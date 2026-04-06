@@ -202,7 +202,13 @@ async function handleUpdateKey(
   req: Request,
   keyManager: KeyManager,
 ): Promise<Response> {
-  const body = await parseJsonBody<{ key?: string; maskedKey?: string; label?: string; priority?: number }>(req);
+  const body = await parseJsonBody<{
+    key?: string;
+    maskedKey?: string;
+    label?: string;
+    priority?: number;
+    allowedDays?: number[];
+  }>(req);
   if (body === null) {
     return json({ error: "Invalid JSON body" }, 400);
   }
@@ -215,8 +221,9 @@ async function handleUpdateKey(
 
   const hasLabel = typeof body.label === "string";
   const hasPriority = typeof body.priority === "number";
-  if (!hasLabel && !hasPriority) {
-    return json({ error: "Need 'label' and/or 'priority' field" }, 400);
+  const hasAllowedDays = Array.isArray(body.allowedDays);
+  if (!hasLabel && !hasPriority && !hasAllowedDays) {
+    return json({ error: "Need 'label', 'priority', and/or 'allowedDays' field" }, 400);
   }
 
   if (hasLabel && body.label!.length === 0) {
@@ -224,6 +231,12 @@ async function handleUpdateKey(
   }
   if (hasPriority && (body.priority! < 1 || body.priority! > 3)) {
     return json({ error: "'priority' must be 1, 2, or 3" }, 400);
+  }
+  if (hasAllowedDays) {
+    const days = body.allowedDays!;
+    if (days.length === 0 || !days.every(d => Number.isInteger(d) && d >= 0 && d <= 6)) {
+      return json({ error: "'allowedDays' must be a non-empty array of integers 0-6" }, 400);
+    }
   }
 
   // Update label (accepts full key or masked key)
@@ -245,7 +258,22 @@ async function handleUpdateKey(
     if (!updated) return json({ error: "Key not found" }, 404);
   }
 
-  return json({ updated: true, ...(hasLabel ? { label: body.label } : {}), ...(hasPriority ? { priority: body.priority } : {}) });
+  // Update allowed days
+  let sortedDays: number[] | undefined;
+  if (hasAllowedDays) {
+    sortedDays = [...new Set(body.allowedDays!)].sort((a, b) => a - b);
+    const updated = hasKey
+      ? keyManager.updateKeyAllowedDays(body.key!, sortedDays)
+      : keyManager.updateKeyAllowedDaysByMask(body.maskedKey!, sortedDays);
+    if (!updated) return json({ error: "Key not found" }, 404);
+  }
+
+  return json({
+    updated: true,
+    ...(hasLabel ? { label: body.label } : {}),
+    ...(hasPriority ? { priority: body.priority } : {}),
+    ...(hasAllowedDays ? { allowedDays: sortedDays } : {}),
+  });
 }
 
 function handleResetKeyCooldowns(

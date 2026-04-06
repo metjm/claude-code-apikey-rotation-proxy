@@ -101,6 +101,8 @@ export interface ApiKeyEntry {
   availableAt: UnixMs;
   /** Selection priority: 1 = Preferred, 2 = Normal, 3 = Fallback. */
   priority: number;
+  /** Days of the week this key may be used. 0=Sun … 6=Sat. Default: all days. */
+  allowedDays: readonly number[];
 }
 
 export interface MaskedKeyEntry {
@@ -112,6 +114,7 @@ export interface MaskedKeyEntry {
   readonly availableAt: UnixMs;
   readonly isAvailable: boolean;
   readonly priority: number;
+  readonly allowedDays: readonly number[];
   readonly recentErrors: number;
 }
 

@@ -121,6 +121,14 @@
   }
   .key-priority-select:focus { outline: none; border-color: var(--blue); }
   .key-priority-select option { background: var(--bg2); color: var(--text); }
+  .day-picker { display: flex; gap: 2px; margin-top: 2px; }
+  .day-btn {
+    width: 22px; height: 20px; border: 1px solid var(--border); border-radius: 3px;
+    background: var(--bg3); color: var(--text-dim); font-family: var(--font);
+    font-size: 9px; cursor: pointer; padding: 0; line-height: 20px; text-align: center;
+  }
+  .day-btn:hover { border-color: var(--blue); }
+  .day-btn.day-active { background: rgba(88,166,255,0.2); color: var(--blue); border-color: rgba(88,166,255,0.5); }
   .badge-row { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
   .metric-inline { color: var(--text-dim); font-size: 10px; line-height: 1.35; }
   .ops-table .badge { white-space: nowrap; }
@@ -676,8 +684,11 @@ function activeCapacityWindows(key) {
 }
 function routingBadge(key) {
   if (!key.isAvailable) {
-    const rem = key.availableAt - Date.now();
-    return `<span class="badge badge-ratelimited">Cooling ${rem > 0 ? fmtCountdown(rem) : ''}</span>`;
+    if (key.availableAt > Date.now()) {
+      const rem = key.availableAt - Date.now();
+      return `<span class="badge badge-ratelimited">Cooling ${fmtCountdown(rem)}</span>`;
+    }
+    return '<span class="badge badge-unknown" title="Key is not scheduled for today">Day Off</span>';
   }
   return '<span class="badge badge-ok">Available</span>';
 }
@@ -1203,6 +1214,15 @@ function renderKeys() {
             <option value="2"${pri === 2 ? ' selected' : ''}>Normal</option>
             <option value="3"${pri === 3 ? ' selected' : ''}>Fallback</option>
           </select>
+          <div class="day-picker" title="Days this key is eligible for routing">
+            ${[['Su',0],['Mo',1],['Tu',2],['We',3],['Th',4],['Fr',5],['Sa',6]].map(([label, day]) => {
+              const active = (k.allowedDays || [0,1,2,3,4,5,6]).includes(day);
+              return \`<button class="day-btn\${active ? ' day-active' : ''}"
+                onclick='toggleKeyDay(\${keyRef}, \${day}, \${!active})'
+                title="\${['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'][day]}"
+              >\${label}</button>\`;
+            }).join('')}
+          </div>
           <div class="badge-row">
             <button class="btn-link" onclick='renameKey(${keyRef})'>Rename</button>
             <button class="btn-link" onclick='removeKey(${keyRef})'>Remove</button>
@@ -1453,6 +1473,25 @@ async function updateKeyPriority(maskedKey, priority) {
     refreshKeys();
   } catch (err) {
     alert('Failed to update priority: ' + err.message);
+  }
+}
+
+async function toggleKeyDay(maskedKey, day, enable) {
+  const key = keys.find(k => k.maskedKey === maskedKey);
+  if (!key) return;
+  const current = key.allowedDays || [0,1,2,3,4,5,6];
+  let next;
+  if (enable) {
+    next = [...new Set([...current, day])].sort((a, b) => a - b);
+  } else {
+    next = current.filter(d => d !== day);
+    if (next.length === 0) { alert('Must have at least one allowed day'); return; }
+  }
+  try {
+    await api('POST', '/admin/keys/update', { maskedKey, allowedDays: next });
+    refreshKeys();
+  } catch (err) {
+    alert('Failed to update allowed days: ' + err.message);
   }
 }
 

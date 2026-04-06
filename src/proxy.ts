@@ -231,9 +231,8 @@ export async function proxyRequest(
 // ── Helpers ───────────────────────────────────────────────────────
 
 function allExhaustedResult(keyManager: KeyManager): ProxyResult {
-  const earliest = keyManager.getEarliestAvailableKey();
-  if (earliest === null) return { kind: "no_keys" };
-  return { kind: "all_exhausted", earliestAvailableAt: earliest.availableAt };
+  if (keyManager.totalCount() === 0) return { kind: "no_keys" };
+  return { kind: "all_exhausted", earliestAvailableAt: keyManager.getEarliestAvailableAt() };
 }
 
 function fetchUpstream(

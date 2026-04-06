@@ -391,18 +391,16 @@ describe("Key Selection", () => {
     expect(selected!.key).toBe(VALID_KEY_2);
   });
 
-  test("getEarliestAvailableKey() returns soonest-available key", () => {
+  test("getEarliestAvailableAt() returns soonest cooldown for rate-limited keys", () => {
     const km = create();
     const k1 = km.addKey(VALID_KEY_1, "far");
     const k2 = km.addKey(VALID_KEY_2, "soon");
-
-    // Rate limit both, but k1 for longer
     km.recordRateLimit(k1, 99999);
     km.recordRateLimit(k2, 10);
-
-    const earliest = km.getEarliestAvailableKey();
-    expect(earliest).not.toBeNull();
-    expect(earliest!.key).toBe(VALID_KEY_2);
+    const earliest = km.getEarliestAvailableAt();
+    // Should be approximately k2's availableAt (soonest cooldown)
+    expect(earliest).toBeGreaterThan(0);
+    expect(Math.abs(earliest - k2.availableAt)).toBeLessThan(1000);
   });
 
   test("availableCount() and totalCount() are correct", () => {
@@ -785,6 +783,123 @@ describe("Key priority", () => {
     km1.updateKeyPriority(VALID_KEY_1, 3);
     const km2 = new KeyManager(tempDir);
     expect(km2.listKeys()[0]!.priority).toBe(3);
+  });
+});
+
+describe("Key day scheduling", () => {
+  test("new keys default to all days [0,1,2,3,4,5,6]", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "test");
+    const listed = km.listKeys();
+    expect(listed[0]!.allowedDays).toEqual([0, 1, 2, 3, 4, 5, 6]);
+  });
+
+  test("updateKeyAllowedDays changes days in memory and persists to DB", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "test");
+    const updated = km.updateKeyAllowedDays(VALID_KEY_1, [1, 2, 3, 4, 5]);
+    expect(updated).toBe(true);
+    expect(km.listKeys()[0]!.allowedDays).toEqual([1, 2, 3, 4, 5]);
+
+    // Reload from DB
+    km.close();
+    const km2 = create();
+    expect(km2.listKeys()[0]!.allowedDays).toEqual([1, 2, 3, 4, 5]);
+    km2.close();
+  });
+
+  test("updateKeyAllowedDays returns false for unknown key", () => {
+    const km = create();
+    expect(km.updateKeyAllowedDays("sk-ant-api03-unknown", [1, 2])).toBe(false);
+  });
+
+  test("updateKeyAllowedDaysByMask works via masked key", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "test");
+    const masked = km.listKeys()[0]!.maskedKey;
+    const updated = km.updateKeyAllowedDaysByMask(masked, [0, 6]);
+    expect(updated).toBe(true);
+    expect(km.listKeys()[0]!.allowedDays).toEqual([0, 6]);
+  });
+
+  test("getNextAvailableKey() skips keys not allowed on current day", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "restricted");
+    km.addKey(VALID_KEY_2, "all-days");
+
+    // Set key 1 to a day that is NOT today
+    const today = new Date().getDay();
+    const notToday = (today + 1) % 7;
+    km.updateKeyAllowedDays(VALID_KEY_1, [notToday]);
+
+    const next = km.getNextAvailableKey();
+    expect(next).not.toBeNull();
+    expect(next!.key).toBe(VALID_KEY_2);
+  });
+
+  test("getNextAvailableKey() returns null when all keys are day-restricted", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "restricted");
+
+    const today = new Date().getDay();
+    const notToday = (today + 1) % 7;
+    km.updateKeyAllowedDays(VALID_KEY_1, [notToday]);
+
+    expect(km.getNextAvailableKey()).toBeNull();
+  });
+
+  test("availableCount() excludes day-restricted keys", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "restricted");
+    km.addKey(VALID_KEY_2, "all-days");
+
+    expect(km.availableCount()).toBe(2);
+
+    const today = new Date().getDay();
+    const notToday = (today + 1) % 7;
+    km.updateKeyAllowedDays(VALID_KEY_1, [notToday]);
+
+    expect(km.availableCount()).toBe(1);
+  });
+
+  test("listKeys() returns allowedDays and correct isAvailable for day-restricted keys", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "restricted");
+
+    const today = new Date().getDay();
+    const notToday = (today + 1) % 7;
+    km.updateKeyAllowedDays(VALID_KEY_1, [notToday]);
+
+    const listed = km.listKeys();
+    expect(listed[0]!.allowedDays).toEqual([notToday]);
+    expect(listed[0]!.isAvailable).toBe(false);
+  });
+
+  test("allowedDays persists across reload", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "test");
+    km.updateKeyAllowedDays(VALID_KEY_1, [1, 3, 5]);
+    km.close();
+
+    const km2 = create();
+    expect(km2.listKeys()[0]!.allowedDays).toEqual([1, 3, 5]);
+    km2.close();
+  });
+
+  test("getEarliestAvailableAt() returns midnight when all keys are day-restricted", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "restricted");
+
+    const today = new Date().getDay();
+    const notToday = (today + 1) % 7;
+    km.updateKeyAllowedDays(VALID_KEY_1, [notToday]);
+
+    const earliest = km.getEarliestAvailableAt();
+    const nowMs = Date.now();
+    // Should be in the future (midnight)
+    expect(earliest).toBeGreaterThan(nowMs);
+    // Should be at most ~24 hours from now
+    expect(earliest - nowMs).toBeLessThanOrEqual(24 * 60 * 60 * 1000);
   });
 });
 
