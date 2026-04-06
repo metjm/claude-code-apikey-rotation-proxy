@@ -865,13 +865,6 @@ function compactQuotaState(key) {
       title: 'Responses were observed, but none carried the normalized limit headers this dashboard understands.',
     };
   }
-  if (key.capacity?.retryAfterSecs && key.capacity.retryAfterSecs > 0) {
-    return {
-      className: 'badge-ratelimited',
-      label: `Retry ${fmtCountdown(key.capacity.retryAfterSecs * 1000)}`,
-      title: `Upstream asked clients to wait ${fmtCountdown(key.capacity.retryAfterSecs * 1000)} before retrying.`,
-    };
-  }
   if (conflictingWindow) {
     return {
       className: 'badge-warning',
@@ -936,14 +929,6 @@ function capacityHeadline(key) {
       subtitle: `Seen ${fmtNum(responseCount)} responses so far. Keep using the key, but treat quota telemetry as unavailable.`,
     };
   }
-  if (key.capacity?.retryAfterSecs && key.capacity.retryAfterSecs > 0) {
-    return {
-      badgeClass: 'badge-ratelimited',
-      badgeLabel: 'Retry later',
-      title: 'Upstream asked clients to wait before retrying recent requests.',
-      subtitle: `Current retry guidance is ${fmtCountdown(key.capacity.retryAfterSecs * 1000)}.`,
-    };
-  }
   if (conflictingWindow) {
     return {
       badgeClass: 'badge-warning',
@@ -997,12 +982,6 @@ function capacityTableSummary(key, telemetry) {
     return {
       main: 'Responses were observed, but no supported limit headers were parsed.',
       sub: 'Treat quota telemetry as unavailable for now.',
-    };
-  }
-  if (key.capacity?.retryAfterSecs && key.capacity.retryAfterSecs > 0) {
-    return {
-      main: 'Upstream asked clients to wait before retrying.',
-      sub: `Latest retry guidance is ${fmtCountdown(key.capacity.retryAfterSecs * 1000)}.`,
     };
   }
   if (conflictingWindow) {
