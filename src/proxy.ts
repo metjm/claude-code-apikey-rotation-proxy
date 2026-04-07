@@ -59,6 +59,8 @@ export async function proxyRequest(
   if (proxyUser) keyManager.recordTokenRequest(proxyUser);
 
   const url = new URL(req.url);
+  const traceId = req.headers.get("x-request-id") ?? crypto.randomUUID();
+  const requestContentLength = req.headers.get("content-length");
 
   const triedKeys = new Set<string>();
   let attempts = 0;
@@ -82,6 +84,7 @@ export async function proxyRequest(
 
     const upstreamUrl = `${config.upstream}${url.pathname}${url.search}`;
     const headers = buildUpstreamHeaders(req.headers, entry.key);
+    const requestBodyState = snapshotRequestBodyState(req);
 
     const allHeaders: Record<string, string> = {};
     for (const [k, v] of headers.entries()) {
@@ -93,9 +96,24 @@ export async function proxyRequest(
       method: req.method,
       path: url.pathname,
       attempt: attempts,
+      traceId,
       upstreamUrl,
+      requestContentLength,
+      requestBodyState,
       headers: allHeaders,
     });
+    if (attempts > 1 || requestBodyState.bodyUsed || requestBodyState.bodyLocked) {
+      log("info", "Retry diagnostics before upstream fetch", {
+        label: entry.label,
+        user: proxyUser?.label,
+        method: req.method,
+        path: url.pathname,
+        attempt: attempts,
+        traceId,
+        requestContentLength,
+        requestBodyState,
+      });
+    }
     emitWithKeys({
       type: "request", ts: new Date().toISOString(), label: entry.label,
       user: proxyUser?.label,
@@ -112,6 +130,13 @@ export async function proxyRequest(
       log("error", "Upstream fetch failed", {
         label: entry.label,
         user: proxyUser?.label,
+        method: req.method,
+        path: url.pathname,
+        attempt: attempts,
+        traceId,
+        durationMs: Date.now() - fetchStartedAt,
+        requestContentLength,
+        requestBodyState: snapshotRequestBodyState(req),
         error: String(err),
       });
       emitWithKeys({
@@ -137,6 +162,11 @@ export async function proxyRequest(
       label: entry.label,
       user: proxyUser?.label,
       status: upstream.status,
+      method: req.method,
+      path: url.pathname,
+      attempt: attempts,
+      traceId,
+      durationMs: Date.now() - fetchStartedAt,
     });
     emitWithKeys({
       type: "response", ts: new Date().toISOString(), label: entry.label,
@@ -155,12 +185,20 @@ export async function proxyRequest(
       const retryAfter = parseRetryAfter(upstream.headers);
       keyManager.recordRateLimit(entry, retryAfter);
       await upstream.text();
+      const retryBodyState = snapshotRequestBodyState(req);
 
       log("info", "Rate limited, trying next key", {
         label: entry.label,
         user: proxyUser?.label,
+        method: req.method,
+        path: url.pathname,
+        attempt: attempts,
+        traceId,
+        durationMs: Date.now() - fetchStartedAt,
         retryAfter,
         availableKeys: keyManager.availableCount(),
+        requestContentLength,
+        requestBodyState: retryBodyState,
       });
       emitWithKeys({
         type: "rate_limit", ts: new Date().toISOString(), label: entry.label,
@@ -233,6 +271,18 @@ export async function proxyRequest(
 function allExhaustedResult(keyManager: KeyManager): ProxyResult {
   if (keyManager.totalCount() === 0) return { kind: "no_keys" };
   return { kind: "all_exhausted", earliestAvailableAt: keyManager.getEarliestAvailableAt() };
+}
+
+function snapshotRequestBodyState(req: Request): {
+  readonly hasBody: boolean;
+  readonly bodyUsed: boolean;
+  readonly bodyLocked: boolean;
+} {
+  return {
+    hasBody: req.body !== null,
+    bodyUsed: req.bodyUsed,
+    bodyLocked: req.body?.locked ?? false,
+  };
 }
 
 function fetchUpstream(
