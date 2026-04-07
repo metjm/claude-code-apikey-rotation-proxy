@@ -97,6 +97,7 @@ function startServer(): void {
 
   const server = Bun.serve({
     port: config.port,
+    idleTimeout: 255,
 
     async fetch(req: Request): Promise<Response> {
       // Serve dashboard
