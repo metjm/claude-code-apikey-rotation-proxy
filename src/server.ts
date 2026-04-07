@@ -99,7 +99,7 @@ function startServer(): void {
     port: config.port,
     idleTimeout: 255,
 
-    async fetch(req: Request): Promise<Response> {
+    async fetch(req: Request, server): Promise<Response> {
       // Serve dashboard
       const url = new URL(req.url);
       if (url.pathname === "/dashboard" || url.pathname === "/dashboard/") {
@@ -121,6 +121,10 @@ function startServer(): void {
       if (adminResponse !== null) {
         return adminResponse;
       }
+
+      // Proxy requests can stay quiet for long periods while Anthropic streams.
+      // Disable Bun's idle timeout for these request lifetimes specifically.
+      server.timeout(req, 0);
 
       // Auth gate: if proxy tokens are configured, require a valid one
       let proxyUser: ProxyTokenEntry | null = null;
