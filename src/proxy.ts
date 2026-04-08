@@ -1188,13 +1188,10 @@ function fetchUpstream(
   signal?: AbortSignal,
 ): Promise<Response> {
   const normalizedSignal = signal ?? null;
-  const upstreamHeaders = new Headers(headers);
-  upstreamHeaders.set("connection", "close");
-
   if (method === "GET" || method === "HEAD" || method === "OPTIONS") {
     return fetch(url, {
       method,
-      headers: upstreamHeaders,
+      headers,
       signal: normalizedSignal,
       keepalive: false,
     });
@@ -1203,7 +1200,7 @@ function fetchUpstream(
     url,
     {
       method,
-      headers: upstreamHeaders,
+      headers,
       body,
       signal: normalizedSignal,
       keepalive: false,

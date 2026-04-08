@@ -270,7 +270,7 @@ describe("Header Handling", () => {
       expect(init).toBeDefined();
       expect((init as RequestInit).keepalive).toBe(false);
       expect((init as RequestInit).headers).toBeInstanceOf(Headers);
-      expect(((init as RequestInit).headers as Headers).get("connection")).toBe("close");
+      expect(((init as RequestInit).headers as Headers).get("connection")).not.toBe("close");
     } finally {
       fetchSpy.mockRestore();
     }
