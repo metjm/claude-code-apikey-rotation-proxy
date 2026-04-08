@@ -1154,6 +1154,7 @@ function renderKeys() {
     const keyRef = JSON.stringify(k.maskedKey);
     const usageLines = [
       `<div><strong>${fmtNum(k.stats.totalRequests)}</strong> req · ${fmtNum(k.stats.totalTokensIn)} in / ${fmtNum(k.stats.totalTokensOut)} out</div>`,
+      `<div title="Unique session-sticky conversation mappings seen on this account in the last 15 minutes">${fmtNum(k.recentLinkedSessions15m || 0)} linked sessions (15m)</div>`,
     ];
     if ((k.stats.totalCacheRead || 0) > 0 || (k.stats.totalCacheCreation || 0) > 0) {
       usageLines.push(`<div title="Cache read / cache write">${fmtNum(k.stats.totalCacheRead || 0)} cache / ${fmtNum(k.stats.totalCacheCreation || 0)} write</div>`);

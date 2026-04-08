@@ -333,6 +333,35 @@ describe("Key CRUD", () => {
     );
     expect(entry.label).toBe("label-a");
     expect(entry.stats.totalRequests).toBe(0);
+    expect(entry.recentLinkedSessions15m).toBe(0);
+  });
+
+  test("listKeys() tracks linked sessions active in the last 15 minutes", () => {
+    const km = create();
+    const originalNow = Date.now;
+    let fakeNow = 1_000_000;
+    Date.now = () => fakeNow;
+
+    try {
+      km.addKey(VALID_KEY_1, "a");
+      km.addKey(VALID_KEY_2, "b");
+
+      expect(km.getKeyForConversation("user-1:session-a").entry?.key).toBe(VALID_KEY_1);
+      expect(km.getKeyForConversation("user-1:session-b").entry?.key).toBe(VALID_KEY_2);
+
+      let keys = km.listKeys().sort((a, b) => String(a.label).localeCompare(String(b.label)));
+      expect(keys.map((key) => key.recentLinkedSessions15m)).toEqual([1, 1]);
+
+      fakeNow += 16 * 60 * 1000;
+      keys = km.listKeys().sort((a, b) => String(a.label).localeCompare(String(b.label)));
+      expect(keys.map((key) => key.recentLinkedSessions15m)).toEqual([0, 0]);
+
+      expect(km.getKeyForConversation("user-1:session-a").entry?.key).toBe(VALID_KEY_1);
+      keys = km.listKeys().sort((a, b) => String(a.label).localeCompare(String(b.label)));
+      expect(keys.map((key) => key.recentLinkedSessions15m)).toEqual([1, 0]);
+    } finally {
+      Date.now = originalNow;
+    }
   });
 
   test("listKeys() returns empty array when no keys", () => {

@@ -306,6 +306,31 @@ describe("Capacity admin payloads", () => {
     expect(body.capacitySummary.windows[0].windowName).toBe("unified");
   });
 
+  test("GET /admin/stats includes recent linked session counts per key", async () => {
+    const originalNow = Date.now;
+    let fakeNow = 1_000_000;
+    Date.now = () => fakeNow;
+
+    try {
+      km.addKey(VALID_KEY, "cap-admin-a");
+      km.addKey(VALID_KEY_2, "cap-admin-b");
+
+      expect(km.getKeyForConversation("user-1:session-a").entry?.key).toBe(VALID_KEY);
+      expect(km.getKeyForConversation("user-1:session-b").entry?.key).toBe(VALID_KEY_2);
+
+      const res = await handleAdminRoute(makeReq("GET", "/admin/stats"), km, makeConfig(), st);
+      const body = await jsonBody(res!) as {
+        keys: Array<{ label: string; recentLinkedSessions15m: number }>;
+      };
+
+      const keyed = new Map(body.keys.map((key) => [String(key.label), key.recentLinkedSessions15m]));
+      expect(keyed.get("cap-admin-a")).toBe(1);
+      expect(keyed.get("cap-admin-b")).toBe(1);
+    } finally {
+      Date.now = originalNow;
+    }
+  });
+
   test("GET /admin/stats keeps successful-response rejected telemetry out of hard-rejection counts", async () => {
     const entry = km.addKey(VALID_KEY, "cap-observed-rejected");
     km.recordCapacityObservation(entry, {

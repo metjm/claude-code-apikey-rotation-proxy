@@ -173,6 +173,7 @@ function currentBucketKey(): string {
 }
 
 const CONVERSATION_AFFINITY_TTL_MS = 60 * 60 * 1000;
+const RECENT_LINKED_SESSION_WINDOW_MS = 15 * 60 * 1000;
 
 export class KeyManager {
   private keys: ApiKeyEntry[] = [];
@@ -956,6 +957,9 @@ export class KeyManager {
     const currentTime = now();
     const currentDay = new Date().getDay();
     const recentErrs = this.recentErrorsByDimension("key_label", "user_label", "__all__");
+    const recentLinkedSessionCounts = this.countConversationAffinitiesByKey(
+      unixMs(Date.now() - RECENT_LINKED_SESSION_WINDOW_MS),
+    );
     return this.keys.map(
       (k): MaskedKeyEntry => ({
         maskedKey: maskKey(k.key),
@@ -968,6 +972,7 @@ export class KeyManager {
         priority: k.priority,
         allowedDays: k.allowedDays,
         recentErrors: recentErrs.get(k.label) ?? 0,
+        recentLinkedSessions15m: recentLinkedSessionCounts.get(k.key) ?? 0,
       })
     );
   }
@@ -1337,9 +1342,10 @@ export class KeyManager {
     return this.keys.filter((entry) => this.isKeyAvailable(entry) && entry.priority === priority).length;
   }
 
-  private countConversationAffinitiesByKey(): Map<ApiKey, number> {
+  private countConversationAffinitiesByKey(cutoff?: UnixMs): Map<ApiKey, number> {
     const counts = new Map<ApiKey, number>();
     for (const affinity of this.conversationAffinities.values()) {
+      if (cutoff !== undefined && affinity.lastSeenAt < cutoff) continue;
       counts.set(affinity.key, (counts.get(affinity.key) ?? 0) + 1);
     }
     return counts;

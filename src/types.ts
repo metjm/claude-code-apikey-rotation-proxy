@@ -116,6 +116,7 @@ export interface MaskedKeyEntry {
   readonly priority: number;
   readonly allowedDays: readonly number[];
   readonly recentErrors: number;
+  readonly recentLinkedSessions15m: number;
 }
 
 // ── Proxy token entry ─────────────────────────────────────────────
