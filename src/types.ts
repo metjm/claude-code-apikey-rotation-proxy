@@ -116,7 +116,7 @@ export interface MaskedKeyEntry {
   readonly priority: number;
   readonly allowedDays: readonly number[];
   readonly recentErrors: number;
-  readonly recentSessions15s: readonly {
+  readonly recentSessions15m: readonly {
     readonly sessionId: string;
     readonly lastSeenAt: string;
   }[];

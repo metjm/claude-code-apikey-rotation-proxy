@@ -1128,7 +1128,7 @@ function renderKeys() {
         <th>State</th>
         <th>Limits</th>
         <th>Usage</th>
-        <th>Sessions (15s)</th>
+        <th>Sessions (15m)</th>
         <th>Controls</th>
       </tr>
     </thead>
@@ -1186,9 +1186,9 @@ function renderKeys() {
     if ((k.stats.totalCacheRead || 0) > 0 || (k.stats.totalCacheCreation || 0) > 0) {
       usageLines.push(`<div title="Cache read / cache write">${fmtNum(k.stats.totalCacheRead || 0)} cache / ${fmtNum(k.stats.totalCacheCreation || 0)} write</div>`);
     }
-    const recentSessions = Array.isArray(k.recentSessions15s) ? k.recentSessions15s : [];
+    const recentSessions = Array.isArray(k.recentSessions15m) ? k.recentSessions15m : [];
     const sessionsHtml = recentSessions.length === 0
-      ? '<div class="table-sub">No sessions seen in last 15s</div>'
+      ? '<div class="table-sub">No sessions seen in last 15m</div>'
       : `<table class="session-table"><thead><tr><th>Session</th><th>Seen</th></tr></thead><tbody>${
           recentSessions.map(session => `
             <tr>

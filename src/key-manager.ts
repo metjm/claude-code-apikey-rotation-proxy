@@ -175,7 +175,7 @@ function currentBucketKey(): string {
 }
 
 const CONVERSATION_AFFINITY_TTL_MS = 60 * 60 * 1000;
-const RECENT_SESSION_WINDOW_MS = 15 * 1000;
+const RECENT_SESSION_WINDOW_MS = 15 * 60 * 1000;
 
 export class KeyManager {
   private keys: ApiKeyEntry[] = [];
@@ -990,7 +990,7 @@ export class KeyManager {
         priority: k.priority,
         allowedDays: k.allowedDays,
         recentErrors: recentErrs.get(k.label) ?? 0,
-        recentSessions15s: recentSessionsByKey.get(k.key) ?? [],
+        recentSessions15m: recentSessionsByKey.get(k.key) ?? [],
       })
     );
   }
