@@ -113,6 +113,13 @@ interface CapacityTsRow {
   utilization_max: number;
 }
 
+interface ConversationAffinityRow {
+  conversation_key: string;
+  key: string;
+  assigned_at: number;
+  last_seen_at: number;
+}
+
 // ── KeyManager ────────────────────────────────────────────────────
 
 interface BucketAccumulator {
@@ -136,6 +143,23 @@ interface CapacityBucketAccumulator {
   utilizationMax: number;
 }
 
+interface ConversationAffinityEntry {
+  conversationKey: string;
+  key: ApiKey;
+  assignedAt: UnixMs;
+  lastSeenAt: UnixMs;
+}
+
+interface ConversationKeySelection {
+  entry: ApiKeyEntry | null;
+  routingDecision: "global_sticky_fallback" | "conversation_affinity_hit" | "conversation_new_assignment" | "conversation_affinity_remapped";
+  affinityHit: boolean;
+  remapped: boolean;
+  priorityTier: number | null;
+  candidateCount: number;
+  conversationCountForSelectedKey: number | null;
+}
+
 function emptyBucket(): BucketAccumulator {
   return { requests: 0, successes: 0, errors: 0, rateLimits: 0, tokensIn: 0, tokensOut: 0, cacheRead: 0, cacheCreation: 0 };
 }
@@ -148,9 +172,12 @@ function currentBucketKey(): string {
   return new Date().toISOString().slice(0, 13);
 }
 
+const CONVERSATION_AFFINITY_TTL_MS = 60 * 60 * 1000;
+
 export class KeyManager {
   private keys: ApiKeyEntry[] = [];
   private tokens: ProxyTokenEntry[] = [];
+  private readonly conversationAffinities = new Map<string, ConversationAffinityEntry>();
   private readonly db: Database;
   readonly dbPath: string;
   private readonly cleanupInterval: ReturnType<typeof setInterval>;
@@ -176,6 +203,7 @@ export class KeyManager {
       if (this.isClosed) return;
       try {
         this.cleanupOldTimeseries();
+        this.cleanupExpiredConversationAffinities(true);
       } catch (error) {
         log("warn", "Failed to clean up key manager timeseries", {
           dbPath: this.dbPath,
@@ -309,6 +337,16 @@ export class KeyManager {
       );
 
       CREATE INDEX IF NOT EXISTS idx_capacity_window_ts_bucket ON capacity_window_timeseries(bucket);
+
+      CREATE TABLE IF NOT EXISTS conversation_affinities (
+        conversation_key TEXT PRIMARY KEY,
+        key TEXT NOT NULL,
+        assigned_at INTEGER NOT NULL,
+        last_seen_at INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_conversation_affinities_key ON conversation_affinities(key);
+      CREATE INDEX IF NOT EXISTS idx_conversation_affinities_last_seen ON conversation_affinities(last_seen_at);
     `);
 
     // Migrate existing tables to add cache columns
@@ -437,6 +475,22 @@ export class KeyManager {
     const tokenRows = this.db.query("SELECT * FROM proxy_tokens").all() as TokenRow[];
     this.tokens = tokenRows.map((r) => rowToTokenEntry(r));
 
+    const affinityRows = this.db.query("SELECT * FROM conversation_affinities").all() as ConversationAffinityRow[];
+    this.conversationAffinities.clear();
+    const validKeys = new Set(this.keys.map((entry) => entry.key));
+    const cutoff = unixMs(Date.now() - CONVERSATION_AFFINITY_TTL_MS);
+    for (const row of affinityRows) {
+      if ((row.last_seen_at as UnixMs) < cutoff) continue;
+      if (!validKeys.has(row.key as ApiKey)) continue;
+      this.conversationAffinities.set(row.conversation_key, {
+        conversationKey: row.conversation_key,
+        key: row.key as ApiKey,
+        assignedAt: row.assigned_at as UnixMs,
+        lastSeenAt: row.last_seen_at as UnixMs,
+      });
+    }
+    this.cleanupExpiredConversationAffinities(true);
+
     log("info", `Loaded ${this.keys.length} key(s) and ${this.tokens.length} token(s) from SQLite`);
   }
 
@@ -461,6 +515,73 @@ export class KeyManager {
 
     if (available.length > 0) return available[0]!;
     return null;
+  }
+
+  getKeyForConversation(conversationKey: string | null): ConversationKeySelection {
+    if (conversationKey === null) {
+      const entry = this.getNextAvailableKey();
+      return {
+        entry,
+        routingDecision: "global_sticky_fallback",
+        affinityHit: false,
+        remapped: false,
+        priorityTier: entry?.priority ?? null,
+        candidateCount: entry === null ? 0 : this.countAvailableKeysAtPriority(entry.priority),
+        conversationCountForSelectedKey: entry === null ? null : this.countConversationAffinitiesByKey().get(entry.key) ?? 0,
+      };
+    }
+
+    this.cleanupExpiredConversationAffinities(true);
+    const currentTime = now();
+    const existing = this.conversationAffinities.get(conversationKey);
+    if (existing !== undefined) {
+      existing.lastSeenAt = currentTime;
+      const mappedEntry = this.keys.find((entry) => entry.key === existing.key) ?? null;
+      if (mappedEntry !== null && this.isKeyAvailable(mappedEntry)) {
+        this.scheduleSave();
+        return {
+          entry: mappedEntry,
+          routingDecision: "conversation_affinity_hit",
+          affinityHit: true,
+          remapped: false,
+          priorityTier: mappedEntry.priority,
+          candidateCount: this.countAvailableKeysAtPriority(mappedEntry.priority),
+          conversationCountForSelectedKey: this.countConversationAffinitiesByKey().get(mappedEntry.key) ?? 0,
+        };
+      }
+    }
+
+    const fallback = this.selectLeastLoadedAvailableKey();
+    if (fallback === null) {
+      return {
+        entry: null,
+        routingDecision: existing === undefined ? "conversation_new_assignment" : "conversation_affinity_remapped",
+        affinityHit: false,
+        remapped: false,
+        priorityTier: null,
+        candidateCount: 0,
+        conversationCountForSelectedKey: null,
+      };
+    }
+
+    const assignedAt = existing?.assignedAt ?? currentTime;
+    this.conversationAffinities.set(conversationKey, {
+      conversationKey,
+      key: fallback.entry.key,
+      assignedAt,
+      lastSeenAt: currentTime,
+    });
+    this.scheduleSave();
+
+    return {
+      entry: fallback.entry,
+      routingDecision: existing === undefined ? "conversation_new_assignment" : "conversation_affinity_remapped",
+      affinityHit: false,
+      remapped: existing !== undefined && existing.key !== fallback.entry.key,
+      priorityTier: fallback.priorityTier,
+      candidateCount: fallback.candidateCount,
+      conversationCountForSelectedKey: (fallback.conversationCounts.get(fallback.entry.key) ?? 0) + (existing?.key === fallback.entry.key ? 0 : 1),
+    };
   }
 
   getEarliestAvailableAt(): UnixMs {
@@ -802,6 +923,8 @@ export class KeyManager {
     this.db.run("DELETE FROM api_key_capacity_state WHERE key = ?", [removed.key]);
     this.db.run("DELETE FROM api_key_capacity_signal_coverage WHERE key = ?", [removed.key]);
     this.db.run("DELETE FROM api_key_capacity_windows WHERE key = ?", [removed.key]);
+    this.db.run("DELETE FROM conversation_affinities WHERE key = ?", [removed.key]);
+    this.removeConversationAffinitiesForKey(removed.key);
     log("info", "Key removed", { label: removed.label });
     return true;
   }
@@ -814,6 +937,8 @@ export class KeyManager {
     this.db.run("DELETE FROM api_key_capacity_state WHERE key = ?", [removed.key]);
     this.db.run("DELETE FROM api_key_capacity_signal_coverage WHERE key = ?", [removed.key]);
     this.db.run("DELETE FROM api_key_capacity_windows WHERE key = ?", [removed.key]);
+    this.db.run("DELETE FROM conversation_affinities WHERE key = ?", [removed.key]);
+    this.removeConversationAffinitiesForKey(removed.key);
     log("info", "Key removed", { label: removed.label });
     return true;
   }
@@ -1182,6 +1307,75 @@ export class KeyManager {
     this.db.run("DELETE FROM capacity_window_timeseries WHERE bucket < ?", [cutoff]);
   }
 
+  private cleanupExpiredConversationAffinities(persist: boolean): void {
+    const cutoff = unixMs(Date.now() - CONVERSATION_AFFINITY_TTL_MS);
+    const validKeys = new Set(this.keys.map((entry) => entry.key));
+    let removed = false;
+    for (const [conversationKey, affinity] of this.conversationAffinities) {
+      if (affinity.lastSeenAt >= cutoff && validKeys.has(affinity.key)) continue;
+      this.conversationAffinities.delete(conversationKey);
+      removed = true;
+    }
+    if (!removed) return;
+    if (persist) this.scheduleSave();
+  }
+
+  private removeConversationAffinitiesForKey(key: ApiKey): void {
+    for (const [conversationKey, affinity] of this.conversationAffinities) {
+      if (affinity.key !== key) continue;
+      this.conversationAffinities.delete(conversationKey);
+    }
+  }
+
+  private isKeyAvailable(entry: ApiKeyEntry): boolean {
+    const currentTime = now();
+    const currentDay = new Date().getDay();
+    return entry.availableAt <= currentTime && entry.allowedDays.includes(currentDay);
+  }
+
+  private countAvailableKeysAtPriority(priority: number): number {
+    return this.keys.filter((entry) => this.isKeyAvailable(entry) && entry.priority === priority).length;
+  }
+
+  private countConversationAffinitiesByKey(): Map<ApiKey, number> {
+    const counts = new Map<ApiKey, number>();
+    for (const affinity of this.conversationAffinities.values()) {
+      counts.set(affinity.key, (counts.get(affinity.key) ?? 0) + 1);
+    }
+    return counts;
+  }
+
+  private selectLeastLoadedAvailableKey(): {
+    entry: ApiKeyEntry;
+    priorityTier: number;
+    candidateCount: number;
+    conversationCounts: Map<ApiKey, number>;
+  } | null {
+    const available = this.keys.filter((entry) => this.isKeyAvailable(entry));
+    if (available.length === 0) return null;
+
+    const bestPriority = Math.min(...available.map((entry) => entry.priority));
+    const conversationCounts = this.countConversationAffinitiesByKey();
+    const candidates = available
+      .filter((entry) => entry.priority === bestPriority)
+      .sort((a, b) => {
+        const conversationDiff = (conversationCounts.get(a.key) ?? 0) - (conversationCounts.get(b.key) ?? 0);
+        if (conversationDiff !== 0) return conversationDiff;
+
+        const lastUsedDiff = (a.stats.lastUsedAt ?? 0) - (b.stats.lastUsedAt ?? 0);
+        if (lastUsedDiff !== 0) return lastUsedDiff;
+
+        return a.label.localeCompare(b.label);
+      });
+
+    return {
+      entry: candidates[0]!,
+      priorityTier: bestPriority,
+      candidateCount: candidates.length,
+      conversationCounts,
+    };
+  }
+
   // ── Persistence ─────────────────────────────────────────────────
 
   private scheduleSave(): void {
@@ -1285,6 +1479,11 @@ export class KeyManager {
         utilization_samples = utilization_samples + excluded.utilization_samples,
         utilization_max = MAX(utilization_max, excluded.utilization_max)
     `);
+    const clearConversationAffinities = this.db.prepare("DELETE FROM conversation_affinities");
+    const insertConversationAffinity = this.db.prepare(`
+      INSERT INTO conversation_affinities (conversation_key, key, assigned_at, last_seen_at)
+      VALUES (?, ?, ?, ?)
+    `);
 
     this.db.transaction(() => {
       for (const k of this.keys) {
@@ -1357,6 +1556,15 @@ export class KeyManager {
           acc.utilizationSum,
           acc.utilizationSamples,
           acc.utilizationMax,
+        );
+      }
+      clearConversationAffinities.run();
+      for (const affinity of this.conversationAffinities.values()) {
+        insertConversationAffinity.run(
+          affinity.conversationKey,
+          affinity.key,
+          affinity.assignedAt,
+          affinity.lastSeenAt,
         );
       }
       this.tsAccumulator.clear();

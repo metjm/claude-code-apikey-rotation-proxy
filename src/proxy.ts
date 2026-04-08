@@ -38,6 +38,21 @@ function getStreamReader(source: ReadableStream<Uint8Array>) {
 
 type UpstreamReader = ReturnType<typeof getStreamReader>;
 
+type RoutingSelection = {
+  readonly entry: ApiKeyEntry | null;
+  readonly routingDecision:
+    | "first_chunk_retry_same_key"
+    | "global_sticky_fallback"
+    | "conversation_affinity_hit"
+    | "conversation_new_assignment"
+    | "conversation_affinity_remapped";
+  readonly affinityHit: boolean;
+  readonly remapped: boolean;
+  readonly priorityTier: number | null;
+  readonly candidateCount: number;
+  readonly conversationCountForSelectedKey: number | null;
+};
+
 type StreamStartFailureReason =
   | "first_chunk_timeout"
   | "stream_ended_before_first_chunk"
@@ -119,6 +134,8 @@ export async function proxyRequest(
 
   const url = new URL(req.url);
   const traceId = req.headers.get("x-request-id") ?? crypto.randomUUID();
+  const sessionId = normalizeConversationSessionId(req.headers.get("x-claude-code-session-id"));
+  const conversationKey = buildConversationKey(proxyUser, sessionId);
   const requestContentLength = req.headers.get("content-length");
   let requestBody: BufferedRequestBody;
   try {
@@ -151,9 +168,18 @@ export async function proxyRequest(
   let preferredRetryKey: ApiKeyEntry | null = null;
 
   while (attempts < config.maxRetriesPerRequest) {
-    const entry: ApiKeyEntry | null = preferredRetryKey !== null && isKeyAvailableNow(preferredRetryKey)
-      ? preferredRetryKey
-      : keyManager.getNextAvailableKey();
+    const selection: RoutingSelection = preferredRetryKey !== null && isKeyAvailableNow(preferredRetryKey)
+      ? {
+          entry: preferredRetryKey,
+          routingDecision: "first_chunk_retry_same_key",
+          affinityHit: conversationKey !== null,
+          remapped: false,
+          priorityTier: preferredRetryKey.priority,
+          candidateCount: 1,
+          conversationCountForSelectedKey: null,
+        }
+      : keyManager.getKeyForConversation(conversationKey);
+    const entry: ApiKeyEntry | null = selection.entry;
     preferredRetryKey = null;
 
     if (entry === null) {
@@ -181,6 +207,14 @@ export async function proxyRequest(
       path: url.pathname,
       attempt: attempts,
       traceId,
+      sessionId,
+      conversationKey,
+      routingDecision: selection.routingDecision,
+      affinityHit: selection.affinityHit,
+      remappedConversation: selection.remapped,
+      priorityTier: selection.priorityTier,
+      candidateCount: selection.candidateCount,
+      conversationCountForSelectedKey: selection.conversationCountForSelectedKey,
       upstreamUrl,
       requestContentLength,
       requestBodyState,
@@ -194,6 +228,8 @@ export async function proxyRequest(
         path: url.pathname,
         attempt: attempts,
         traceId,
+        sessionId,
+        conversationKey,
         requestContentLength,
         requestBodyState,
       });
@@ -279,6 +315,7 @@ export async function proxyRequest(
         path: url.pathname,
         attempt: attempts,
         traceId,
+        sessionId,
         durationMs: Date.now() - fetchStartedAt,
         retryAfter,
         availableKeys: keyManager.availableCount(),
@@ -352,11 +389,12 @@ export async function proxyRequest(
           user: proxyUser?.label,
           method: req.method,
           path: url.pathname,
-          attempt: attempts,
-          traceId,
-          durationMs: Date.now() - fetchStartedAt,
-          firstChunkTimeoutMs: config.firstChunkTimeoutMs,
-          maxFirstChunkRetries: config.maxFirstChunkRetries,
+        attempt: attempts,
+        traceId,
+        sessionId,
+        durationMs: Date.now() - fetchStartedAt,
+        firstChunkTimeoutMs: config.firstChunkTimeoutMs,
+        maxFirstChunkRetries: config.maxFirstChunkRetries,
           firstChunkRetries,
           retryStrategy: "sticky_same_key_unless_unavailable",
           reason: firstChunk.reason,
@@ -431,6 +469,20 @@ function isKeyAvailableNow(entry: ApiKeyEntry): boolean {
   const currentTime = unixMs(Date.now());
   const currentDay = new Date().getDay();
   return entry.availableAt <= currentTime && entry.allowedDays.includes(currentDay);
+}
+
+function normalizeConversationSessionId(raw: string | null): string | null {
+  const normalized = raw?.trim() ?? "";
+  return normalized === "" ? null : normalized;
+}
+
+function buildConversationKey(
+  proxyUser: ProxyTokenEntry | null | undefined,
+  sessionId: string | null,
+): string | null {
+  if (sessionId === null) return null;
+  const actor = proxyUser?.label ?? "anon";
+  return `${actor}:${sessionId}`;
 }
 
 function firstChunkFailureResult(

@@ -2567,6 +2567,134 @@ describe("Capacity observation integration", () => {
 });
 
 describe("Day-restricted keys", () => {
+  test("different Claude Code sessions balance across equal-priority keys and stay sticky", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    km.addKey(FAKE_KEY_B, "key-b");
+
+    const seen: Array<{ session: string | null; key: string | null }> = [];
+    const mock = upstream((req) => {
+      seen.push({
+        session: req.headers.get("x-claude-code-session-id"),
+        key: req.headers.get("x-api-key"),
+      });
+      return new Response(JSON.stringify({
+        usage: {
+          input_tokens: 1,
+          output_tokens: 1,
+        },
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+
+    const config = makeConfig(mock.url);
+
+    const sessionA1 = await proxyRequest(makeRequest("/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-claude-code-session-id": "session-a",
+      },
+      body: JSON.stringify({ messages: [{ role: "user", content: "a1" }] }),
+    }), km, config, st);
+    expect(sessionA1.kind).toBe("success");
+
+    const sessionB1 = await proxyRequest(makeRequest("/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-claude-code-session-id": "session-b",
+      },
+      body: JSON.stringify({ messages: [{ role: "user", content: "b1" }] }),
+    }), km, config, st);
+    expect(sessionB1.kind).toBe("success");
+
+    const sessionA2 = await proxyRequest(makeRequest("/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-claude-code-session-id": "session-a",
+      },
+      body: JSON.stringify({ messages: [{ role: "user", content: "a2" }] }),
+    }), km, config, st);
+    expect(sessionA2.kind).toBe("success");
+
+    const sessionB2 = await proxyRequest(makeRequest("/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-claude-code-session-id": "session-b",
+      },
+      body: JSON.stringify({ messages: [{ role: "user", content: "b2" }] }),
+    }), km, config, st);
+    expect(sessionB2.kind).toBe("success");
+
+    expect(seen).toEqual([
+      { session: "session-a", key: FAKE_KEY_A },
+      { session: "session-b", key: FAKE_KEY_B },
+      { session: "session-a", key: FAKE_KEY_A },
+      { session: "session-b", key: FAKE_KEY_B },
+    ]);
+  });
+
+  test("a session remaps after 429 and stays on the new key", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    km.addKey(FAKE_KEY_B, "key-b");
+
+    const seen: string[] = [];
+    let sessionAAttempts = 0;
+    const mock = upstream((req) => {
+      const key = req.headers.get("x-api-key");
+      seen.push(key ?? "");
+      if (key === FAKE_KEY_A) {
+        sessionAAttempts++;
+        if (sessionAAttempts === 1) {
+          return new Response("rate limited", {
+            status: 429,
+            headers: { "retry-after": "30" },
+          });
+        }
+      }
+
+      return new Response(JSON.stringify({
+        usage: {
+          input_tokens: 1,
+          output_tokens: 1,
+        },
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+
+    const config = makeConfig(mock.url);
+
+    const first = await proxyRequest(makeRequest("/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-claude-code-session-id": "session-a",
+      },
+      body: JSON.stringify({ messages: [{ role: "user", content: "first" }] }),
+    }), km, config, st);
+    expect(first.kind).toBe("success");
+
+    const second = await proxyRequest(makeRequest("/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-claude-code-session-id": "session-a",
+      },
+      body: JSON.stringify({ messages: [{ role: "user", content: "second" }] }),
+    }), km, config, st);
+    expect(second.kind).toBe("success");
+
+    expect(seen).toEqual([FAKE_KEY_A, FAKE_KEY_B, FAKE_KEY_B]);
+  });
+
   test("returns all_exhausted with future earliestAvailableAt when all keys are day-restricted", async () => {
     const { km, st, cleanup } = createTestSetup();
     const mock = startMockUpstream(() => new Response("OK"));

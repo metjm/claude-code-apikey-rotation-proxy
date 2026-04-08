@@ -436,6 +436,94 @@ describe("Key Selection", () => {
     expect(km.totalCount()).toBe(2);
     expect(km.availableCount()).toBe(1);
   });
+
+  test("getKeyForConversation() keeps the same conversation sticky to its assigned key", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "a");
+    const other = km.addKey(VALID_KEY_2, "b");
+
+    const first = km.getKeyForConversation("user-1:session-a");
+    expect(first.entry?.key).toBe(VALID_KEY_1);
+    expect(first.affinityHit).toBe(false);
+
+    km.recordRequest(other);
+
+    const second = km.getKeyForConversation("user-1:session-a");
+    expect(second.entry?.key).toBe(VALID_KEY_1);
+    expect(second.affinityHit).toBe(true);
+    expect(second.routingDecision).toBe("conversation_affinity_hit");
+  });
+
+  test("getKeyForConversation() balances different conversations across equal-priority keys", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "a");
+    km.addKey(VALID_KEY_2, "b");
+
+    const first = km.getKeyForConversation("user-1:session-a");
+    expect(first.entry?.key).toBe(VALID_KEY_1);
+    km.recordRequest(first.entry!);
+
+    const second = km.getKeyForConversation("user-1:session-b");
+    expect(second.entry?.key).toBe(VALID_KEY_2);
+    km.recordRequest(second.entry!);
+
+    const third = km.getKeyForConversation("user-1:session-c");
+    expect(third.entry?.key).toBe(VALID_KEY_1);
+    expect(third.priorityTier).toBe(2);
+  });
+
+  test("getKeyForConversation() only balances within the best available priority tier", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "preferred-a");
+    km.addKey(VALID_KEY_2, "preferred-b");
+    km.addKey(VALID_KEY_3, "normal-c");
+    km.updateKeyPriority(VALID_KEY_1, 1);
+    km.updateKeyPriority(VALID_KEY_2, 1);
+    km.updateKeyPriority(VALID_KEY_3, 2);
+
+    const first = km.getKeyForConversation("user-1:session-a");
+    expect(first.entry?.key).toBe(VALID_KEY_1);
+    km.recordRequest(first.entry!);
+
+    const second = km.getKeyForConversation("user-1:session-b");
+    expect(second.entry?.key).toBe(VALID_KEY_2);
+    km.recordRequest(second.entry!);
+
+    const third = km.getKeyForConversation("user-1:session-c");
+    expect([VALID_KEY_1, VALID_KEY_2]).toContain(third.entry?.key);
+    expect(third.entry?.key).not.toBe(VALID_KEY_3);
+    expect(third.priorityTier).toBe(1);
+  });
+
+  test("getKeyForConversation() remaps a conversation when its assigned key is rate-limited", () => {
+    const km = create();
+    const firstKey = km.addKey(VALID_KEY_1, "a");
+    km.addKey(VALID_KEY_2, "b");
+
+    const first = km.getKeyForConversation("user-1:session-a");
+    expect(first.entry?.key).toBe(VALID_KEY_1);
+
+    km.recordRateLimit(firstKey, 99999);
+
+    const second = km.getKeyForConversation("user-1:session-a");
+    expect(second.entry?.key).toBe(VALID_KEY_2);
+    expect(second.remapped).toBe(true);
+    expect(second.routingDecision).toBe("conversation_affinity_remapped");
+  });
+
+  test("getKeyForConversation() persists conversation affinity across reload", () => {
+    const km1 = create();
+    km1.addKey(VALID_KEY_1, "a");
+    km1.addKey(VALID_KEY_2, "b");
+    const first = km1.getKeyForConversation("user-1:session-a");
+    expect(first.entry?.key).toBe(VALID_KEY_1);
+    km1.close();
+
+    const km2 = create();
+    const second = km2.getKeyForConversation("user-1:session-a");
+    expect(second.entry?.key).toBe(VALID_KEY_1);
+    expect(second.affinityHit).toBe(true);
+  });
 });
 
 // ── Key Stats Recording ─────────────────────────────────────────────────────
