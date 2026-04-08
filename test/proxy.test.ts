@@ -1,4 +1,4 @@
-import { describe, test, expect, afterEach, beforeEach } from "bun:test";
+import { describe, test, expect, afterEach, beforeEach, spyOn } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,6 +9,7 @@ import { proxyRequest } from "../src/proxy.ts";
 import { subscribe, type ProxyEvent } from "../src/events.ts";
 import type { ProxyConfig, ProxyTokenEntry } from "../src/types.ts";
 import { SchemaTracker } from "../src/schema-tracker.ts";
+import { setLogLevel } from "../src/logger.ts";
 
 // ── Helpers ────────────────────────────────────────────────────────
 
@@ -907,6 +908,68 @@ describe("Token Tracking - Streaming (SSE)", () => {
       },
     });
   }
+
+  function parseConsoleEntries(logSpy: ReturnType<typeof spyOn>): Array<Record<string, unknown>> {
+    return logSpy.mock.calls.map(([line]) => JSON.parse(line as string) as Record<string, unknown>);
+  }
+
+  test("logs stream lifecycle with trace IDs and chunk timing", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    setLogLevel("debug");
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+
+    const sseData = [
+      'data: {"type":"message_start","message":{"usage":{"input_tokens":10}}}\n\n',
+      'data: {"type":"message_delta","usage":{"output_tokens":5}}\n\n',
+      "data: [DONE]\n\n",
+    ];
+
+    const mock = upstream(() =>
+      new Response(makeSSEBody(sseData), {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }),
+    );
+
+    try {
+      const config = makeConfig(mock.url);
+      const result = await proxyRequest(
+        makeRequest("/v1/messages", { headers: { "x-request-id": "trace-stream-1" } }),
+        km,
+        config,
+        st,
+      );
+
+      expect(result.kind).toBe("success");
+      if (result.kind === "success") {
+        await result.response.text();
+      }
+
+      const entries = parseConsoleEntries(logSpy);
+      const opened = entries.find((entry) => entry.msg === "Stream opened");
+      const firstChunk = entries.find((entry) => entry.msg === "Stream first chunk");
+      const closed = entries.find((entry) => entry.msg === "Stream closed");
+
+      expect(opened).toBeDefined();
+      expect(opened?.traceId).toBe("trace-stream-1");
+      expect(opened?.activeStreams).toBe(1);
+
+      expect(firstChunk).toBeDefined();
+      expect(firstChunk?.traceId).toBe("trace-stream-1");
+      expect(firstChunk?.firstChunkDelayMs).toEqual(expect.any(Number));
+      expect(firstChunk?.otherRecentlyActiveStreams).toBe(0);
+
+      expect(closed).toBeDefined();
+      expect(closed?.traceId).toBe("trace-stream-1");
+      expect(closed?.chunkCount).toBeGreaterThan(0);
+      expect(closed?.eventCount).toBe(2);
+      expect(closed?.activeStreamsRemaining).toBe(0);
+    } finally {
+      logSpy.mockRestore();
+      setLogLevel("info");
+    }
+  });
 
   test("detects text/event-stream content-type", async () => {
     const { km, st } = setup();

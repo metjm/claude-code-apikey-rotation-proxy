@@ -11,6 +11,24 @@ import { emitWithKeys } from "./events.ts";
 import type { SchemaTracker } from "./schema-tracker.ts";
 
 const RATE_LIMIT_STATUS = 429 as const;
+const ACTIVE_STREAM_SNAPSHOT_INTERVAL_MS = 2_000;
+const RECENT_STREAM_ACTIVITY_WINDOW_MS = 1_000;
+
+type ActiveStreamState = {
+  readonly traceId: string;
+  readonly label: string;
+  readonly user: string | undefined;
+  readonly path: string;
+  readonly openedAt: number;
+  firstChunkAt: number | null;
+  lastChunkAt: number | null;
+  chunkCount: number;
+  eventCount: number;
+  bytesReceived: number;
+};
+
+const activeStreams = new Map<string, ActiveStreamState>();
+let lastActiveStreamSnapshotAt = 0;
 
 /**
  * Headers we strip from the outgoing request — they get replaced with our key
@@ -235,7 +253,15 @@ export async function proxyRequest(
     let body: ReadableStream<Uint8Array> | string | null;
 
     if (isStreaming && upstream.body !== null) {
-      body = createTokenTrackingStream(upstream.body, entry, keyManager, proxyUser, schemaTracker, url.pathname);
+      body = createTokenTrackingStream(
+        upstream.body,
+        entry,
+        keyManager,
+        proxyUser,
+        schemaTracker,
+        url.pathname,
+        traceId,
+      );
     } else if (upstream.body !== null) {
       const text = await upstream.text();
       extractTokensFromJson(text, entry, keyManager, proxyUser);
@@ -283,6 +309,139 @@ function snapshotRequestBodyState(req: Request): {
     bodyUsed: req.bodyUsed,
     bodyLocked: req.body?.locked ?? false,
   };
+}
+
+function countRecentlyActiveStreams(now: number): number {
+  let count = 0;
+  for (const stream of activeStreams.values()) {
+    if (stream.lastChunkAt !== null && now - stream.lastChunkAt <= RECENT_STREAM_ACTIVITY_WINDOW_MS) {
+      count++;
+    }
+  }
+  return count;
+}
+
+function maybeLogActiveStreamSnapshot(now: number): void {
+  if (activeStreams.size <= 1) return;
+  if (now - lastActiveStreamSnapshotAt < ACTIVE_STREAM_SNAPSHOT_INTERVAL_MS) return;
+  lastActiveStreamSnapshotAt = now;
+
+  const streams = [...activeStreams.values()]
+    .sort((a, b) => a.openedAt - b.openedAt)
+    .map((stream) => ({
+      traceId: stream.traceId,
+      label: stream.label,
+      user: stream.user,
+      path: stream.path,
+      ageMs: now - stream.openedAt,
+      firstChunkDelayMs: stream.firstChunkAt === null ? null : stream.firstChunkAt - stream.openedAt,
+      sinceLastChunkMs: stream.lastChunkAt === null ? null : now - stream.lastChunkAt,
+      waitingForFirstChunk: stream.firstChunkAt === null,
+      chunkCount: stream.chunkCount,
+      eventCount: stream.eventCount,
+      bytesReceived: stream.bytesReceived,
+    }));
+
+  log("info", "Active stream snapshot", {
+    activeStreams: activeStreams.size,
+    recentlyActiveStreams: countRecentlyActiveStreams(now),
+    recentWindowMs: RECENT_STREAM_ACTIVITY_WINDOW_MS,
+    streams,
+  });
+}
+
+function registerActiveStream(
+  traceId: string,
+  label: string,
+  user: string | undefined,
+  path: string,
+): void {
+  const now = Date.now();
+  activeStreams.set(traceId, {
+    traceId,
+    label,
+    user,
+    path,
+    openedAt: now,
+    firstChunkAt: null,
+    lastChunkAt: null,
+    chunkCount: 0,
+    eventCount: 0,
+    bytesReceived: 0,
+  });
+
+  log("info", "Stream opened", {
+    traceId,
+    label,
+    user,
+    path,
+    activeStreams: activeStreams.size,
+  });
+  maybeLogActiveStreamSnapshot(now);
+}
+
+function recordActiveStreamChunk(traceId: string, chunkBytes: number): void {
+  const stream = activeStreams.get(traceId);
+  if (!stream) return;
+
+  const now = Date.now();
+  stream.chunkCount++;
+  stream.bytesReceived += chunkBytes;
+  stream.lastChunkAt = now;
+
+  if (stream.firstChunkAt === null) {
+    stream.firstChunkAt = now;
+    const recentlyActiveStreams = countRecentlyActiveStreams(now);
+    log("info", "Stream first chunk", {
+      traceId,
+      label: stream.label,
+      user: stream.user,
+      path: stream.path,
+      firstChunkDelayMs: now - stream.openedAt,
+      activeStreams: activeStreams.size,
+      otherRecentlyActiveStreams: Math.max(0, recentlyActiveStreams - 1),
+    });
+  }
+
+  maybeLogActiveStreamSnapshot(now);
+}
+
+function recordActiveStreamEvent(traceId: string): void {
+  const stream = activeStreams.get(traceId);
+  if (!stream) return;
+  stream.eventCount++;
+}
+
+function closeActiveStream(
+  traceId: string,
+  inputTokens: number,
+  outputTokens: number,
+  cacheReadTokens: number,
+  cacheCreationTokens: number,
+): void {
+  const stream = activeStreams.get(traceId);
+  if (!stream) return;
+
+  const now = Date.now();
+  activeStreams.delete(traceId);
+  log("info", "Stream closed", {
+    traceId,
+    label: stream.label,
+    user: stream.user,
+    path: stream.path,
+    durationMs: now - stream.openedAt,
+    firstChunkDelayMs: stream.firstChunkAt === null ? null : stream.firstChunkAt - stream.openedAt,
+    sinceLastChunkMs: stream.lastChunkAt === null ? null : now - stream.lastChunkAt,
+    chunkCount: stream.chunkCount,
+    eventCount: stream.eventCount,
+    bytesReceived: stream.bytesReceived,
+    input: inputTokens,
+    output: outputTokens,
+    cacheRead: cacheReadTokens,
+    cacheCreation: cacheCreationTokens,
+    activeStreamsRemaining: activeStreams.size,
+  });
+  maybeLogActiveStreamSnapshot(now);
 }
 
 function fetchUpstream(
@@ -674,6 +833,7 @@ function createTokenTrackingStream(
   proxyUser: ProxyTokenEntry | null | undefined,
   schemaTracker: SchemaTracker,
   endpoint: string,
+  traceId: string,
 ): ReadableStream<Uint8Array> {
   const decoder = new TextDecoder();
   let buffer = "";
@@ -681,10 +841,12 @@ function createTokenTrackingStream(
   let outputTokens = 0;
   let cacheReadTokens = 0;
   let cacheCreationTokens = 0;
+  registerActiveStream(traceId, entry.label, proxyUser?.label, endpoint);
 
   return source.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
     transform(chunk, controller) {
       controller.enqueue(chunk);
+      recordActiveStreamChunk(traceId, chunk.byteLength);
 
       buffer += decoder.decode(chunk, { stream: true });
       const lines = buffer.split("\n");
@@ -697,6 +859,7 @@ function createTokenTrackingStream(
 
         try {
           const event = JSON.parse(json) as AnthropicStreamDelta;
+          recordActiveStreamEvent(traceId);
           if (event.type === "message_start" && event.message?.usage) {
             inputTokens += event.message.usage.input_tokens ?? 0;
             cacheReadTokens += event.message.usage.cache_read_input_tokens ?? 0;
@@ -720,6 +883,7 @@ function createTokenTrackingStream(
     },
 
     flush() {
+      closeActiveStream(traceId, inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens);
       keyManager.recordSuccess(entry, inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens);
       if (proxyUser) keyManager.recordTokenSuccess(proxyUser, inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens);
       if (inputTokens > 0 || outputTokens > 0 || cacheReadTokens > 0) {
