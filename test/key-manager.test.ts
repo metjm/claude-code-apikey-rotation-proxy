@@ -333,10 +333,10 @@ describe("Key CRUD", () => {
     );
     expect(entry.label).toBe("label-a");
     expect(entry.stats.totalRequests).toBe(0);
-    expect(entry.recentLinkedSessions15m).toBe(0);
+    expect(entry.recentSessions15s).toEqual([]);
   });
 
-  test("listKeys() tracks linked sessions active in the last 15 minutes", () => {
+  test("listKeys() tracks recent sessions active in the last 15 seconds", () => {
     const km = create();
     const originalNow = Date.now;
     let fakeNow = 1_000_000;
@@ -346,19 +346,25 @@ describe("Key CRUD", () => {
       km.addKey(VALID_KEY_1, "a");
       km.addKey(VALID_KEY_2, "b");
 
-      expect(km.getKeyForConversation("user-1:session-a").entry?.key).toBe(VALID_KEY_1);
-      expect(km.getKeyForConversation("user-1:session-b").entry?.key).toBe(VALID_KEY_2);
+      expect(km.getKeyForConversation("user-1:session-a", "session-a").entry?.key).toBe(VALID_KEY_1);
+      expect(km.getKeyForConversation("user-1:session-b", "session-b").entry?.key).toBe(VALID_KEY_2);
 
       let keys = km.listKeys().sort((a, b) => String(a.label).localeCompare(String(b.label)));
-      expect(keys.map((key) => key.recentLinkedSessions15m)).toEqual([1, 1]);
+      expect(keys.map((key) => key.recentSessions15s.map((session) => session.sessionId))).toEqual([
+        ["session-a"],
+        ["session-b"],
+      ]);
 
-      fakeNow += 16 * 60 * 1000;
+      fakeNow += 16 * 1000;
       keys = km.listKeys().sort((a, b) => String(a.label).localeCompare(String(b.label)));
-      expect(keys.map((key) => key.recentLinkedSessions15m)).toEqual([0, 0]);
+      expect(keys.map((key) => key.recentSessions15s)).toEqual([[], []]);
 
-      expect(km.getKeyForConversation("user-1:session-a").entry?.key).toBe(VALID_KEY_1);
+      expect(km.getKeyForConversation("user-1:session-a", "session-a").entry?.key).toBe(VALID_KEY_1);
       keys = km.listKeys().sort((a, b) => String(a.label).localeCompare(String(b.label)));
-      expect(keys.map((key) => key.recentLinkedSessions15m)).toEqual([1, 0]);
+      expect(keys.map((key) => key.recentSessions15s.map((session) => session.sessionId))).toEqual([
+        ["session-a"],
+        [],
+      ]);
     } finally {
       Date.now = originalNow;
     }

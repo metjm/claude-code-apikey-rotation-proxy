@@ -116,6 +116,7 @@ interface CapacityTsRow {
 interface ConversationAffinityRow {
   conversation_key: string;
   key: string;
+  session_id: string | null;
   assigned_at: number;
   last_seen_at: number;
 }
@@ -146,6 +147,7 @@ interface CapacityBucketAccumulator {
 interface ConversationAffinityEntry {
   conversationKey: string;
   key: ApiKey;
+  sessionId: string | null;
   assignedAt: UnixMs;
   lastSeenAt: UnixMs;
 }
@@ -173,7 +175,7 @@ function currentBucketKey(): string {
 }
 
 const CONVERSATION_AFFINITY_TTL_MS = 60 * 60 * 1000;
-const RECENT_LINKED_SESSION_WINDOW_MS = 15 * 60 * 1000;
+const RECENT_SESSION_WINDOW_MS = 15 * 1000;
 
 export class KeyManager {
   private keys: ApiKeyEntry[] = [];
@@ -342,6 +344,7 @@ export class KeyManager {
       CREATE TABLE IF NOT EXISTS conversation_affinities (
         conversation_key TEXT PRIMARY KEY,
         key TEXT NOT NULL,
+        session_id TEXT,
         assigned_at INTEGER NOT NULL,
         last_seen_at INTEGER NOT NULL
       );
@@ -363,6 +366,18 @@ export class KeyManager {
     migrate("api_key_capacity_state", "response_count");
     migrate("api_key_capacity_state", "normalized_header_count");
     migrate("capacity_window_timeseries", "utilization_samples");
+    try { this.db.exec("ALTER TABLE conversation_affinities ADD COLUMN session_id TEXT"); } catch {}
+    try {
+      this.db.exec(`
+        UPDATE conversation_affinities
+        SET session_id = CASE
+          WHEN session_id IS NOT NULL THEN session_id
+          WHEN instr(conversation_key, ':') > 0 THEN substr(conversation_key, instr(conversation_key, ':') + 1)
+          ELSE conversation_key
+        END
+        WHERE session_id IS NULL
+      `);
+    } catch {}
 
     // One-time reset: old token counts were inaccurate (missing cache tokens)
     const marker = this.db.query("SELECT 1 FROM stats_timeseries WHERE key_label = '__reset_v2__'").get();
@@ -486,6 +501,7 @@ export class KeyManager {
       this.conversationAffinities.set(row.conversation_key, {
         conversationKey: row.conversation_key,
         key: row.key as ApiKey,
+        sessionId: row.session_id,
         assignedAt: row.assigned_at as UnixMs,
         lastSeenAt: row.last_seen_at as UnixMs,
       });
@@ -518,7 +534,7 @@ export class KeyManager {
     return null;
   }
 
-  getKeyForConversation(conversationKey: string | null): ConversationKeySelection {
+  getKeyForConversation(conversationKey: string | null, sessionId?: string | null): ConversationKeySelection {
     if (conversationKey === null) {
       const entry = this.getNextAvailableKey();
       return {
@@ -536,6 +552,7 @@ export class KeyManager {
     const currentTime = now();
     const existing = this.conversationAffinities.get(conversationKey);
     if (existing !== undefined) {
+      existing.sessionId = sessionId ?? existing.sessionId;
       existing.lastSeenAt = currentTime;
       const mappedEntry = this.keys.find((entry) => entry.key === existing.key) ?? null;
       if (mappedEntry !== null && this.isKeyAvailable(mappedEntry)) {
@@ -569,6 +586,7 @@ export class KeyManager {
     this.conversationAffinities.set(conversationKey, {
       conversationKey,
       key: fallback.entry.key,
+      sessionId: sessionId ?? existing?.sessionId ?? null,
       assignedAt,
       lastSeenAt: currentTime,
     });
@@ -957,8 +975,8 @@ export class KeyManager {
     const currentTime = now();
     const currentDay = new Date().getDay();
     const recentErrs = this.recentErrorsByDimension("key_label", "user_label", "__all__");
-    const recentLinkedSessionCounts = this.countConversationAffinitiesByKey(
-      unixMs(Date.now() - RECENT_LINKED_SESSION_WINDOW_MS),
+    const recentSessionsByKey = this.listRecentConversationSessionsByKey(
+      unixMs(Date.now() - RECENT_SESSION_WINDOW_MS),
     );
     return this.keys.map(
       (k): MaskedKeyEntry => ({
@@ -972,7 +990,7 @@ export class KeyManager {
         priority: k.priority,
         allowedDays: k.allowedDays,
         recentErrors: recentErrs.get(k.label) ?? 0,
-        recentLinkedSessions15m: recentLinkedSessionCounts.get(k.key) ?? 0,
+        recentSessions15s: recentSessionsByKey.get(k.key) ?? [],
       })
     );
   }
@@ -1351,6 +1369,28 @@ export class KeyManager {
     return counts;
   }
 
+  private listRecentConversationSessionsByKey(
+    cutoff: UnixMs,
+  ): Map<ApiKey, Array<{ sessionId: string; lastSeenAt: string }>> {
+    const sessionsByKey = new Map<ApiKey, Array<{ sessionId: string; lastSeenAt: string }>>();
+    for (const affinity of this.conversationAffinities.values()) {
+      if (affinity.lastSeenAt < cutoff) continue;
+      const existing = sessionsByKey.get(affinity.key) ?? [];
+      existing.push({
+        sessionId: affinity.sessionId ?? affinity.conversationKey,
+        lastSeenAt: new Date(affinity.lastSeenAt).toISOString(),
+      });
+      sessionsByKey.set(affinity.key, existing);
+    }
+
+    for (const sessions of sessionsByKey.values()) {
+      sessions.sort((a, b) =>
+        b.lastSeenAt.localeCompare(a.lastSeenAt) || a.sessionId.localeCompare(b.sessionId)
+      );
+    }
+    return sessionsByKey;
+  }
+
   private selectLeastLoadedAvailableKey(): {
     entry: ApiKeyEntry;
     priorityTier: number;
@@ -1487,8 +1527,8 @@ export class KeyManager {
     `);
     const clearConversationAffinities = this.db.prepare("DELETE FROM conversation_affinities");
     const insertConversationAffinity = this.db.prepare(`
-      INSERT INTO conversation_affinities (conversation_key, key, assigned_at, last_seen_at)
-      VALUES (?, ?, ?, ?)
+      INSERT INTO conversation_affinities (conversation_key, key, session_id, assigned_at, last_seen_at)
+      VALUES (?, ?, ?, ?, ?)
     `);
 
     this.db.transaction(() => {
@@ -1569,6 +1609,7 @@ export class KeyManager {
         insertConversationAffinity.run(
           affinity.conversationKey,
           affinity.key,
+          affinity.sessionId,
           affinity.assignedAt,
           affinity.lastSeenAt,
         );

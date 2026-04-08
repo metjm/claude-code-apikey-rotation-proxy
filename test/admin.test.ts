@@ -306,7 +306,7 @@ describe("Capacity admin payloads", () => {
     expect(body.capacitySummary.windows[0].windowName).toBe("unified");
   });
 
-  test("GET /admin/stats includes recent linked session counts per key", async () => {
+  test("GET /admin/stats includes recent sessions per key", async () => {
     const originalNow = Date.now;
     let fakeNow = 1_000_000;
     Date.now = () => fakeNow;
@@ -315,17 +315,17 @@ describe("Capacity admin payloads", () => {
       km.addKey(VALID_KEY, "cap-admin-a");
       km.addKey(VALID_KEY_2, "cap-admin-b");
 
-      expect(km.getKeyForConversation("user-1:session-a").entry?.key).toBe(VALID_KEY);
-      expect(km.getKeyForConversation("user-1:session-b").entry?.key).toBe(VALID_KEY_2);
+      expect(km.getKeyForConversation("user-1:session-a", "session-a").entry?.key).toBe(VALID_KEY);
+      expect(km.getKeyForConversation("user-1:session-b", "session-b").entry?.key).toBe(VALID_KEY_2);
 
       const res = await handleAdminRoute(makeReq("GET", "/admin/stats"), km, makeConfig(), st);
       const body = await jsonBody(res!) as {
-        keys: Array<{ label: string; recentLinkedSessions15m: number }>;
+        keys: Array<{ label: string; recentSessions15s: Array<{ sessionId: string }> }>;
       };
 
-      const keyed = new Map(body.keys.map((key) => [String(key.label), key.recentLinkedSessions15m]));
-      expect(keyed.get("cap-admin-a")).toBe(1);
-      expect(keyed.get("cap-admin-b")).toBe(1);
+      const keyed = new Map(body.keys.map((key) => [String(key.label), key.recentSessions15s.map((session) => session.sessionId)]));
+      expect(keyed.get("cap-admin-a")).toEqual(["session-a"]);
+      expect(keyed.get("cap-admin-b")).toEqual(["session-b"]);
     } finally {
       Date.now = originalNow;
     }

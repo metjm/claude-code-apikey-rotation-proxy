@@ -178,7 +178,7 @@ export async function proxyRequest(
           candidateCount: 1,
           conversationCountForSelectedKey: null,
         }
-      : keyManager.getKeyForConversation(conversationKey);
+      : keyManager.getKeyForConversation(conversationKey, sessionId);
     const entry: ApiKeyEntry | null = selection.entry;
     preferredRetryKey = null;
 

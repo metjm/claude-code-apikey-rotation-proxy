@@ -114,6 +114,39 @@
   .table-sub { color: var(--text-dim); font-size: 10px; line-height: 1.35; }
   .table-metrics { display: flex; flex-direction: column; gap: 1px; }
   .table-metrics strong { color: var(--text-bright); font-weight: 600; }
+  .session-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 10px;
+  }
+  .session-table th,
+  .session-table td {
+    padding: 2px 0;
+    border: none;
+    vertical-align: top;
+  }
+  .session-table th {
+    color: var(--text-dim);
+    font-size: 9px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.35px;
+    position: static;
+    background: transparent;
+  }
+  .session-table td:last-child,
+  .session-table th:last-child {
+    text-align: right;
+    white-space: nowrap;
+  }
+  .session-id {
+    color: var(--text-bright);
+    max-width: 180px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    display: inline-block;
+  }
   .table-controls { display: flex; flex-direction: column; gap: 4px; align-items: flex-start; }
   .key-priority-select {
     min-width: 96px; background: var(--bg3); color: var(--text); border: 1px solid var(--border);
@@ -1095,7 +1128,7 @@ function renderKeys() {
         <th>State</th>
         <th>Limits</th>
         <th>Usage</th>
-        <th>Observed</th>
+        <th>Sessions (15s)</th>
         <th>Controls</th>
       </tr>
     </thead>
@@ -1108,11 +1141,6 @@ function renderKeys() {
     const quotaState = compactQuotaState(k);
     const tone = keyRowTone(k, telemetry);
     const claim = k.capacity?.representativeClaim ? humanizeClaim(k.capacity.representativeClaim) : 'No driver';
-    const latency = k.capacity?.latencyMs !== null && k.capacity?.latencyMs !== undefined ? `${fmtNum(k.capacity.latencyMs)} ms` : '--';
-    const responseCount = k.capacity?.responseCount || 0;
-    const normalizedCount = k.capacity?.normalizedHeaderCount || 0;
-    const responseAge = k.capacity?.lastResponseAt ? fmtRelative(new Date(k.capacity.lastResponseAt).toISOString()) : '--';
-    const signalAge = k.capacity?.lastHeaderAt ? fmtRelative(new Date(k.capacity.lastHeaderAt).toISOString()) : '--';
     const routingDetail = [
       `${fmtNum(k.stats.rateLimitHits)} RL`,
       (k.recentErrors || 0) > 0 ? `${fmtNum(k.recentErrors || 0)} err` : null,
@@ -1154,17 +1182,21 @@ function renderKeys() {
     const keyRef = JSON.stringify(k.maskedKey);
     const usageLines = [
       `<div><strong>${fmtNum(k.stats.totalRequests)}</strong> req · ${fmtNum(k.stats.totalTokensIn)} in / ${fmtNum(k.stats.totalTokensOut)} out</div>`,
-      `<div title="Unique session-sticky conversation mappings seen on this account in the last 15 minutes">${fmtNum(k.recentLinkedSessions15m || 0)} linked sessions (15m)</div>`,
     ];
     if ((k.stats.totalCacheRead || 0) > 0 || (k.stats.totalCacheCreation || 0) > 0) {
       usageLines.push(`<div title="Cache read / cache write">${fmtNum(k.stats.totalCacheRead || 0)} cache / ${fmtNum(k.stats.totalCacheCreation || 0)} write</div>`);
     }
-    const observedTitle = [
-      telemetryCoverageSummary(k),
-      k.capacity?.lastRequestId ? `Last request ID: ${k.capacity.lastRequestId}` : null,
-      k.capacity?.shouldRetry === true ? 'Upstream said automatic retry is OK.' : null,
-      k.capacity?.shouldRetry === false ? 'Upstream said automatic retry should be avoided.' : null,
-    ].filter(Boolean).join('\n\n');
+    const recentSessions = Array.isArray(k.recentSessions15s) ? k.recentSessions15s : [];
+    const sessionsHtml = recentSessions.length === 0
+      ? '<div class="table-sub">No sessions seen in last 15s</div>'
+      : `<table class="session-table"><thead><tr><th>Session</th><th>Seen</th></tr></thead><tbody>${
+          recentSessions.map(session => `
+            <tr>
+              <td><span class="session-id" title="${esc(session.sessionId)}">${esc(session.sessionId)}</span></td>
+              <td>${esc(fmtRelative(session.lastSeenAt))}</td>
+            </tr>
+          `).join('')
+        }</tbody></table>`;
 
     html += `<tr class="${esc(tone)}">
       <td>
@@ -1195,10 +1227,7 @@ function renderKeys() {
         </div>
       </td>
       <td>
-        <div class="table-metrics" title="${esc(observedTitle)}">
-          <div><strong>${fmtNum(responseCount)}</strong> resp · ${responseCount > 0 ? fmtPct(normalizedCount / responseCount) : '--'} parsed</div>
-          <div>${esc(responseAge)} resp · ${esc(signalAge)} sig · ${esc(latency)}</div>
-        </div>
+        ${sessionsHtml}
       </td>
       <td>
         <div class="table-controls">
