@@ -214,6 +214,8 @@ describe("config", () => {
     "ADMIN_TOKEN",
     "DATA_DIR",
     "MAX_RETRIES",
+    "FIRST_CHUNK_TIMEOUT_MS",
+    "MAX_FIRST_CHUNK_RETRIES",
   ] as const;
 
   beforeEach(() => {
@@ -257,6 +259,14 @@ describe("config", () => {
     test("maxRetriesPerRequest defaults to 10", () => {
       expect(loadConfig().maxRetriesPerRequest).toBe(10);
     });
+
+    test("firstChunkTimeoutMs defaults to 16000", () => {
+      expect(loadConfig().firstChunkTimeoutMs).toBe(16_000);
+    });
+
+    test("maxFirstChunkRetries defaults to 2", () => {
+      expect(loadConfig().maxFirstChunkRetries).toBe(2);
+    });
   });
 
   // ── custom values via env ────────────────────────────────────────
@@ -287,6 +297,16 @@ describe("config", () => {
       expect(loadConfig().maxRetriesPerRequest).toBe(3);
     });
 
+    test("FIRST_CHUNK_TIMEOUT_MS is respected", () => {
+      process.env["FIRST_CHUNK_TIMEOUT_MS"] = "2500";
+      expect(loadConfig().firstChunkTimeoutMs).toBe(2500);
+    });
+
+    test("MAX_FIRST_CHUNK_RETRIES is respected", () => {
+      process.env["MAX_FIRST_CHUNK_RETRIES"] = "1";
+      expect(loadConfig().maxFirstChunkRetries).toBe(1);
+    });
+
     test("MAX_RETRIES zero is valid", () => {
       process.env["MAX_RETRIES"] = "0";
       expect(loadConfig().maxRetriesPerRequest).toBe(0);
@@ -303,6 +323,8 @@ describe("config", () => {
       process.env["ADMIN_TOKEN"] = "tok";
       process.env["DATA_DIR"] = "/data";
       process.env["MAX_RETRIES"] = "5";
+      process.env["FIRST_CHUNK_TIMEOUT_MS"] = "9999";
+      process.env["MAX_FIRST_CHUNK_RETRIES"] = "4";
 
       const cfg = loadConfig();
       expect(cfg.port).toBe(3000);
@@ -310,6 +332,8 @@ describe("config", () => {
       expect(cfg.adminToken).toBe("tok");
       expect(cfg.dataDir).toBe("/data");
       expect(cfg.maxRetriesPerRequest).toBe(5);
+      expect(cfg.firstChunkTimeoutMs).toBe(9999);
+      expect(cfg.maxFirstChunkRetries).toBe(4);
     });
   });
 
@@ -342,6 +366,16 @@ describe("config", () => {
       expect(() => loadConfig()).toThrow("MAX_RETRIES must be an integer");
     });
 
+    test("non-numeric FIRST_CHUNK_TIMEOUT_MS throws", () => {
+      process.env["FIRST_CHUNK_TIMEOUT_MS"] = "nope";
+      expect(() => loadConfig()).toThrow("FIRST_CHUNK_TIMEOUT_MS must be an integer");
+    });
+
+    test("non-numeric MAX_FIRST_CHUNK_RETRIES throws", () => {
+      process.env["MAX_FIRST_CHUNK_RETRIES"] = "nope";
+      expect(() => loadConfig()).toThrow("MAX_FIRST_CHUNK_RETRIES must be an integer");
+    });
+
     test("thrown error for PORT includes the bad value", () => {
       process.env["PORT"] = "xyz";
       expect(() => loadConfig()).toThrow('"xyz"');
@@ -349,6 +383,16 @@ describe("config", () => {
 
     test("thrown error for MAX_RETRIES includes the bad value", () => {
       process.env["MAX_RETRIES"] = "oops";
+      expect(() => loadConfig()).toThrow('"oops"');
+    });
+
+    test("thrown error for FIRST_CHUNK_TIMEOUT_MS includes the bad value", () => {
+      process.env["FIRST_CHUNK_TIMEOUT_MS"] = "oops";
+      expect(() => loadConfig()).toThrow('"oops"');
+    });
+
+    test("thrown error for MAX_FIRST_CHUNK_RETRIES includes the bad value", () => {
+      process.env["MAX_FIRST_CHUNK_RETRIES"] = "oops";
       expect(() => loadConfig()).toThrow('"oops"');
     });
   });

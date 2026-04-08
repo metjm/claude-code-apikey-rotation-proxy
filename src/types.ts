@@ -210,6 +210,8 @@ export interface ProxyConfig {
   readonly adminToken: string | null;
   readonly dataDir: string;
   readonly maxRetriesPerRequest: number;
+  readonly firstChunkTimeoutMs: number;
+  readonly maxFirstChunkRetries: number;
   readonly webhookUrl: string | null;
 }
 

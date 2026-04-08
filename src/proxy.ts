@@ -27,6 +27,44 @@ type ActiveStreamState = {
   bytesReceived: number;
 };
 
+type BufferedRequestBody = Uint8Array | null;
+
+function getStreamReader(source: ReadableStream<Uint8Array>) {
+  return source.getReader();
+}
+
+type UpstreamReader = ReturnType<typeof getStreamReader>;
+
+type StreamStartFailureReason =
+  | "first_chunk_timeout"
+  | "stream_ended_before_first_chunk"
+  | "stream_read_failed_before_first_chunk";
+
+type StreamStartFailure = {
+  readonly reason: StreamStartFailureReason;
+  readonly attempt: number;
+  readonly usedKey: import("./types.ts").ApiKeyEntry;
+  readonly error?: string;
+};
+
+type FirstStreamChunkResult =
+  | {
+      readonly kind: "chunk";
+      readonly firstChunk: Uint8Array;
+      readonly reader: UpstreamReader;
+    }
+  | {
+      readonly kind: "retry";
+      readonly reason: StreamStartFailureReason;
+      readonly error?: string;
+    };
+
+type StreamObserver = {
+  readonly observeChunk: (chunk: Uint8Array) => void;
+  readonly finish: () => void;
+  readonly abandon: (reason: string) => void;
+};
+
 const activeStreams = new Map<string, ActiveStreamState>();
 let lastActiveStreamSnapshotAt = 0;
 
@@ -79,19 +117,53 @@ export async function proxyRequest(
   const url = new URL(req.url);
   const traceId = req.headers.get("x-request-id") ?? crypto.randomUUID();
   const requestContentLength = req.headers.get("content-length");
+  let requestBody: BufferedRequestBody;
+  try {
+    requestBody = await bufferRequestBody(req);
+  } catch (err) {
+    const entry = keyManager.getNextAvailableKey();
+    if (entry === null) {
+      if (proxyUser) keyManager.recordTokenError(proxyUser);
+      return allExhaustedResult(keyManager);
+    }
+    if (proxyUser) keyManager.recordTokenError(proxyUser);
+    return {
+      kind: "error",
+      status: 400,
+      body: JSON.stringify({
+        error: {
+          type: "proxy_error",
+          message: `Failed to read request body: ${String(err)}`,
+        },
+      }),
+      usedKey: entry,
+    };
+  }
+  const requestBodyState = snapshotRequestBodyState(req, requestBody);
 
   const triedKeys = new Set<string>();
   let attempts = 0;
+  let firstChunkRetries = 0;
+  let sawRateLimit = false;
+  let lastStreamStartFailure: StreamStartFailure | null = null;
 
   while (attempts < config.maxRetriesPerRequest) {
-    const entry = keyManager.getNextAvailableKey();
+    const entry = keyManager.getNextAvailableKey(triedKeys);
 
     if (entry === null) {
+      if (lastStreamStartFailure !== null && !sawRateLimit) {
+        if (proxyUser) keyManager.recordTokenError(proxyUser);
+        return firstChunkFailureResult(lastStreamStartFailure, config.firstChunkTimeoutMs);
+      }
       if (proxyUser) keyManager.recordTokenError(proxyUser);
       return allExhaustedResult(keyManager);
     }
 
     if (triedKeys.has(entry.key)) {
+      if (lastStreamStartFailure !== null && !sawRateLimit) {
+        if (proxyUser) keyManager.recordTokenError(proxyUser);
+        return firstChunkFailureResult(lastStreamStartFailure, config.firstChunkTimeoutMs);
+      }
       if (proxyUser) keyManager.recordTokenError(proxyUser);
       return allExhaustedResult(keyManager);
     }
@@ -102,7 +174,6 @@ export async function proxyRequest(
 
     const upstreamUrl = `${config.upstream}${url.pathname}${url.search}`;
     const headers = buildUpstreamHeaders(req.headers, entry.key);
-    const requestBodyState = snapshotRequestBodyState(req);
 
     const allHeaders: Record<string, string> = {};
     for (const [k, v] of headers.entries()) {
@@ -120,7 +191,7 @@ export async function proxyRequest(
       requestBodyState,
       headers: allHeaders,
     });
-    if (attempts > 1 || requestBodyState.bodyUsed || requestBodyState.bodyLocked) {
+    if (attempts > 1) {
       log("info", "Retry diagnostics before upstream fetch", {
         label: entry.label,
         user: proxyUser?.label,
@@ -140,8 +211,9 @@ export async function proxyRequest(
 
     let upstream: Response;
     const fetchStartedAt = Date.now();
+    const abortController = new AbortController();
     try {
-      upstream = await fetchUpstream(upstreamUrl, req.method, headers, req.body);
+      upstream = await fetchUpstream(upstreamUrl, req.method, headers, requestBody, abortController.signal);
     } catch (err) {
       keyManager.recordError(entry);
       if (proxyUser) keyManager.recordTokenError(proxyUser);
@@ -154,7 +226,7 @@ export async function proxyRequest(
         traceId,
         durationMs: Date.now() - fetchStartedAt,
         requestContentLength,
-        requestBodyState: snapshotRequestBodyState(req),
+        requestBodyState,
         error: String(err),
       });
       emitWithKeys({
@@ -200,10 +272,10 @@ export async function proxyRequest(
     }
 
     if (upstream.status === RATE_LIMIT_STATUS) {
+      sawRateLimit = true;
       const retryAfter = parseRetryAfter(upstream.headers);
       keyManager.recordRateLimit(entry, retryAfter);
       await upstream.text();
-      const retryBodyState = snapshotRequestBodyState(req);
 
       log("info", "Rate limited, trying next key", {
         label: entry.label,
@@ -216,12 +288,13 @@ export async function proxyRequest(
         retryAfter,
         availableKeys: keyManager.availableCount(),
         requestContentLength,
-        requestBodyState: retryBodyState,
+        requestBodyState,
       });
       emitWithKeys({
         type: "rate_limit", ts: new Date().toISOString(), label: entry.label,
         user: proxyUser?.label, retryAfter, availableKeys: keyManager.availableCount(),
       }, keyManager.listKeys());
+      lastStreamStartFailure = null;
       continue;
     }
 
@@ -253,8 +326,7 @@ export async function proxyRequest(
     let body: ReadableStream<Uint8Array> | string | null;
 
     if (isStreaming && upstream.body !== null) {
-      body = createTokenTrackingStream(
-        upstream.body,
+      const observer = createTokenTrackingObserver(
         entry,
         keyManager,
         proxyUser,
@@ -262,6 +334,59 @@ export async function proxyRequest(
         url.pathname,
         traceId,
       );
+      const firstChunk = await waitForFirstStreamChunk(
+        upstream.body,
+        config.firstChunkTimeoutMs,
+        abortController,
+      );
+      if (firstChunk.kind === "retry") {
+        observer.abandon(firstChunk.reason);
+        keyManager.recordError(entry);
+        firstChunkRetries++;
+        lastStreamStartFailure = {
+          reason: firstChunk.reason,
+          attempt: attempts,
+          usedKey: entry,
+          ...(firstChunk.error !== undefined ? { error: firstChunk.error } : {}),
+        };
+
+        log("warn", "No first stream chunk yet, trying next key", {
+          label: entry.label,
+          user: proxyUser?.label,
+          method: req.method,
+          path: url.pathname,
+          attempt: attempts,
+          traceId,
+          durationMs: Date.now() - fetchStartedAt,
+          firstChunkTimeoutMs: config.firstChunkTimeoutMs,
+          maxFirstChunkRetries: config.maxFirstChunkRetries,
+          firstChunkRetries,
+          reason: firstChunk.reason,
+          ...(firstChunk.error !== undefined ? { error: firstChunk.error } : {}),
+        });
+        emitWithKeys({
+          type: "error",
+          ts: new Date().toISOString(),
+          label: entry.label,
+          user: proxyUser?.label,
+          path: url.pathname,
+          attempt: attempts,
+          traceId,
+          error: firstChunk.reason,
+          firstChunkTimeoutMs: config.firstChunkTimeoutMs,
+          firstChunkRetries,
+        }, keyManager.listKeys());
+
+        if (firstChunkRetries > config.maxFirstChunkRetries) {
+          if (proxyUser) keyManager.recordTokenError(proxyUser);
+          return firstChunkFailureResult(lastStreamStartFailure, config.firstChunkTimeoutMs);
+        }
+        continue;
+      }
+
+      lastStreamStartFailure = null;
+      observer.observeChunk(firstChunk.firstChunk);
+      body = createTrackedStreamFromReader(firstChunk.reader, firstChunk.firstChunk, observer);
     } else if (upstream.body !== null) {
       const text = await upstream.text();
       extractTokensFromJson(text, entry, keyManager, proxyUser);
@@ -288,6 +413,11 @@ export async function proxyRequest(
     return { kind: "success", response: proxiedResponse, usedKey: entry };
   }
 
+  if (lastStreamStartFailure !== null && !sawRateLimit) {
+    if (proxyUser) keyManager.recordTokenError(proxyUser);
+    return firstChunkFailureResult(lastStreamStartFailure, config.firstChunkTimeoutMs);
+  }
+
   if (proxyUser) keyManager.recordTokenError(proxyUser);
   return allExhaustedResult(keyManager);
 }
@@ -299,15 +429,63 @@ function allExhaustedResult(keyManager: KeyManager): ProxyResult {
   return { kind: "all_exhausted", earliestAvailableAt: keyManager.getEarliestAvailableAt() };
 }
 
-function snapshotRequestBodyState(req: Request): {
+function firstChunkFailureResult(
+  failure: StreamStartFailure,
+  firstChunkTimeoutMs: number,
+): ProxyResult {
+  return {
+    kind: "error",
+    status: 504,
+    body: JSON.stringify({
+      error: {
+        type: "proxy_error",
+        message: describeStreamStartFailure(failure, firstChunkTimeoutMs),
+      },
+    }),
+    usedKey: failure.usedKey,
+  };
+}
+
+function describeStreamStartFailure(
+  failure: StreamStartFailure,
+  firstChunkTimeoutMs: number,
+): string {
+  const attemptCount = failure.attempt;
+  switch (failure.reason) {
+    case "first_chunk_timeout":
+      return `Upstream stream produced no first chunk within ${firstChunkTimeoutMs}ms after ${attemptCount} attempt(s).`;
+    case "stream_ended_before_first_chunk":
+      return `Upstream stream ended before the first chunk after ${attemptCount} attempt(s).`;
+    case "stream_read_failed_before_first_chunk":
+      return failure.error
+        ? `Upstream stream failed before the first chunk after ${attemptCount} attempt(s): ${failure.error}`
+        : `Upstream stream failed before the first chunk after ${attemptCount} attempt(s).`;
+  }
+}
+
+async function bufferRequestBody(req: Request): Promise<BufferedRequestBody> {
+  if (req.body === null) return null;
+  const body = await req.arrayBuffer();
+  return new Uint8Array(body);
+}
+
+function normalizeChunk(chunk: Uint8Array | ArrayBufferView): Uint8Array {
+  return chunk instanceof Uint8Array
+    ? chunk
+    : new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+}
+
+function snapshotRequestBodyState(req: Request, bufferedBody?: BufferedRequestBody): {
   readonly hasBody: boolean;
   readonly bodyUsed: boolean;
   readonly bodyLocked: boolean;
+  readonly bufferedBytes: number;
 } {
   return {
     hasBody: req.body !== null,
     bodyUsed: req.bodyUsed,
     bodyLocked: req.body?.locked ?? false,
+    bufferedBytes: bufferedBody?.byteLength ?? 0,
   };
 }
 
@@ -444,16 +622,106 @@ function closeActiveStream(
   maybeLogActiveStreamSnapshot(now);
 }
 
+function abandonActiveStream(
+  traceId: string,
+  reason: string,
+  inputTokens: number,
+  outputTokens: number,
+  cacheReadTokens: number,
+  cacheCreationTokens: number,
+): void {
+  const stream = activeStreams.get(traceId);
+  if (!stream) return;
+
+  const now = Date.now();
+  activeStreams.delete(traceId);
+  log("warn", "Stream abandoned", {
+    traceId,
+    label: stream.label,
+    user: stream.user,
+    path: stream.path,
+    reason,
+    durationMs: now - stream.openedAt,
+    firstChunkDelayMs: stream.firstChunkAt === null ? null : stream.firstChunkAt - stream.openedAt,
+    sinceLastChunkMs: stream.lastChunkAt === null ? null : now - stream.lastChunkAt,
+    chunkCount: stream.chunkCount,
+    eventCount: stream.eventCount,
+    bytesReceived: stream.bytesReceived,
+    input: inputTokens,
+    output: outputTokens,
+    cacheRead: cacheReadTokens,
+    cacheCreation: cacheCreationTokens,
+    activeStreamsRemaining: activeStreams.size,
+  });
+  maybeLogActiveStreamSnapshot(now);
+}
+
 function fetchUpstream(
   url: string,
   method: string,
   headers: Headers,
-  body: ReadableStream<Uint8Array> | null,
+  body: BufferedRequestBody,
+  signal?: AbortSignal,
 ): Promise<Response> {
+  const normalizedSignal = signal ?? null;
   if (method === "GET" || method === "HEAD" || method === "OPTIONS") {
-    return fetch(url, { method, headers });
+    return fetch(url, { method, headers, signal: normalizedSignal });
   }
-  return fetch(url, { method, headers, body, duplex: "half" } satisfies BunFetchRequestInit);
+  return fetch(
+    url,
+    { method, headers, body, signal: normalizedSignal, duplex: "half" } satisfies BunFetchRequestInit,
+  );
+}
+
+async function waitForFirstStreamChunk(
+  source: ReadableStream<Uint8Array>,
+  timeoutMs: number,
+  abortController: AbortController,
+): Promise<FirstStreamChunkResult> {
+  const reader = getStreamReader(source);
+  let timeoutId: ReturnType<typeof setTimeout> | null = null;
+
+  try {
+    const readPromise = reader.read().then(
+      (result) => ({ kind: "read" as const, result }),
+      (error) => ({ kind: "error" as const, error: String(error) }),
+    );
+    const timeoutPromise = new Promise<{ kind: "timeout" }>((resolve) => {
+      timeoutId = setTimeout(() => resolve({ kind: "timeout" }), timeoutMs);
+    });
+    const outcome = await Promise.race([readPromise, timeoutPromise]);
+
+    if (outcome.kind === "timeout") {
+      abortController.abort("first_chunk_timeout");
+      try { await reader.cancel("first_chunk_timeout"); } catch {}
+      try { reader.releaseLock(); } catch {}
+      return { kind: "retry", reason: "first_chunk_timeout" };
+    }
+
+    if (outcome.kind === "error") {
+      try { await reader.cancel("stream_read_failed_before_first_chunk"); } catch {}
+      try { reader.releaseLock(); } catch {}
+      return {
+        kind: "retry",
+        reason: "stream_read_failed_before_first_chunk",
+        error: outcome.error,
+      };
+    }
+
+    if (outcome.result.done || outcome.result.value === undefined) {
+      try { await reader.cancel("stream_ended_before_first_chunk"); } catch {}
+      try { reader.releaseLock(); } catch {}
+      return { kind: "retry", reason: "stream_ended_before_first_chunk" };
+    }
+
+    return {
+      kind: "chunk",
+      firstChunk: normalizeChunk(outcome.result.value),
+      reader,
+    };
+  } finally {
+    if (timeoutId !== null) clearTimeout(timeoutId);
+  }
 }
 
 function buildUpstreamHeaders(incoming: Headers, apiKey: string): Headers {
@@ -821,86 +1089,142 @@ function extractTokensFromJson(
   }
 }
 
-/**
- * Wraps a streaming response body to intercept SSE events and extract token
- * usage from message_start and message_delta events. Data passes through
- * unmodified — we only observe.
- */
-function createTokenTrackingStream(
-  source: ReadableStream<Uint8Array>,
+function createTokenTrackingObserver(
   entry: import("./types.ts").ApiKeyEntry,
   keyManager: KeyManager,
   proxyUser: ProxyTokenEntry | null | undefined,
   schemaTracker: SchemaTracker,
   endpoint: string,
   traceId: string,
-): ReadableStream<Uint8Array> {
+): StreamObserver {
   const decoder = new TextDecoder();
   let buffer = "";
   let inputTokens = 0;
   let outputTokens = 0;
   let cacheReadTokens = 0;
   let cacheCreationTokens = 0;
+  let finalized = false;
   registerActiveStream(traceId, entry.label, proxyUser?.label, endpoint);
 
-  return source.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
-    transform(chunk, controller) {
-      controller.enqueue(chunk);
-      recordActiveStreamChunk(traceId, chunk.byteLength);
+  function observeChunk(chunk: Uint8Array): void {
+    if (finalized) return;
+    recordActiveStreamChunk(traceId, chunk.byteLength);
 
-      buffer += decoder.decode(chunk, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop() ?? "";
+    buffer += decoder.decode(chunk, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
 
-      for (const line of lines) {
-        if (!line.startsWith("data: ")) continue;
-        const json = line.slice(6).trim();
-        if (json === "[DONE]") continue;
+    for (const line of lines) {
+      if (!line.startsWith("data: ")) continue;
+      const json = line.slice(6).trim();
+      if (json === "[DONE]") continue;
 
-        try {
-          const event = JSON.parse(json) as AnthropicStreamDelta;
-          recordActiveStreamEvent(traceId);
-          if (event.type === "message_start" && event.message?.usage) {
-            inputTokens += event.message.usage.input_tokens ?? 0;
-            cacheReadTokens += event.message.usage.cache_read_input_tokens ?? 0;
-            cacheCreationTokens += event.message.usage.cache_creation_input_tokens ?? 0;
-          }
-          if (event.type === "message_delta" && event.usage) {
-            outputTokens += event.usage.output_tokens ?? 0;
-          }
-
-          const eventChanges = schemaTracker.recordStreamEvent(endpoint, event.type ?? "unknown", event);
-          if (eventChanges.length > 0) {
-            emitWithKeys({
-              type: "schema_change", ts: new Date().toISOString(),
-              changes: eventChanges,
-            }, keyManager.listKeys());
-          }
-        } catch {
-          // Not valid JSON — skip
+      try {
+        const event = JSON.parse(json) as AnthropicStreamDelta;
+        recordActiveStreamEvent(traceId);
+        if (event.type === "message_start" && event.message?.usage) {
+          inputTokens += event.message.usage.input_tokens ?? 0;
+          cacheReadTokens += event.message.usage.cache_read_input_tokens ?? 0;
+          cacheCreationTokens += event.message.usage.cache_creation_input_tokens ?? 0;
         }
+        if (event.type === "message_delta" && event.usage) {
+          outputTokens += event.usage.output_tokens ?? 0;
+        }
+
+        const eventChanges = schemaTracker.recordStreamEvent(endpoint, event.type ?? "unknown", event);
+        if (eventChanges.length > 0) {
+          emitWithKeys({
+            type: "schema_change", ts: new Date().toISOString(),
+            changes: eventChanges,
+          }, keyManager.listKeys());
+        }
+      } catch {
+        // Not valid JSON — skip
       }
+    }
+  }
+
+  function finish(): void {
+    if (finalized) return;
+    finalized = true;
+    buffer = "";
+    closeActiveStream(traceId, inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens);
+    keyManager.recordSuccess(entry, inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens);
+    if (proxyUser) keyManager.recordTokenSuccess(proxyUser, inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens);
+    if (inputTokens > 0 || outputTokens > 0 || cacheReadTokens > 0) {
+      log("info", "Token usage (stream)", {
+        label: entry.label,
+        user: proxyUser?.label,
+        input: inputTokens,
+        output: outputTokens,
+        cacheRead: cacheReadTokens,
+        cacheCreation: cacheCreationTokens,
+      });
+      emitWithKeys({
+        type: "tokens", ts: new Date().toISOString(), label: entry.label,
+        user: proxyUser?.label, input: inputTokens, output: outputTokens,
+        cacheRead: cacheReadTokens, cacheCreation: cacheCreationTokens,
+      }, keyManager.listKeys());
+    }
+  }
+
+  function abandon(reason: string): void {
+    if (finalized) return;
+    finalized = true;
+    buffer = "";
+    abandonActiveStream(traceId, reason, inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens);
+  }
+
+  return { observeChunk, finish, abandon };
+}
+
+function createTrackedStreamFromReader(
+  reader: UpstreamReader,
+  firstChunk: Uint8Array,
+  observer: StreamObserver,
+): ReadableStream<Uint8Array> {
+  let sentFirstChunk = false;
+  let closed = false;
+
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (closed) return;
+
+      if (!sentFirstChunk) {
+        sentFirstChunk = true;
+        controller.enqueue(firstChunk);
+        return;
+      }
+
+      let result;
+      try {
+        result = await reader.read();
+      } catch (error) {
+        closed = true;
+        observer.abandon("stream_read_failed_after_first_chunk");
+        controller.error(error);
+        return;
+      }
+
+      if (result.done || result.value === undefined) {
+        closed = true;
+        observer.finish();
+        try { reader.releaseLock(); } catch {}
+        controller.close();
+        return;
+      }
+
+      const chunk = normalizeChunk(result.value);
+      observer.observeChunk(chunk);
+      controller.enqueue(chunk);
     },
 
-    flush() {
-      closeActiveStream(traceId, inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens);
-      keyManager.recordSuccess(entry, inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens);
-      if (proxyUser) keyManager.recordTokenSuccess(proxyUser, inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens);
-      if (inputTokens > 0 || outputTokens > 0 || cacheReadTokens > 0) {
-        log("info", "Token usage (stream)", {
-          label: entry.label,
-          user: proxyUser?.label,
-          input: inputTokens,
-          output: outputTokens,
-          cacheRead: cacheReadTokens,
-          cacheCreation: cacheCreationTokens,
-        });
-        emitWithKeys({
-          type: "tokens", ts: new Date().toISOString(), label: entry.label,
-          user: proxyUser?.label, input: inputTokens, output: outputTokens,
-          cacheRead: cacheReadTokens, cacheCreation: cacheCreationTokens,
-        }, keyManager.listKeys());
-      }
+    async cancel(reason) {
+      if (closed) return;
+      closed = true;
+      try { await reader.cancel(reason); } catch {}
+      try { reader.releaseLock(); } catch {}
+      observer.abandon("downstream_cancelled");
     },
-  }));
+  });
 }

@@ -29,15 +29,25 @@ const VALID_TOKEN_2 = "my-proxy-token-bbbb";
 
 let tempDir: string;
 let savedDbPath: string | undefined;
+let managers: KeyManager[];
 
 beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), "km-test-"));
+  managers = [];
   // Stash and clear DB_PATH so it does not leak between tests
   savedDbPath = process.env["DB_PATH"];
   delete process.env["DB_PATH"];
 });
 
 afterEach(() => {
+  for (const manager of managers) {
+    try {
+      manager.close();
+    } catch {
+      // best-effort cleanup
+    }
+  }
+  managers = [];
   // Restore original env
   if (savedDbPath !== undefined) {
     process.env["DB_PATH"] = savedDbPath;
@@ -53,7 +63,14 @@ afterEach(() => {
 
 /** Create a KeyManager for testing. */
 function create(dataDir?: string): KeyManager {
-  return new KeyManager(dataDir ?? tempDir);
+  const manager = new KeyManager(dataDir ?? tempDir);
+  managers.push(manager);
+  return manager;
+}
+
+function trackManager(manager: KeyManager): KeyManager {
+  managers.push(manager);
+  return manager;
 }
 
 /** Build a legacy state.json payload for migration tests. */
@@ -683,7 +700,7 @@ describe("Key label updates", () => {
     const listed = km.listKeys();
     expect(listed[0]!.label).toBe("new-label");
     // Verify persisted in DB
-    const km2 = new KeyManager(tempDir);
+    const km2 = trackManager(new KeyManager(tempDir));
     expect(km2.listKeys()[0]!.label).toBe("new-label");
   });
 
@@ -720,7 +737,7 @@ describe("Key priority", () => {
     expect(result).toBe(true);
     expect(km.listKeys()[0]!.priority).toBe(1);
     // Verify persisted
-    const km2 = new KeyManager(tempDir);
+    const km2 = trackManager(new KeyManager(tempDir));
     expect(km2.listKeys()[0]!.priority).toBe(1);
   });
 
@@ -781,7 +798,7 @@ describe("Key priority", () => {
     const km1 = create();
     km1.addKey(VALID_KEY_1, "a");
     km1.updateKeyPriority(VALID_KEY_1, 3);
-    const km2 = new KeyManager(tempDir);
+    const km2 = trackManager(new KeyManager(tempDir));
     expect(km2.listKeys()[0]!.priority).toBe(3);
   });
 });
@@ -912,7 +929,7 @@ describe("Token label updates", () => {
     const listed = km.listTokens();
     expect(listed[0]!.label).toBe("new-label");
     // Verify persisted
-    const km2 = new KeyManager(tempDir);
+    const km2 = trackManager(new KeyManager(tempDir));
     expect(km2.listTokens()[0]!.label).toBe("new-label");
   });
 

@@ -35,7 +35,16 @@ function createTestSetup(): TestSetup {
   const tmpDir = mkdtempSync(join(tmpdir(), "proxy-test-"));
   const km = new KeyManager(tmpDir);
   const st = createTestSchemaTracker(tmpDir);
-  return { km, st, tmpDir, cleanup: () => { st.close(); rmSync(tmpDir, { recursive: true, force: true }); } };
+  return {
+    km,
+    st,
+    tmpDir,
+    cleanup: () => {
+      try { st.close(); } catch {}
+      try { km.close(); } catch {}
+      rmSync(tmpDir, { recursive: true, force: true });
+    },
+  };
 }
 
 interface MockUpstream {
@@ -62,6 +71,8 @@ function makeConfig(upstream: string, overrides?: Partial<ProxyConfig>): ProxyCo
     adminToken: null,
     dataDir: "/tmp",
     maxRetriesPerRequest: 10,
+    firstChunkTimeoutMs: 16_000,
+    maxFirstChunkRetries: 2,
     webhookUrl: null,
     ...overrides,
   };
@@ -968,6 +979,168 @@ describe("Token Tracking - Streaming (SSE)", () => {
     } finally {
       logSpy.mockRestore();
       setLogLevel("info");
+    }
+  });
+
+  test("retries another key when the first SSE chunk stalls", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    km.addKey(FAKE_KEY_B, "key-b");
+
+    const payload = {
+      model: "claude-sonnet-4-20250514",
+      stream: true,
+      messages: [{ role: "user", content: "retry stalled stream" }],
+    };
+    const seenKeys: string[] = [];
+    const seenBodies: string[] = [];
+
+    const stalledSse = [
+      'data: {"type":"message_start","message":{"usage":{"input_tokens":10}}}\n\n',
+      'data: {"type":"message_delta","usage":{"output_tokens":1}}\n\n',
+      "data: [DONE]\n\n",
+    ];
+    const fastSse = [
+      'data: {"type":"message_start","message":{"usage":{"input_tokens":20}}}\n\n',
+      'data: {"type":"message_delta","usage":{"output_tokens":2}}\n\n',
+      "data: [DONE]\n\n",
+    ];
+
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      const headers = new Headers(init?.headers);
+      const body = init?.body;
+      const bodyText = body instanceof Uint8Array ? new TextDecoder().decode(body) : "";
+      seenKeys.push(headers.get("x-api-key") ?? "");
+      seenBodies.push(bodyText);
+
+      if (headers.get("x-api-key") === FAKE_KEY_A) {
+        let cancelled = false;
+        return new Response(new ReadableStream({
+          start(controller) {
+            setTimeout(() => {
+              if (cancelled) return;
+              const encoder = new TextEncoder();
+              for (const chunk of stalledSse) {
+                controller.enqueue(encoder.encode(chunk));
+              }
+              controller.close();
+            }, 50);
+          },
+          cancel() {
+            cancelled = true;
+          },
+        }), {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        });
+      }
+
+      return new Response(makeSSEBody(fastSse), {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      });
+    });
+
+    try {
+      const config = makeConfig("http://mocked-upstream.local", {
+        firstChunkTimeoutMs: 20,
+        maxFirstChunkRetries: 1,
+      });
+      const result = await proxyRequest(
+        makeRequest("/v1/messages", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(payload),
+        }),
+        km,
+        config,
+        st,
+      );
+
+      expect(result.kind).toBe("success");
+      if (result.kind === "success") {
+        const body = await result.response.text();
+        expect(body).toContain('"output_tokens":2');
+      }
+
+      expect(seenKeys).toEqual([FAKE_KEY_A, FAKE_KEY_B]);
+      expect(seenBodies).toEqual([JSON.stringify(payload), JSON.stringify(payload)]);
+
+      const [keyA, keyB] = km.listKeys();
+      expect(keyA!.stats.errors).toBe(1);
+      expect(keyA!.stats.successfulRequests).toBe(0);
+      expect(keyB!.stats.successfulRequests).toBe(1);
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
+  test("returns 504 when every first SSE chunk stalls past the retry budget", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    km.addKey(FAKE_KEY_B, "key-b");
+
+    const sseData = [
+      'data: {"type":"message_start","message":{"usage":{"input_tokens":10}}}\n\n',
+      "data: [DONE]\n\n",
+    ];
+
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(async () =>
+      new Response((() => {
+        let cancelled = false;
+        return new ReadableStream({
+          start(controller) {
+          setTimeout(() => {
+            if (cancelled) return;
+            const encoder = new TextEncoder();
+            for (const chunk of sseData) {
+              controller.enqueue(encoder.encode(chunk));
+            }
+            controller.close();
+          }, 50);
+        },
+        cancel() {
+          cancelled = true;
+        },
+      });
+      })(), {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      })
+    );
+
+    try {
+      const config = makeConfig("http://mocked-upstream.local", {
+        firstChunkTimeoutMs: 20,
+        maxFirstChunkRetries: 1,
+      });
+      const result = await proxyRequest(
+        makeRequest("/v1/messages", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ stream: true, messages: [] }),
+        }),
+        km,
+        config,
+        st,
+      );
+
+      expect(result.kind).toBe("error");
+      if (result.kind === "error") {
+        expect(result.status).toBe(504);
+        expect(JSON.parse(result.body)).toEqual({
+          error: {
+            type: "proxy_error",
+            message: "Upstream stream produced no first chunk within 20ms after 2 attempt(s).",
+          },
+        });
+      }
+
+      const [keyA, keyB] = km.listKeys();
+      expect(keyA!.stats.errors).toBe(1);
+      expect(keyB!.stats.errors).toBe(1);
+    } finally {
+      fetchSpy.mockRestore();
     }
   });
 

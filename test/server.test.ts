@@ -114,6 +114,8 @@ function startProxy(opts: {
     adminToken: opts.adminToken ?? null,
     dataDir: opts.dataDir,
     maxRetriesPerRequest: 10,
+    firstChunkTimeoutMs: 16_000,
+    maxFirstChunkRetries: 2,
     webhookUrl: null,
   };
 

@@ -52,6 +52,8 @@ function makeConfig(overrides?: Partial<ProxyConfig>): ProxyConfig {
     adminToken: null,
     dataDir: "/tmp",
     maxRetriesPerRequest: 3,
+    firstChunkTimeoutMs: 16_000,
+    maxFirstChunkRetries: 2,
     webhookUrl: null,
     ...overrides,
   };

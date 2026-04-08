@@ -155,6 +155,7 @@ export class KeyManager {
   readonly dbPath: string;
   private readonly cleanupInterval: ReturnType<typeof setInterval>;
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
+  private isClosed = false;
   private readonly tsAccumulator = new Map<string, BucketAccumulator>();
   private readonly capacityTsAccumulator = new Map<string, CapacityBucketAccumulator>();
 
@@ -171,17 +172,37 @@ export class KeyManager {
     this.migrateFromJson(dataDir);
     this.loadFromDb();
 
-    this.cleanupInterval = setInterval(() => this.cleanupOldTimeseries(), 60 * 60 * 1000);
+    this.cleanupInterval = setInterval(() => {
+      if (this.isClosed) return;
+      try {
+        this.cleanupOldTimeseries();
+      } catch (error) {
+        log("warn", "Failed to clean up key manager timeseries", {
+          dbPath: this.dbPath,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }, 60 * 60 * 1000);
   }
 
   close(): void {
+    if (this.isClosed) return;
     clearInterval(this.cleanupInterval);
     if (this.saveTimer) {
       clearTimeout(this.saveTimer);
       this.saveTimer = null;
     }
-    this.saveNow();
-    this.db.close();
+    try {
+      this.saveNow();
+    } catch (error) {
+      log("warn", "Failed to flush key manager state during close", {
+        dbPath: this.dbPath,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      this.isClosed = true;
+      this.db.close();
+    }
   }
 
   // ── Schema ──────────────────────────────────────────────────────
@@ -421,13 +442,17 @@ export class KeyManager {
 
   // ── Key selection ───────────────────────────────────────────────
 
-  getNextAvailableKey(): ApiKeyEntry | null {
+  getNextAvailableKey(excludedKeys?: ReadonlySet<string>): ApiKeyEntry | null {
     if (this.keys.length === 0) return null;
 
     const currentTime = now();
     const currentDay = new Date().getDay();
     const available = this.keys
-      .filter((k) => k.availableAt <= currentTime && k.allowedDays.includes(currentDay))
+      .filter((k) =>
+        k.availableAt <= currentTime
+        && k.allowedDays.includes(currentDay)
+        && !excludedKeys?.has(k.key)
+      )
       .sort((a, b) => {
         // Hard routing still follows the original rules: priority first, then sticky reuse.
         if (a.priority !== b.priority) return a.priority - b.priority;
@@ -1160,10 +1185,18 @@ export class KeyManager {
   // ── Persistence ─────────────────────────────────────────────────
 
   private scheduleSave(): void {
-    if (this.saveTimer) return;
+    if (this.isClosed || this.saveTimer) return;
     this.saveTimer = setTimeout(() => {
       this.saveTimer = null;
-      this.saveNow();
+      if (this.isClosed) return;
+      try {
+        this.saveNow();
+      } catch (error) {
+        log("warn", "Failed to persist key manager state", {
+          dbPath: this.dbPath,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
     }, 1_000);
   }
 
