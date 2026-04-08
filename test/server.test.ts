@@ -323,6 +323,43 @@ describe("Dashboard", () => {
     expect(() => new Function(script)).not.toThrow();
   });
 
+  test("dashboard window threshold helpers only warn after the threshold is actually exceeded", () => {
+    const html = readFileSync(new URL("../public/dashboard.html", import.meta.url), "utf8");
+    const start = html.indexOf("function hasSurpassedWarningThreshold");
+    const end = html.indexOf("function capacityWindow");
+
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(end).toBeGreaterThan(start);
+
+    const snippet = html.slice(start, end);
+    const helpers = new Function(`${snippet}; return {
+      hasSurpassedWarningThreshold,
+      readableWindowStatus,
+      windowTone,
+      compactWindowStatus,
+      compactWindowStateLabel,
+    };`)() as {
+      hasSurpassedWarningThreshold: (window: Record<string, unknown>) => boolean;
+      readableWindowStatus: (window: Record<string, unknown>) => string;
+      windowTone: (window: Record<string, unknown>) => string;
+      compactWindowStatus: (window: Record<string, unknown>) => string;
+      compactWindowStateLabel: (window: Record<string, unknown>) => string;
+    };
+
+    const belowThresholdWindow = {
+      windowName: "unified-5h",
+      status: "allowed",
+      utilization: 0.1,
+      surpassedThreshold: 1,
+    };
+
+    expect(helpers.hasSurpassedWarningThreshold(belowThresholdWindow)).toBe(false);
+    expect(helpers.readableWindowStatus(belowThresholdWindow)).toBe("looks OK");
+    expect(helpers.windowTone(belowThresholdWindow)).toBe("ok");
+    expect(helpers.compactWindowStatus(belowThresholdWindow)).toBe("ok");
+    expect(helpers.compactWindowStateLabel(belowThresholdWindow)).toBe("OK");
+  });
+
   test("GET /favicon.ico returns 204", async () => {
     const res = await fetch(`${proxy.url}/favicon.ico`);
     expect(res.status).toBe(204);

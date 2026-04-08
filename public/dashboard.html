@@ -763,10 +763,20 @@ function sortedCapacityWindows(key, options = {}) {
       return String(a.windowName).localeCompare(String(b.windowName));
     });
 }
+function hasSurpassedWarningThreshold(window) {
+  return !!(
+    window
+    && window.surpassedThreshold !== null
+    && window.surpassedThreshold !== undefined
+    && window.utilization !== null
+    && window.utilization !== undefined
+    && window.utilization >= window.surpassedThreshold
+  );
+}
 function readableWindowStatus(window) {
   if (!window) return 'unknown';
   if (window.windowName === 'unified-overage' && window.status === 'rejected') return 'extra usage unavailable';
-  if (window.surpassedThreshold) return 'past warning threshold';
+  if (hasSurpassedWarningThreshold(window)) return 'past warning threshold';
   if (window.status === 'allowed_warning') return 'close to limit';
   if (window.status === 'allowed') return 'looks OK';
   if (window.status === 'rejected') return 'header said limit reached';
@@ -774,7 +784,7 @@ function readableWindowStatus(window) {
 }
 function windowTone(window) {
   if (!window) return 'unknown';
-  if (window.surpassedThreshold || window.status === 'allowed_warning') return 'warning';
+  if (hasSurpassedWarningThreshold(window) || window.status === 'allowed_warning') return 'warning';
   if (window.status === 'allowed') return 'ok';
   return 'unknown';
 }
@@ -801,7 +811,7 @@ function compactWindowName(windowName) {
 }
 function compactWindowStatus(window) {
   if (!window) return 'unknown';
-  if (window.surpassedThreshold) return 'past warn';
+  if (hasSurpassedWarningThreshold(window)) return 'past warn';
   if (window.status === 'allowed_warning') return 'close';
   if (window.status === 'allowed') return 'ok';
   if (window.status === 'rejected') return 'mixed';
@@ -809,7 +819,7 @@ function compactWindowStatus(window) {
 }
 function compactWindowStateLabel(window) {
   if (!window) return '--';
-  if (window.surpassedThreshold) return 'Warn';
+  if (hasSurpassedWarningThreshold(window)) return 'Warn';
   if (window.status === 'allowed_warning') return 'Close';
   if (window.status === 'allowed') return 'OK';
   if (window.status === 'rejected') return 'Mixed';
@@ -894,7 +904,7 @@ function telemetryCoverageLabel(key) {
   return 'Coverage intermittent';
 }
 function isWindowWarning(window) {
-  return window.status === 'allowed_warning' || (window.surpassedThreshold && window.utilization >= window.surpassedThreshold);
+  return window.status === 'allowed_warning' || hasSurpassedWarningThreshold(window);
 }
 function compactQuotaState(key) {
   const responseCount = key.capacity?.responseCount || 0;
