@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { Server } from "bun";
 
 import { KeyManager } from "../src/key-manager.ts";
-import { proxyRequest } from "../src/proxy.ts";
+import { proxyRequest, resetProxyDebugStateForTests } from "../src/proxy.ts";
 import { subscribe, type ProxyEvent } from "../src/events.ts";
 import type { ProxyConfig, ProxyTokenEntry } from "../src/types.ts";
 import { SchemaTracker } from "../src/schema-tracker.ts";
@@ -118,6 +118,7 @@ afterEach(() => {
   upstreams = [];
   for (const s of setups) s.cleanup();
   setups = [];
+  resetProxyDebugStateForTests();
 });
 
 /** Convenience: create setup + track for cleanup. */
@@ -920,8 +921,10 @@ describe("Token Tracking - Streaming (SSE)", () => {
     });
   }
 
-  function parseConsoleEntries(logSpy: ReturnType<typeof spyOn>): Array<Record<string, unknown>> {
-    return logSpy.mock.calls.map(([line]) => JSON.parse(line as string) as Record<string, unknown>);
+  function parseConsoleEntries(...spies: Array<ReturnType<typeof spyOn>>): Array<Record<string, unknown>> {
+    return spies.flatMap((spy) =>
+      spy.mock.calls.map(([line]) => JSON.parse(line as string) as Record<string, unknown>)
+    );
   }
 
   test("logs stream lifecycle with trace IDs and chunk timing", async () => {
@@ -929,6 +932,7 @@ describe("Token Tracking - Streaming (SSE)", () => {
     km.addKey(FAKE_KEY_A, "key-a");
     setLogLevel("debug");
     const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
 
     const sseData = [
       'data: {"type":"message_start","message":{"usage":{"input_tokens":10}}}\n\n',
@@ -957,7 +961,7 @@ describe("Token Tracking - Streaming (SSE)", () => {
         await result.response.text();
       }
 
-      const entries = parseConsoleEntries(logSpy);
+      const entries = parseConsoleEntries(logSpy, warnSpy);
       const opened = entries.find((entry) => entry.msg === "Stream opened");
       const firstChunk = entries.find((entry) => entry.msg === "Stream first chunk");
       const closed = entries.find((entry) => entry.msg === "Stream closed");
@@ -979,6 +983,79 @@ describe("Token Tracking - Streaming (SSE)", () => {
       expect(closed?.activeStreamsRemaining).toBe(0);
     } finally {
       logSpy.mockRestore();
+      warnSpy.mockRestore();
+      setLogLevel("info");
+    }
+  });
+
+  test("logs slow first chunks with recent history context", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    setLogLevel("debug");
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+
+    let now = 1_000_000;
+    const dateNowSpy = spyOn(Date, "now").mockImplementation(() => now);
+    const encoder = new TextEncoder();
+    const fetchSpy = spyOn(globalThis, "fetch").mockResolvedValue(new Response(new ReadableStream({
+      start(controller) {
+        setTimeout(() => {
+          now += 6_000;
+          controller.enqueue(encoder.encode('data: {"type":"message_start","message":{"usage":{"input_tokens":1}}}\n\n'));
+          controller.close();
+        }, 0);
+      },
+    }), {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    }));
+
+    try {
+      const result = await proxyRequest(
+        makeRequest("/v1/messages", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-request-id": "trace-slow-first-chunk",
+            "x-claude-code-session-id": "session-slow",
+          },
+          body: JSON.stringify({ stream: true, messages: [] }),
+        }),
+        km,
+        makeConfig("http://mocked-upstream.local"),
+        st,
+      );
+
+      expect(result.kind).toBe("success");
+      await result.response.text();
+
+      const entries = parseConsoleEntries(logSpy, warnSpy);
+      const slowEntry = entries.find((entry) =>
+        entry.msg === "Slow first stream chunk"
+        && entry.traceId === "trace-slow-first-chunk"
+      );
+
+      expect(slowEntry).toBeDefined();
+      expect(slowEntry).toMatchObject({
+        label: "key-a",
+        sessionId: "session-slow",
+        firstChunkDelayMs: 6000,
+      });
+      expect(slowEntry?.recentStreamStartHistory).toMatchObject({
+        recentStreamStartWindowMs: 15 * 60 * 1000,
+        totalFirstChunks15m: 1,
+        totalFirstChunkTimeouts15m: 0,
+        sameLabelFirstChunks15m: 1,
+        sameLabelFirstChunkTimeouts15m: 0,
+        sameSessionFirstChunks15m: 1,
+        sameSessionFirstChunkTimeouts15m: 0,
+      });
+    } finally {
+      fetchSpy.mockRestore();
+      dateNowSpy.mockRestore();
+      logSpy.mockRestore();
+      warnSpy.mockRestore();
       setLogLevel("info");
     }
   });
@@ -1090,6 +1167,133 @@ describe("Token Tracking - Streaming (SSE)", () => {
       expect(keyB!.stats.errors).toBe(0);
     } finally {
       fetchSpy.mockRestore();
+    }
+  });
+
+  test("logs same-session active request context when first chunk timeouts happen under concurrency", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    setLogLevel("debug");
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+
+    let firstFetchStarted!: () => void;
+    const firstFetchStartedPromise = new Promise<void>((resolve) => {
+      firstFetchStarted = resolve;
+    });
+    let secondFetchStarted!: () => void;
+    const secondFetchStartedPromise = new Promise<void>((resolve) => {
+      secondFetchStarted = resolve;
+    });
+    let fetchCalls = 0;
+    const encoder = new TextEncoder();
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(async () => {
+      fetchCalls++;
+      if (fetchCalls === 1) firstFetchStarted();
+      if (fetchCalls === 2) secondFetchStarted();
+
+      let cancelled = false;
+      return new Response(new ReadableStream({
+        start(controller) {
+          setTimeout(() => {
+            if (cancelled) return;
+            controller.enqueue(encoder.encode('data: {"type":"message_start","message":{"usage":{"input_tokens":1}}}\n\n'));
+            controller.close();
+          }, 200);
+        },
+        cancel() {
+          cancelled = true;
+        },
+      }), {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      });
+    });
+
+    try {
+      const config = makeConfig("http://mocked-upstream.local", {
+        firstChunkTimeoutMs: 50,
+        maxFirstChunkRetries: 0,
+      });
+      const payload = JSON.stringify({ stream: true, messages: [] });
+
+      const requestA = proxyRequest(
+        makeRequest("/v1/messages", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-request-id": "trace-timeout-a",
+            "x-claude-code-session-id": "session-1",
+          },
+          body: payload,
+        }),
+        km,
+        config,
+        st,
+      );
+      await firstFetchStartedPromise;
+      const requestB = proxyRequest(
+        makeRequest("/v1/messages", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-request-id": "trace-timeout-b",
+            "x-claude-code-session-id": "session-1",
+          },
+          body: payload,
+        }),
+        km,
+        config,
+        st,
+      );
+      await secondFetchStartedPromise;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      const [resultA, resultB] = await Promise.all([requestA, requestB]);
+      expect(resultA.kind).toBe("error");
+      expect(resultB.kind).toBe("error");
+
+      const entries = parseConsoleEntries(logSpy, warnSpy);
+      const retryEntry = entries.find((entry) =>
+        entry.msg === "No first stream chunk yet, retrying request"
+        && entry.traceId === "trace-timeout-a"
+      );
+
+      expect(retryEntry).toBeDefined();
+      const context = retryEntry?.activeRequestContext as Record<string, unknown> | undefined;
+      expect(context).toBeDefined();
+      expect(context?.sameLabelActiveRequests).toBe(1);
+      expect(context?.sameSessionActiveRequests).toBe(1);
+      expect(context?.sameConversationActiveRequests).toBe(1);
+      expect(context?.sameLabelWaitingForFirstChunkRequests).toBe(1);
+      expect(context?.sameSessionWaitingForFirstChunkRequests).toBe(1);
+      expect(context?.sameConversationWaitingForFirstChunkRequests).toBe(1);
+
+      const sameLabelPeers = context?.sameLabelPeers as Array<Record<string, unknown>> | undefined;
+      expect(sameLabelPeers).toBeDefined();
+      expect(sameLabelPeers).toHaveLength(1);
+      expect(sameLabelPeers?.[0]).toMatchObject({
+        traceId: "trace-timeout-b",
+        sessionId: "session-1",
+        phase: "waiting_for_first_chunk",
+      });
+
+      expect(retryEntry?.recentStreamStartHistory).toMatchObject({
+        recentStreamStartWindowMs: 15 * 60 * 1000,
+        totalFirstChunks15m: 0,
+        totalFirstChunkTimeouts15m: 0,
+        sameLabelFirstChunks15m: 0,
+        sameLabelFirstChunkTimeouts15m: 0,
+        sameSessionFirstChunks15m: 0,
+        sameSessionFirstChunkTimeouts15m: 0,
+        sameConversationFirstChunks15m: 0,
+        sameConversationFirstChunkTimeouts15m: 0,
+      });
+    } finally {
+      fetchSpy.mockRestore();
+      logSpy.mockRestore();
+      warnSpy.mockRestore();
+      setLogLevel("info");
     }
   });
 

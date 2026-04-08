@@ -15,6 +15,85 @@ const RATE_LIMIT_STATUS = 429 as const;
 const ACTIVE_STREAM_SNAPSHOT_INTERVAL_MS = 2_000;
 const RECENT_STREAM_ACTIVITY_WINDOW_MS = 1_000;
 const SLOW_STREAM_SILENCE_LOG_MS = 5_000;
+const SLOW_FIRST_CHUNK_LOG_MS = 5_000;
+const STREAM_START_HISTORY_WINDOW_MS = 15 * 60 * 1_000;
+const MAX_ACTIVE_REQUEST_PEERS_LOGGED = 5;
+
+type ActiveRequestPhase =
+  | "fetching_upstream"
+  | "waiting_for_first_chunk"
+  | "streaming";
+
+type ActiveRequestState = {
+  readonly traceId: string;
+  readonly label: string;
+  readonly user: string | undefined;
+  readonly path: string;
+  readonly sessionId: string | null;
+  readonly conversationKey: string | null;
+  attempt: number;
+  readonly startedAt: number;
+  phase: ActiveRequestPhase;
+  upstreamRespondedAt: number | null;
+  firstChunkAt: number | null;
+};
+
+type ActiveRequestPhaseCounts = {
+  activeRequests: number;
+  fetchingUpstreamRequests: number;
+  waitingForFirstChunkRequests: number;
+  streamingRequests: number;
+};
+
+type ActiveRequestPeerSnapshot = {
+  readonly traceId: string;
+  readonly label: string;
+  readonly sessionId: string | null;
+  readonly conversationKey: string | null;
+  readonly attempt: number;
+  readonly phase: ActiveRequestPhase;
+  readonly ageMs: number;
+  readonly sinceUpstreamResponseMs: number | null;
+  readonly sinceFirstChunkMs: number | null;
+};
+
+type ActiveRequestContext = ActiveRequestPhaseCounts & {
+  sameLabelActiveRequests: number;
+  sameLabelFetchingUpstreamRequests: number;
+  sameLabelWaitingForFirstChunkRequests: number;
+  sameLabelStreamingRequests: number;
+  sameSessionActiveRequests: number;
+  sameSessionFetchingUpstreamRequests: number;
+  sameSessionWaitingForFirstChunkRequests: number;
+  sameSessionStreamingRequests: number;
+  sameConversationActiveRequests: number;
+  sameConversationFetchingUpstreamRequests: number;
+  sameConversationWaitingForFirstChunkRequests: number;
+  sameConversationStreamingRequests: number;
+  sameLabelPeers: ActiveRequestPeerSnapshot[];
+};
+
+type StreamStartHistoryEntry = {
+  readonly traceId: string;
+  readonly label: string;
+  readonly sessionId: string | null;
+  readonly conversationKey: string | null;
+  readonly attempt: number;
+  readonly at: number;
+  readonly outcome: "first_chunk" | "first_chunk_timeout";
+};
+
+type StreamStartHistorySummary = {
+  recentStreamStartWindowMs: number;
+  totalFirstChunks15m: number;
+  totalFirstChunkTimeouts15m: number;
+  sameLabelFirstChunks15m: number;
+  sameLabelFirstChunkTimeouts15m: number;
+  sameSessionFirstChunks15m: number;
+  sameSessionFirstChunkTimeouts15m: number;
+  sameConversationFirstChunks15m: number;
+  sameConversationFirstChunkTimeouts15m: number;
+};
 
 type ActiveStreamState = {
   readonly traceId: string;
@@ -84,6 +163,8 @@ type StreamObserver = {
 };
 
 const activeStreams = new Map<string, ActiveStreamState>();
+const activeRequests = new Map<string, ActiveRequestState>();
+const recentStreamStartHistory: StreamStartHistoryEntry[] = [];
 let lastActiveStreamSnapshotAt = 0;
 
 /**
@@ -220,6 +301,15 @@ export async function proxyRequest(
       requestBodyState,
       headers: allHeaders,
     });
+    registerActiveRequest(
+      traceId,
+      entry.label,
+      proxyUser?.label,
+      url.pathname,
+      sessionId,
+      conversationKey,
+      attempts,
+    );
     if (attempts > 1) {
       log("info", "Retry diagnostics before upstream fetch", {
         label: entry.label,
@@ -246,6 +336,7 @@ export async function proxyRequest(
     try {
       upstream = await fetchUpstream(upstreamUrl, req.method, headers, requestBody, abortController.signal);
     } catch (err) {
+      clearActiveRequest(traceId);
       keyManager.recordError(entry);
       if (proxyUser) keyManager.recordTokenError(proxyUser);
       log("error", "Upstream fetch failed", {
@@ -307,6 +398,7 @@ export async function proxyRequest(
       const retryAfter = parseRetryAfter(upstream.headers);
       keyManager.recordRateLimit(entry, retryAfter);
       await upstream.text();
+      clearActiveRequest(traceId);
 
       log("info", "Rate limited, trying next key", {
         label: entry.label,
@@ -332,6 +424,7 @@ export async function proxyRequest(
     }
 
     if (upstream.status >= 400) {
+      clearActiveRequest(traceId);
       keyManager.recordError(entry);
       if (proxyUser) keyManager.recordTokenError(proxyUser);
       const body = await upstream.text();
@@ -367,12 +460,46 @@ export async function proxyRequest(
         url.pathname,
         traceId,
       );
+      markActiveRequestWaitingForFirstChunk(traceId);
+      const waitContext = buildActiveRequestContext(traceId, Date.now());
+      if (
+        waitContext !== null
+        && (
+          waitContext.sameLabelActiveRequests > 0
+          || waitContext.sameSessionActiveRequests > 0
+          || waitContext.sameConversationActiveRequests > 0
+        )
+      ) {
+        log("info", "Waiting for first stream chunk with peer activity", {
+          label: entry.label,
+          user: proxyUser?.label,
+          method: req.method,
+          path: url.pathname,
+          attempt: attempts,
+          traceId,
+          sessionId,
+          conversationKey,
+          activeRequestContext: waitContext,
+        });
+      }
       const firstChunk = await waitForFirstStreamChunk(
         upstream.body,
         config.firstChunkTimeoutMs,
         abortController,
       );
       if (firstChunk.kind === "retry") {
+        const timeoutObservedAt = Date.now();
+        const timeoutContext = buildActiveRequestContext(traceId, timeoutObservedAt);
+        const currentRequest = activeRequests.get(traceId);
+        const currentWaitingForFirstChunkMs = currentRequest?.upstreamRespondedAt == null
+          ? null
+          : timeoutObservedAt - currentRequest.upstreamRespondedAt;
+        const recentHistory = summarizeRecentStreamStartHistory(
+          entry.label,
+          sessionId,
+          conversationKey,
+          timeoutObservedAt,
+        );
         observer.abandon(firstChunk.reason);
         keyManager.recordError(entry);
         firstChunkRetries++;
@@ -389,15 +516,19 @@ export async function proxyRequest(
           user: proxyUser?.label,
           method: req.method,
           path: url.pathname,
-        attempt: attempts,
-        traceId,
-        sessionId,
-        durationMs: Date.now() - fetchStartedAt,
-        firstChunkTimeoutMs: config.firstChunkTimeoutMs,
-        maxFirstChunkRetries: config.maxFirstChunkRetries,
+          attempt: attempts,
+          traceId,
+          sessionId,
+          conversationKey,
+          durationMs: Date.now() - fetchStartedAt,
+          firstChunkTimeoutMs: config.firstChunkTimeoutMs,
+          maxFirstChunkRetries: config.maxFirstChunkRetries,
           firstChunkRetries,
           retryStrategy: "sticky_same_key_unless_unavailable",
           reason: firstChunk.reason,
+          currentWaitingForFirstChunkMs,
+          ...(timeoutContext !== null ? { activeRequestContext: timeoutContext } : {}),
+          recentStreamStartHistory: recentHistory,
           ...(firstChunk.error !== undefined ? { error: firstChunk.error } : {}),
         });
         emitWithKeys({
@@ -433,8 +564,10 @@ export async function proxyRequest(
           changes: bodyChanges,
         }, keyManager.listKeys());
       }
+      clearActiveRequest(traceId);
       body = text;
     } else {
+      clearActiveRequest(traceId);
       keyManager.recordSuccess(entry, 0, 0);
       if (proxyUser) keyManager.recordTokenSuccess(proxyUser, 0, 0);
       body = null;
@@ -459,6 +592,13 @@ export async function proxyRequest(
 }
 
 // ── Helpers ───────────────────────────────────────────────────────
+
+export function resetProxyDebugStateForTests(): void {
+  activeStreams.clear();
+  activeRequests.clear();
+  recentStreamStartHistory.length = 0;
+  lastActiveStreamSnapshotAt = 0;
+}
 
 function allExhaustedResult(keyManager: KeyManager): ProxyResult {
   if (keyManager.totalCount() === 0) return { kind: "no_keys" };
@@ -545,6 +685,199 @@ function snapshotRequestBodyState(req: Request, bufferedBody?: BufferedRequestBo
   };
 }
 
+function registerActiveRequest(
+  traceId: string,
+  label: string,
+  user: string | undefined,
+  path: string,
+  sessionId: string | null,
+  conversationKey: string | null,
+  attempt: number,
+): void {
+  activeRequests.set(traceId, {
+    traceId,
+    label,
+    user,
+    path,
+    sessionId,
+    conversationKey,
+    attempt,
+    startedAt: Date.now(),
+    phase: "fetching_upstream",
+    upstreamRespondedAt: null,
+    firstChunkAt: null,
+  });
+}
+
+function markActiveRequestWaitingForFirstChunk(traceId: string): void {
+  const request = activeRequests.get(traceId);
+  if (!request) return;
+  request.phase = "waiting_for_first_chunk";
+  request.upstreamRespondedAt = Date.now();
+  request.firstChunkAt = null;
+}
+
+function markActiveRequestStreaming(traceId: string, now: number): void {
+  const request = activeRequests.get(traceId);
+  if (!request) return;
+  request.phase = "streaming";
+  if (request.upstreamRespondedAt === null) request.upstreamRespondedAt = now;
+  if (request.firstChunkAt === null) request.firstChunkAt = now;
+}
+
+function clearActiveRequest(traceId: string): void {
+  activeRequests.delete(traceId);
+}
+
+function buildActiveRequestContext(traceId: string, now: number): ActiveRequestContext | null {
+  const current = activeRequests.get(traceId);
+  if (!current) return null;
+
+  const peers = [...activeRequests.values()].filter((request) => request.traceId !== traceId);
+  const sameLabelPeers = peers.filter((request) => request.label === current.label);
+  const sameSessionPeers = current.sessionId === null
+    ? []
+    : peers.filter((request) => request.sessionId === current.sessionId);
+  const sameConversationPeers = current.conversationKey === null
+    ? []
+    : peers.filter((request) => request.conversationKey === current.conversationKey);
+
+  const overall = countActiveRequestPhases(peers);
+  const sameLabel = countActiveRequestPhases(sameLabelPeers);
+  const sameSession = countActiveRequestPhases(sameSessionPeers);
+  const sameConversation = countActiveRequestPhases(sameConversationPeers);
+
+  return {
+    ...overall,
+    sameLabelActiveRequests: sameLabel.activeRequests,
+    sameLabelFetchingUpstreamRequests: sameLabel.fetchingUpstreamRequests,
+    sameLabelWaitingForFirstChunkRequests: sameLabel.waitingForFirstChunkRequests,
+    sameLabelStreamingRequests: sameLabel.streamingRequests,
+    sameSessionActiveRequests: sameSession.activeRequests,
+    sameSessionFetchingUpstreamRequests: sameSession.fetchingUpstreamRequests,
+    sameSessionWaitingForFirstChunkRequests: sameSession.waitingForFirstChunkRequests,
+    sameSessionStreamingRequests: sameSession.streamingRequests,
+    sameConversationActiveRequests: sameConversation.activeRequests,
+    sameConversationFetchingUpstreamRequests: sameConversation.fetchingUpstreamRequests,
+    sameConversationWaitingForFirstChunkRequests: sameConversation.waitingForFirstChunkRequests,
+    sameConversationStreamingRequests: sameConversation.streamingRequests,
+    sameLabelPeers: sameLabelPeers
+      .sort((a, b) => a.startedAt - b.startedAt)
+      .slice(0, MAX_ACTIVE_REQUEST_PEERS_LOGGED)
+      .map((request) => snapshotActiveRequestPeer(request, now)),
+  };
+}
+
+function pruneRecentStreamStartHistory(now: number): void {
+  while (
+    recentStreamStartHistory.length > 0
+    && now - recentStreamStartHistory[0]!.at > STREAM_START_HISTORY_WINDOW_MS
+  ) {
+    recentStreamStartHistory.shift();
+  }
+}
+
+function recordStreamStartHistory(
+  traceId: string,
+  label: string,
+  sessionId: string | null,
+  conversationKey: string | null,
+  attempt: number,
+  outcome: StreamStartHistoryEntry["outcome"],
+  at: number,
+): void {
+  pruneRecentStreamStartHistory(at);
+  recentStreamStartHistory.push({
+    traceId,
+    label,
+    sessionId,
+    conversationKey,
+    attempt,
+    at,
+    outcome,
+  });
+}
+
+function summarizeRecentStreamStartHistory(
+  label: string,
+  sessionId: string | null,
+  conversationKey: string | null,
+  now: number,
+): StreamStartHistorySummary {
+  pruneRecentStreamStartHistory(now);
+
+  let totalFirstChunks15m = 0;
+  let totalFirstChunkTimeouts15m = 0;
+  let sameLabelFirstChunks15m = 0;
+  let sameLabelFirstChunkTimeouts15m = 0;
+  let sameSessionFirstChunks15m = 0;
+  let sameSessionFirstChunkTimeouts15m = 0;
+  let sameConversationFirstChunks15m = 0;
+  let sameConversationFirstChunkTimeouts15m = 0;
+
+  for (const entry of recentStreamStartHistory) {
+    const isFirstChunk = entry.outcome === "first_chunk";
+    if (isFirstChunk) totalFirstChunks15m++;
+    else totalFirstChunkTimeouts15m++;
+
+    if (entry.label === label) {
+      if (isFirstChunk) sameLabelFirstChunks15m++;
+      else sameLabelFirstChunkTimeouts15m++;
+    }
+    if (sessionId !== null && entry.sessionId === sessionId) {
+      if (isFirstChunk) sameSessionFirstChunks15m++;
+      else sameSessionFirstChunkTimeouts15m++;
+    }
+    if (conversationKey !== null && entry.conversationKey === conversationKey) {
+      if (isFirstChunk) sameConversationFirstChunks15m++;
+      else sameConversationFirstChunkTimeouts15m++;
+    }
+  }
+
+  return {
+    recentStreamStartWindowMs: STREAM_START_HISTORY_WINDOW_MS,
+    totalFirstChunks15m,
+    totalFirstChunkTimeouts15m,
+    sameLabelFirstChunks15m,
+    sameLabelFirstChunkTimeouts15m,
+    sameSessionFirstChunks15m,
+    sameSessionFirstChunkTimeouts15m,
+    sameConversationFirstChunks15m,
+    sameConversationFirstChunkTimeouts15m,
+  };
+}
+
+function countActiveRequestPhases(requests: readonly ActiveRequestState[]): ActiveRequestPhaseCounts {
+  const counts: ActiveRequestPhaseCounts = {
+    activeRequests: requests.length,
+    fetchingUpstreamRequests: 0,
+    waitingForFirstChunkRequests: 0,
+    streamingRequests: 0,
+  };
+
+  for (const request of requests) {
+    if (request.phase === "fetching_upstream") counts.fetchingUpstreamRequests++;
+    else if (request.phase === "waiting_for_first_chunk") counts.waitingForFirstChunkRequests++;
+    else if (request.phase === "streaming") counts.streamingRequests++;
+  }
+
+  return counts;
+}
+
+function snapshotActiveRequestPeer(request: ActiveRequestState, now: number): ActiveRequestPeerSnapshot {
+  return {
+    traceId: request.traceId,
+    label: request.label,
+    sessionId: request.sessionId,
+    conversationKey: request.conversationKey,
+    attempt: request.attempt,
+    phase: request.phase,
+    ageMs: now - request.startedAt,
+    sinceUpstreamResponseMs: request.upstreamRespondedAt === null ? null : now - request.upstreamRespondedAt,
+    sinceFirstChunkMs: request.firstChunkAt === null ? null : now - request.firstChunkAt,
+  };
+}
+
 function countRecentlyActiveStreams(now: number): number {
   let count = 0;
   for (const stream of activeStreams.values()) {
@@ -619,6 +952,7 @@ function registerActiveStream(
 function recordActiveStreamChunk(traceId: string, chunkBytes: number): void {
   const stream = activeStreams.get(traceId);
   if (!stream) return;
+  const request = activeRequests.get(traceId);
 
   const now = Date.now();
   const silenceGapMs = stream.lastChunkAt === null ? null : now - stream.lastChunkAt;
@@ -643,16 +977,57 @@ function recordActiveStreamChunk(traceId: string, chunkBytes: number): void {
 
   if (stream.firstChunkAt === null) {
     stream.firstChunkAt = now;
+    markActiveRequestStreaming(traceId, now);
+    recordStreamStartHistory(
+      traceId,
+      stream.label,
+      request?.sessionId ?? null,
+      request?.conversationKey ?? null,
+      request?.attempt ?? 1,
+      "first_chunk",
+      now,
+    );
+    const firstChunkDelayMs = now - stream.openedAt;
     const recentlyActiveStreams = countRecentlyActiveStreams(now);
+    const requestContext = buildActiveRequestContext(traceId, now);
     log("info", "Stream first chunk", {
       traceId,
       label: stream.label,
       user: stream.user,
       path: stream.path,
-      firstChunkDelayMs: now - stream.openedAt,
+      firstChunkDelayMs,
       activeStreams: activeStreams.size,
       otherRecentlyActiveStreams: Math.max(0, recentlyActiveStreams - 1),
+      ...(requestContext !== null ? {
+        sameLabelActiveRequests: requestContext.sameLabelActiveRequests,
+        sameLabelWaitingForFirstChunkRequests: requestContext.sameLabelWaitingForFirstChunkRequests,
+        sameLabelStreamingRequests: requestContext.sameLabelStreamingRequests,
+        sameConversationActiveRequests: requestContext.sameConversationActiveRequests,
+        sameConversationWaitingForFirstChunkRequests: requestContext.sameConversationWaitingForFirstChunkRequests,
+        sameConversationStreamingRequests: requestContext.sameConversationStreamingRequests,
+      } : {}),
     });
+    if (firstChunkDelayMs >= SLOW_FIRST_CHUNK_LOG_MS) {
+      log("warn", "Slow first stream chunk", {
+        traceId,
+        label: stream.label,
+        user: stream.user,
+        path: stream.path,
+        attempt: request?.attempt ?? 1,
+        sessionId: request?.sessionId ?? null,
+        conversationKey: request?.conversationKey ?? null,
+        firstChunkDelayMs,
+        activeStreams: activeStreams.size,
+        otherRecentlyActiveStreams: Math.max(0, recentlyActiveStreams - 1),
+        ...(requestContext !== null ? { activeRequestContext: requestContext } : {}),
+        recentStreamStartHistory: summarizeRecentStreamStartHistory(
+          stream.label,
+          request?.sessionId ?? null,
+          request?.conversationKey ?? null,
+          now,
+        ),
+      });
+    }
   }
 
   maybeLogActiveStreamSnapshot(now);
@@ -707,8 +1082,20 @@ function abandonActiveStream(
 ): void {
   const stream = activeStreams.get(traceId);
   if (!stream) return;
+  const request = activeRequests.get(traceId);
 
   const now = Date.now();
+  if (reason === "first_chunk_timeout") {
+    recordStreamStartHistory(
+      traceId,
+      stream.label,
+      request?.sessionId ?? null,
+      request?.conversationKey ?? null,
+      request?.attempt ?? 1,
+      "first_chunk_timeout",
+      now,
+    );
+  }
   activeStreams.delete(traceId);
   log("warn", "Stream abandoned", {
     traceId,
@@ -1230,6 +1617,7 @@ function createTokenTrackingObserver(
     finalized = true;
     buffer = "";
     closeActiveStream(traceId, inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens);
+    clearActiveRequest(traceId);
     keyManager.recordSuccess(entry, inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens);
     if (proxyUser) keyManager.recordTokenSuccess(proxyUser, inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens);
     if (inputTokens > 0 || outputTokens > 0 || cacheReadTokens > 0) {
@@ -1254,6 +1642,7 @@ function createTokenTrackingObserver(
     finalized = true;
     buffer = "";
     abandonActiveStream(traceId, reason, inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens);
+    clearActiveRequest(traceId);
   }
 
   return { observeChunk, finish, abandon };
