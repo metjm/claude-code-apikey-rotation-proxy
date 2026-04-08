@@ -983,7 +983,7 @@ describe("Token Tracking - Streaming (SSE)", () => {
     }
   });
 
-  test("retries another key when the first SSE chunk stalls", async () => {
+  test("retries the same key when the first SSE chunk stalls", async () => {
     const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
     km.addKey(FAKE_KEY_B, "key-b");
@@ -1007,6 +1007,8 @@ describe("Token Tracking - Streaming (SSE)", () => {
       "data: [DONE]\n\n",
     ];
 
+    let keyAAttempts = 0;
+    let simulatedCompetingRequest = false;
     const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
       const headers = new Headers(init?.headers);
       const body = init?.body;
@@ -1015,22 +1017,36 @@ describe("Token Tracking - Streaming (SSE)", () => {
       seenBodies.push(bodyText);
 
       if (headers.get("x-api-key") === FAKE_KEY_A) {
-        let cancelled = false;
-        return new Response(new ReadableStream({
-          start(controller) {
-            setTimeout(() => {
-              if (cancelled) return;
-              const encoder = new TextEncoder();
-              for (const chunk of stalledSse) {
-                controller.enqueue(encoder.encode(chunk));
-              }
-              controller.close();
-            }, 50);
-          },
-          cancel() {
-            cancelled = true;
-          },
-        }), {
+        keyAAttempts++;
+        if (keyAAttempts === 1) {
+          let cancelled = false;
+          setTimeout(() => {
+            if (simulatedCompetingRequest) return;
+            simulatedCompetingRequest = true;
+            const competingKey = km.listKeys()[1];
+            if (competingKey) km.recordRequest(competingKey);
+          }, 5);
+          return new Response(new ReadableStream({
+            start(controller) {
+              setTimeout(() => {
+                if (cancelled) return;
+                const encoder = new TextEncoder();
+                for (const chunk of stalledSse) {
+                  controller.enqueue(encoder.encode(chunk));
+                }
+                controller.close();
+              }, 50);
+            },
+            cancel() {
+              cancelled = true;
+            },
+          }), {
+            status: 200,
+            headers: { "content-type": "text/event-stream" },
+          });
+        }
+
+        return new Response(makeSSEBody(fastSse), {
           status: 200,
           headers: { "content-type": "text/event-stream" },
         });
@@ -1064,13 +1080,14 @@ describe("Token Tracking - Streaming (SSE)", () => {
         expect(body).toContain('"output_tokens":2');
       }
 
-      expect(seenKeys).toEqual([FAKE_KEY_A, FAKE_KEY_B]);
+      expect(seenKeys).toEqual([FAKE_KEY_A, FAKE_KEY_A]);
       expect(seenBodies).toEqual([JSON.stringify(payload), JSON.stringify(payload)]);
 
       const [keyA, keyB] = km.listKeys();
       expect(keyA!.stats.errors).toBe(1);
-      expect(keyA!.stats.successfulRequests).toBe(0);
-      expect(keyB!.stats.successfulRequests).toBe(1);
+      expect(keyA!.stats.successfulRequests).toBe(1);
+      expect(keyB!.stats.successfulRequests).toBe(0);
+      expect(keyB!.stats.errors).toBe(0);
     } finally {
       fetchSpy.mockRestore();
     }
@@ -1150,7 +1167,7 @@ describe("Token Tracking - Streaming (SSE)", () => {
     }
   });
 
-  test("returns 504 when every first SSE chunk stalls past the retry budget", async () => {
+  test("returns 504 when the same key keeps stalling past the retry budget", async () => {
     const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
     km.addKey(FAKE_KEY_B, "key-b");
@@ -1160,8 +1177,12 @@ describe("Token Tracking - Streaming (SSE)", () => {
       "data: [DONE]\n\n",
     ];
 
-    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(async () =>
-      new Response((() => {
+    const seenKeys: string[] = [];
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      const headers = new Headers(init?.headers);
+      seenKeys.push(headers.get("x-api-key") ?? "");
+
+      return new Response((() => {
         let cancelled = false;
         return new ReadableStream({
           start(controller) {
@@ -1181,8 +1202,8 @@ describe("Token Tracking - Streaming (SSE)", () => {
       })(), {
         status: 200,
         headers: { "content-type": "text/event-stream" },
-      })
-    );
+      });
+    });
 
     try {
       const config = makeConfig("http://mocked-upstream.local", {
@@ -1211,9 +1232,11 @@ describe("Token Tracking - Streaming (SSE)", () => {
         });
       }
 
+      expect(seenKeys).toEqual([FAKE_KEY_A, FAKE_KEY_A]);
+
       const [keyA, keyB] = km.listKeys();
-      expect(keyA!.stats.errors).toBe(1);
-      expect(keyB!.stats.errors).toBe(1);
+      expect(keyA!.stats.errors).toBe(2);
+      expect(keyB!.stats.errors).toBe(0);
     } finally {
       fetchSpy.mockRestore();
     }

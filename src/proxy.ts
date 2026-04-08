@@ -1,5 +1,6 @@
 import type { KeyManager } from "./key-manager.ts";
 import {
+  type ApiKeyEntry,
   type CapacityObservation,
   type ProxyConfig,
   type ProxyResult,
@@ -143,14 +144,17 @@ export async function proxyRequest(
   }
   const requestBodyState = snapshotRequestBodyState(req, requestBody);
 
-  const triedKeys = new Set<string>();
   let attempts = 0;
   let firstChunkRetries = 0;
   let sawRateLimit = false;
   let lastStreamStartFailure: StreamStartFailure | null = null;
+  let preferredRetryKey: ApiKeyEntry | null = null;
 
   while (attempts < config.maxRetriesPerRequest) {
-    const entry = keyManager.getNextAvailableKey(triedKeys);
+    const entry: ApiKeyEntry | null = preferredRetryKey !== null && isKeyAvailableNow(preferredRetryKey)
+      ? preferredRetryKey
+      : keyManager.getNextAvailableKey();
+    preferredRetryKey = null;
 
     if (entry === null) {
       if (lastStreamStartFailure !== null && !sawRateLimit) {
@@ -160,17 +164,6 @@ export async function proxyRequest(
       if (proxyUser) keyManager.recordTokenError(proxyUser);
       return allExhaustedResult(keyManager);
     }
-
-    if (triedKeys.has(entry.key)) {
-      if (lastStreamStartFailure !== null && !sawRateLimit) {
-        if (proxyUser) keyManager.recordTokenError(proxyUser);
-        return firstChunkFailureResult(lastStreamStartFailure, config.firstChunkTimeoutMs);
-      }
-      if (proxyUser) keyManager.recordTokenError(proxyUser);
-      return allExhaustedResult(keyManager);
-    }
-
-    triedKeys.add(entry.key);
     attempts++;
     keyManager.recordRequest(entry);
 
@@ -297,6 +290,7 @@ export async function proxyRequest(
         user: proxyUser?.label, retryAfter, availableKeys: keyManager.availableCount(),
       }, keyManager.listKeys());
       lastStreamStartFailure = null;
+      preferredRetryKey = null;
       continue;
     }
 
@@ -345,6 +339,7 @@ export async function proxyRequest(
         observer.abandon(firstChunk.reason);
         keyManager.recordError(entry);
         firstChunkRetries++;
+        preferredRetryKey = entry;
         lastStreamStartFailure = {
           reason: firstChunk.reason,
           attempt: attempts,
@@ -352,7 +347,7 @@ export async function proxyRequest(
           ...(firstChunk.error !== undefined ? { error: firstChunk.error } : {}),
         };
 
-        log("warn", "No first stream chunk yet, trying next key", {
+        log("warn", "No first stream chunk yet, retrying request", {
           label: entry.label,
           user: proxyUser?.label,
           method: req.method,
@@ -363,6 +358,7 @@ export async function proxyRequest(
           firstChunkTimeoutMs: config.firstChunkTimeoutMs,
           maxFirstChunkRetries: config.maxFirstChunkRetries,
           firstChunkRetries,
+          retryStrategy: "sticky_same_key_unless_unavailable",
           reason: firstChunk.reason,
           ...(firstChunk.error !== undefined ? { error: firstChunk.error } : {}),
         });
@@ -429,6 +425,12 @@ export async function proxyRequest(
 function allExhaustedResult(keyManager: KeyManager): ProxyResult {
   if (keyManager.totalCount() === 0) return { kind: "no_keys" };
   return { kind: "all_exhausted", earliestAvailableAt: keyManager.getEarliestAvailableAt() };
+}
+
+function isKeyAvailableNow(entry: ApiKeyEntry): boolean {
+  const currentTime = unixMs(Date.now());
+  const currentDay = new Date().getDay();
+  return entry.availableAt <= currentTime && entry.allowedDays.includes(currentDay);
 }
 
 function firstChunkFailureResult(
