@@ -68,6 +68,7 @@ Environment:
   DB_PATH           Full path to SQLite database (overrides DATA_DIR; default: DATA_DIR/state.db)
   MAX_RETRIES       Max key rotation attempts per request (default: 10)
   FIRST_CHUNK_TIMEOUT_MS   Max time to wait for the first SSE chunk before retrying (default: 16000)
+  STREAM_IDLE_TIMEOUT_MS   Max time between SSE chunks before aborting the stream (default: 120000, 0 disables)
   MAX_FIRST_CHUNK_RETRIES  Max retries after a first-chunk stall on SSE responses (default: 2)
   WEBHOOK_URL       Slack-compatible webhook URL for API schema change notifications (optional)
   LOG_LEVEL         debug | info | warn | error (default: info)`);

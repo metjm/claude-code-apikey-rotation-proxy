@@ -72,6 +72,7 @@ function makeConfig(upstream: string, overrides?: Partial<ProxyConfig>): ProxyCo
     dataDir: "/tmp",
     maxRetriesPerRequest: 10,
     firstChunkTimeoutMs: 16_000,
+    streamIdleTimeoutMs: 120_000,
     maxFirstChunkRetries: 2,
     webhookUrl: null,
     ...overrides,
@@ -1367,6 +1368,70 @@ describe("Token Tracking - Streaming (SSE)", () => {
       Date.now = originalNow;
       fetchSpy.mockRestore();
       logSpy.mockRestore();
+      setLogLevel("info");
+    }
+  });
+
+  test("abandons a streaming response after 2 minutes of upstream silence", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    setLogLevel("debug");
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+
+    let cancelled = false;
+    const encoder = new TextEncoder();
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(async () =>
+      new Response(new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encoder.encode('data: {"type":"message_start","message":{"usage":{"input_tokens":10}}}\n\n'));
+        },
+        cancel() {
+          cancelled = true;
+        },
+      }), {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }),
+    );
+
+    try {
+      const config = makeConfig("http://mocked-upstream.local", {
+        streamIdleTimeoutMs: 20,
+      });
+      const result = await proxyRequest(
+        makeRequest("/v1/messages", { headers: { "x-request-id": "trace-idle-timeout-1" } }),
+        km,
+        config,
+        st,
+      );
+
+      expect(result.kind).toBe("success");
+      if (result.kind === "success") {
+        const body = result.response.body;
+        expect(body).not.toBeNull();
+        const reader = body!.getReader();
+        const first = await reader.read();
+        expect(first.done).toBe(false);
+        await expect(reader.read()).rejects.toThrow("Upstream stream idle timeout after 20ms");
+      }
+
+      expect(cancelled).toBe(true);
+
+      const entries = parseConsoleEntries(logSpy, warnSpy);
+      const abandoned = entries.find((entry) => entry.msg === "Stream abandoned");
+
+      expect(abandoned).toBeDefined();
+      expect(abandoned?.traceId).toBe("trace-idle-timeout-1");
+      expect(abandoned?.reason).toBe("stream_idle_timeout");
+      expect(Number(abandoned?.sinceLastChunkMs)).toBeGreaterThanOrEqual(20);
+
+      const keys = km.listKeys();
+      expect(keys[0]!.stats.successfulRequests).toBe(0);
+    } finally {
+      fetchSpy.mockRestore();
+      logSpy.mockRestore();
+      warnSpy.mockRestore();
       setLogLevel("info");
     }
   });

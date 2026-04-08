@@ -162,6 +162,22 @@ type StreamObserver = {
   readonly abandon: (reason: string) => void;
 };
 
+type NextChunkResult =
+  | {
+      readonly kind: "chunk";
+      readonly chunk: Uint8Array;
+    }
+  | {
+      readonly kind: "done";
+    }
+  | {
+      readonly kind: "error";
+      readonly error: unknown;
+    }
+  | {
+      readonly kind: "timeout";
+    };
+
 const activeStreams = new Map<string, ActiveStreamState>();
 const activeRequests = new Map<string, ActiveRequestState>();
 const recentStreamStartHistory: StreamStartHistoryEntry[] = [];
@@ -553,7 +569,13 @@ export async function proxyRequest(
 
       lastStreamStartFailure = null;
       observer.observeChunk(firstChunk.firstChunk);
-      body = createTrackedStreamFromReader(firstChunk.reader, firstChunk.firstChunk, observer);
+      body = createTrackedStreamFromReader(
+        firstChunk.reader,
+        firstChunk.firstChunk,
+        observer,
+        abortController,
+        config.streamIdleTimeoutMs,
+      );
     } else if (upstream.body !== null) {
       const text = await upstream.text();
       extractTokensFromJson(text, entry, keyManager, proxyUser);
@@ -1124,6 +1146,40 @@ function getStreamMaxSilenceGapMs(stream: ActiveStreamState, now: number): numbe
   return Math.max(stream.maxSilenceGapMs, now - stream.lastChunkAt);
 }
 
+async function readNextChunkWithTimeout(
+  reader: UpstreamReader,
+  timeoutMs: number,
+): Promise<NextChunkResult> {
+  if (timeoutMs <= 0) {
+    try {
+      const result = await reader.read();
+      if (result.done || result.value === undefined) return { kind: "done" };
+      return { kind: "chunk", chunk: normalizeChunk(result.value) };
+    } catch (error) {
+      return { kind: "error", error };
+    }
+  }
+
+  let timeoutId: ReturnType<typeof setTimeout> | null = null;
+  try {
+    const readPromise = reader.read().then(
+      (result) => ({ kind: "read" as const, result }),
+      (error) => ({ kind: "error" as const, error }),
+    );
+    const timeoutPromise = new Promise<{ kind: "timeout" }>((resolve) => {
+      timeoutId = setTimeout(() => resolve({ kind: "timeout" }), timeoutMs);
+    });
+    const outcome = await Promise.race([readPromise, timeoutPromise]);
+
+    if (outcome.kind === "timeout") return { kind: "timeout" };
+    if (outcome.kind === "error") return { kind: "error", error: outcome.error };
+    if (outcome.result.done || outcome.result.value === undefined) return { kind: "done" };
+    return { kind: "chunk", chunk: normalizeChunk(outcome.result.value) };
+  } finally {
+    if (timeoutId !== null) clearTimeout(timeoutId);
+  }
+}
+
 function fetchUpstream(
   url: string,
   method: string,
@@ -1641,6 +1697,8 @@ function createTrackedStreamFromReader(
   reader: UpstreamReader,
   firstChunk: Uint8Array,
   observer: StreamObserver,
+  abortController: AbortController,
+  streamIdleTimeoutMs: number,
 ): ReadableStream<Uint8Array> {
   let sentFirstChunk = false;
   let closed = false;
@@ -1655,17 +1713,23 @@ function createTrackedStreamFromReader(
         return;
       }
 
-      let result;
-      try {
-        result = await reader.read();
-      } catch (error) {
+      const nextChunk = await readNextChunkWithTimeout(reader, streamIdleTimeoutMs);
+      if (nextChunk.kind === "timeout") {
         closed = true;
-        observer.abandon("stream_read_failed_after_first_chunk");
-        controller.error(error);
+        abortController.abort("stream_idle_timeout");
+        try { await reader.cancel("stream_idle_timeout"); } catch {}
+        try { reader.releaseLock(); } catch {}
+        observer.abandon("stream_idle_timeout");
+        controller.error(new Error(`Upstream stream idle timeout after ${streamIdleTimeoutMs}ms`));
         return;
       }
-
-      if (result.done || result.value === undefined) {
+      if (nextChunk.kind === "error") {
+        closed = true;
+        observer.abandon("stream_read_failed_after_first_chunk");
+        controller.error(nextChunk.error);
+        return;
+      }
+      if (nextChunk.kind === "done") {
         closed = true;
         observer.finish();
         try { reader.releaseLock(); } catch {}
@@ -1673,7 +1737,7 @@ function createTrackedStreamFromReader(
         return;
       }
 
-      const chunk = normalizeChunk(result.value);
+      const chunk = nextChunk.chunk;
       observer.observeChunk(chunk);
       controller.enqueue(chunk);
     },

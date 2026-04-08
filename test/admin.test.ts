@@ -53,6 +53,7 @@ function makeConfig(overrides?: Partial<ProxyConfig>): ProxyConfig {
     dataDir: "/tmp",
     maxRetriesPerRequest: 3,
     firstChunkTimeoutMs: 16_000,
+    streamIdleTimeoutMs: 120_000,
     maxFirstChunkRetries: 2,
     webhookUrl: null,
     ...overrides,
@@ -377,12 +378,13 @@ describe("Capacity admin payloads", () => {
     expect(body.keys[0]!.capacityHealth).toBe("warning");
     expect(body.keys[0]!.capacity.overageStatus).toBe("rejected");
     expect(body.keys[0]!.capacity.overageDisabledReason).toBe("out_of_credits");
-    expect(body.keys[0]!.capacity.windows[0]!.status).toBe("rejected");
+    expect(body.keys[0]!.capacity.windows[0]!.status).toBe("allowed_warning");
     expect(body.capacitySummary.warningKeys).toBe(1);
     expect(body.capacitySummary.rejectedKeys).toBe(0);
     expect(body.capacitySummary.overageRejectedKeys).toBe(1);
     expect(body.capacitySummary.windows[0]!.windowName).toBe("unified-7d");
-    expect(body.capacitySummary.windows[0]!.rejectedKeys).toBe(1);
+    expect(body.capacitySummary.windows[0]!.warningKeys).toBe(1);
+    expect(body.capacitySummary.windows[0]!.rejectedKeys).toBe(0);
   });
 
   test("GET /admin/capacity/timeseries returns rollups by window", async () => {

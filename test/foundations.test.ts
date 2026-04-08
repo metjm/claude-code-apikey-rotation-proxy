@@ -215,6 +215,7 @@ describe("config", () => {
     "DATA_DIR",
     "MAX_RETRIES",
     "FIRST_CHUNK_TIMEOUT_MS",
+    "STREAM_IDLE_TIMEOUT_MS",
     "MAX_FIRST_CHUNK_RETRIES",
   ] as const;
 
@@ -267,6 +268,10 @@ describe("config", () => {
     test("maxFirstChunkRetries defaults to 2", () => {
       expect(loadConfig().maxFirstChunkRetries).toBe(2);
     });
+
+    test("streamIdleTimeoutMs defaults to 120000", () => {
+      expect(loadConfig().streamIdleTimeoutMs).toBe(120_000);
+    });
   });
 
   // ── custom values via env ────────────────────────────────────────
@@ -302,6 +307,11 @@ describe("config", () => {
       expect(loadConfig().firstChunkTimeoutMs).toBe(2500);
     });
 
+    test("STREAM_IDLE_TIMEOUT_MS is respected", () => {
+      process.env["STREAM_IDLE_TIMEOUT_MS"] = "90000";
+      expect(loadConfig().streamIdleTimeoutMs).toBe(90_000);
+    });
+
     test("MAX_FIRST_CHUNK_RETRIES is respected", () => {
       process.env["MAX_FIRST_CHUNK_RETRIES"] = "1";
       expect(loadConfig().maxFirstChunkRetries).toBe(1);
@@ -324,6 +334,7 @@ describe("config", () => {
       process.env["DATA_DIR"] = "/data";
       process.env["MAX_RETRIES"] = "5";
       process.env["FIRST_CHUNK_TIMEOUT_MS"] = "9999";
+      process.env["STREAM_IDLE_TIMEOUT_MS"] = "123456";
       process.env["MAX_FIRST_CHUNK_RETRIES"] = "4";
 
       const cfg = loadConfig();
@@ -333,6 +344,7 @@ describe("config", () => {
       expect(cfg.dataDir).toBe("/data");
       expect(cfg.maxRetriesPerRequest).toBe(5);
       expect(cfg.firstChunkTimeoutMs).toBe(9999);
+      expect(cfg.streamIdleTimeoutMs).toBe(123456);
       expect(cfg.maxFirstChunkRetries).toBe(4);
     });
   });
@@ -371,6 +383,11 @@ describe("config", () => {
       expect(() => loadConfig()).toThrow("FIRST_CHUNK_TIMEOUT_MS must be an integer");
     });
 
+    test("non-numeric STREAM_IDLE_TIMEOUT_MS throws", () => {
+      process.env["STREAM_IDLE_TIMEOUT_MS"] = "nope";
+      expect(() => loadConfig()).toThrow("STREAM_IDLE_TIMEOUT_MS must be an integer");
+    });
+
     test("non-numeric MAX_FIRST_CHUNK_RETRIES throws", () => {
       process.env["MAX_FIRST_CHUNK_RETRIES"] = "nope";
       expect(() => loadConfig()).toThrow("MAX_FIRST_CHUNK_RETRIES must be an integer");
@@ -388,6 +405,11 @@ describe("config", () => {
 
     test("thrown error for FIRST_CHUNK_TIMEOUT_MS includes the bad value", () => {
       process.env["FIRST_CHUNK_TIMEOUT_MS"] = "oops";
+      expect(() => loadConfig()).toThrow('"oops"');
+    });
+
+    test("thrown error for STREAM_IDLE_TIMEOUT_MS includes the bad value", () => {
+      process.env["STREAM_IDLE_TIMEOUT_MS"] = "oops";
       expect(() => loadConfig()).toThrow('"oops"');
     });
 
