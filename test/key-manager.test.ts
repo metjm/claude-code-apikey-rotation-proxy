@@ -1421,6 +1421,51 @@ describe("Capacity telemetry", () => {
     expect(summary.windows[0]!.rejectedKeys).toBe(0);
   });
 
+  test("stored threshold-only warning statuses self-heal to healthy on reload", async () => {
+    const km1 = create();
+    const entry = km1.addKey(VALID_KEY_1, "legacy-threshold-warning");
+    const baseNow = Date.now();
+
+    km1.recordCapacityObservation(entry, {
+      seenAt: unixMs(baseNow),
+      httpStatus: 200,
+      organizationId: "org-threshold-heal",
+      windows: [
+        {
+          windowName: "unified",
+          status: "allowed_warning",
+          utilization: null,
+          resetAt: unixMs(baseNow + 26 * 60_000),
+          surpassedThreshold: null,
+        },
+        {
+          windowName: "unified-5h",
+          status: "allowed",
+          utilization: 0.14,
+          resetAt: unixMs(baseNow + 26 * 60_000),
+          surpassedThreshold: 0.9,
+        },
+        {
+          windowName: "unified-7d",
+          status: "allowed_warning",
+          utilization: 0.25,
+          resetAt: unixMs(baseNow + 6 * 24 * 60 * 60_000 + 7 * 60 * 60_000),
+          surpassedThreshold: 0.75,
+        },
+      ],
+    });
+
+    await waitForSave();
+
+    const km2 = create();
+    const key = km2.listKeys().find((candidate) => candidate.label === "legacy-threshold-warning");
+    expect(key).toBeDefined();
+    expect(key!.capacityHealth).toBe("healthy");
+    expect(key!.capacity.windows.find((window) => window.windowName === "unified")!.status).toBe("allowed");
+    expect(key!.capacity.windows.find((window) => window.windowName === "unified-5h")!.status).toBe("allowed");
+    expect(key!.capacity.windows.find((window) => window.windowName === "unified-7d")!.status).toBe("allowed");
+  });
+
   test("stale capacity windows are discarded instead of lingering as current warnings", () => {
     const km = create();
     const originalNow = Date.now;

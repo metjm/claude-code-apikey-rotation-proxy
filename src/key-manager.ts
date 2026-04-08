@@ -1795,12 +1795,86 @@ function hasCapacityHealthyTelemetry(windows: CapacityWindowSnapshot[]): boolean
   return windows.some((window) => window.status === "allowed");
 }
 
+const PRIMARY_WINDOW_ADVISORY_WARNING_UTILIZATION: Readonly<Record<string, number>> = {
+  "unified-5h": 0.9,
+  "unified-7d": 0.75,
+};
+
+function hasSurpassedStoredThreshold(window: CapacityWindowSnapshot): boolean {
+  return window.utilization !== null
+    && window.utilization !== undefined
+    && window.surpassedThreshold !== null
+    && window.surpassedThreshold !== undefined
+    && window.utilization >= window.surpassedThreshold;
+}
+
+function normalizePrimaryCapacityWindow(window: CapacityWindowSnapshot): CapacityWindowSnapshot {
+  const advisoryWarningUtilization = PRIMARY_WINDOW_ADVISORY_WARNING_UTILIZATION[window.windowName];
+  if (advisoryWarningUtilization === undefined) return { ...window };
+
+  const hasUtilizationWarning = window.utilization !== null
+    && window.utilization !== undefined
+    && window.utilization >= advisoryWarningUtilization;
+
+  const hasDerivedWarning = hasSurpassedStoredThreshold(window) || hasUtilizationWarning;
+
+  if (window.status === "rejected") {
+    return {
+      ...window,
+      status: hasDerivedWarning ? "allowed_warning" : "allowed",
+    };
+  }
+
+  if (window.status === "allowed_warning") {
+    return {
+      ...window,
+      status: hasDerivedWarning || window.surpassedThreshold === null
+        ? "allowed_warning"
+        : "allowed",
+    };
+  }
+
+  return {
+    ...window,
+    status: hasDerivedWarning ? "allowed_warning" : "allowed",
+  };
+}
+
+function normalizeUnifiedCapacityWindow(
+  unified: CapacityWindowSnapshot,
+  detailedWindows: readonly CapacityWindowSnapshot[],
+): CapacityWindowSnapshot {
+  if (unified.status === "rejected") return { ...unified };
+  if (detailedWindows.length === 0) return { ...unified };
+
+  const hasWarningDetail = detailedWindows.some((window) =>
+    window.status === "allowed_warning" || window.status === "rejected"
+  );
+
+  return {
+    ...unified,
+    status: hasWarningDetail ? "allowed_warning" : "allowed",
+  };
+}
+
 function sanitizeCapacityWindows(
   windows: readonly CapacityWindowSnapshot[],
   currentTime: UnixMs,
 ): CapacityWindowSnapshot[] {
-  return windows
+  const relevant = windows
     .filter((window) => isRelevantCapacityWindow(window, currentTime))
+    .map((window) => normalizePrimaryCapacityWindow(window));
+
+  const normalized = new Map(relevant.map((window) => [window.windowName, window]));
+  const unified = normalized.get("unified");
+  if (unified !== undefined) {
+    const detailedWindows = relevant.filter((window) =>
+      window.windowName === "unified-5h" || window.windowName === "unified-7d"
+    );
+    normalized.set("unified", normalizeUnifiedCapacityWindow(unified, detailedWindows));
+  }
+
+  return [...normalized.values()]
     .sort((a, b) => a.windowName.localeCompare(b.windowName));
 }
 
