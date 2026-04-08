@@ -13,6 +13,7 @@ import type { SchemaTracker } from "./schema-tracker.ts";
 const RATE_LIMIT_STATUS = 429 as const;
 const ACTIVE_STREAM_SNAPSHOT_INTERVAL_MS = 2_000;
 const RECENT_STREAM_ACTIVITY_WINDOW_MS = 1_000;
+const SLOW_STREAM_SILENCE_LOG_MS = 5_000;
 
 type ActiveStreamState = {
   readonly traceId: string;
@@ -22,6 +23,7 @@ type ActiveStreamState = {
   readonly openedAt: number;
   firstChunkAt: number | null;
   lastChunkAt: number | null;
+  maxSilenceGapMs: number;
   chunkCount: number;
   eventCount: number;
   bytesReceived: number;
@@ -514,6 +516,7 @@ function maybeLogActiveStreamSnapshot(now: number): void {
       ageMs: now - stream.openedAt,
       firstChunkDelayMs: stream.firstChunkAt === null ? null : stream.firstChunkAt - stream.openedAt,
       sinceLastChunkMs: stream.lastChunkAt === null ? null : now - stream.lastChunkAt,
+      maxSilenceGapMs: getStreamMaxSilenceGapMs(stream, now),
       waitingForFirstChunk: stream.firstChunkAt === null,
       chunkCount: stream.chunkCount,
       eventCount: stream.eventCount,
@@ -543,6 +546,7 @@ function registerActiveStream(
     openedAt: now,
     firstChunkAt: null,
     lastChunkAt: null,
+    maxSilenceGapMs: 0,
     chunkCount: 0,
     eventCount: 0,
     bytesReceived: 0,
@@ -563,6 +567,22 @@ function recordActiveStreamChunk(traceId: string, chunkBytes: number): void {
   if (!stream) return;
 
   const now = Date.now();
+  const silenceGapMs = stream.lastChunkAt === null ? null : now - stream.lastChunkAt;
+  if (silenceGapMs !== null) {
+    stream.maxSilenceGapMs = Math.max(stream.maxSilenceGapMs, silenceGapMs);
+    if (silenceGapMs >= SLOW_STREAM_SILENCE_LOG_MS) {
+      log("info", "Stream silence gap", {
+        traceId,
+        label: stream.label,
+        user: stream.user,
+        path: stream.path,
+        silenceGapMs,
+        chunkCountBeforeGap: stream.chunkCount,
+        eventCountBeforeGap: stream.eventCount,
+        bytesReceivedBeforeGap: stream.bytesReceived,
+      });
+    }
+  }
   stream.chunkCount++;
   stream.bytesReceived += chunkBytes;
   stream.lastChunkAt = now;
@@ -610,6 +630,7 @@ function closeActiveStream(
     durationMs: now - stream.openedAt,
     firstChunkDelayMs: stream.firstChunkAt === null ? null : stream.firstChunkAt - stream.openedAt,
     sinceLastChunkMs: stream.lastChunkAt === null ? null : now - stream.lastChunkAt,
+    maxSilenceGapMs: getStreamMaxSilenceGapMs(stream, now),
     chunkCount: stream.chunkCount,
     eventCount: stream.eventCount,
     bytesReceived: stream.bytesReceived,
@@ -644,6 +665,7 @@ function abandonActiveStream(
     durationMs: now - stream.openedAt,
     firstChunkDelayMs: stream.firstChunkAt === null ? null : stream.firstChunkAt - stream.openedAt,
     sinceLastChunkMs: stream.lastChunkAt === null ? null : now - stream.lastChunkAt,
+    maxSilenceGapMs: getStreamMaxSilenceGapMs(stream, now),
     chunkCount: stream.chunkCount,
     eventCount: stream.eventCount,
     bytesReceived: stream.bytesReceived,
@@ -654,6 +676,11 @@ function abandonActiveStream(
     activeStreamsRemaining: activeStreams.size,
   });
   maybeLogActiveStreamSnapshot(now);
+}
+
+function getStreamMaxSilenceGapMs(stream: ActiveStreamState, now: number): number | null {
+  if (stream.firstChunkAt === null || stream.lastChunkAt === null) return null;
+  return Math.max(stream.maxSilenceGapMs, now - stream.lastChunkAt);
 }
 
 function fetchUpstream(

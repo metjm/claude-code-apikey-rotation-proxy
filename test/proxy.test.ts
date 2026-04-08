@@ -973,6 +973,7 @@ describe("Token Tracking - Streaming (SSE)", () => {
 
       expect(closed).toBeDefined();
       expect(closed?.traceId).toBe("trace-stream-1");
+      expect(closed?.maxSilenceGapMs).toEqual(expect.any(Number));
       expect(closed?.chunkCount).toBeGreaterThan(0);
       expect(closed?.eventCount).toBe(2);
       expect(closed?.activeStreamsRemaining).toBe(0);
@@ -1072,6 +1073,80 @@ describe("Token Tracking - Streaming (SSE)", () => {
       expect(keyB!.stats.successfulRequests).toBe(1);
     } finally {
       fetchSpy.mockRestore();
+    }
+  });
+
+  test("logs long stream silence gaps and tracks the maximum gap", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    setLogLevel("debug");
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+
+    const originalNow = Date.now;
+    let fakeNow = 1_000_000;
+    Date.now = () => fakeNow;
+
+    const encoder = new TextEncoder();
+    let releaseSecondChunk!: () => void;
+    const secondChunkReady = new Promise<void>((resolve) => {
+      releaseSecondChunk = resolve;
+    });
+    let pullCount = 0;
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(async () =>
+      new Response(new ReadableStream<Uint8Array>({
+        async pull(controller) {
+          pullCount++;
+          if (pullCount === 1) {
+            controller.enqueue(encoder.encode('data: {"type":"message_start","message":{"usage":{"input_tokens":10}}}\n\n'));
+            return;
+          }
+          if (pullCount === 2) {
+            await secondChunkReady;
+            fakeNow += 6_123;
+            controller.enqueue(encoder.encode('data: {"type":"message_delta","usage":{"output_tokens":5}}\n\n'));
+            controller.close();
+          }
+        },
+      }), {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }),
+    );
+
+    try {
+      const config = makeConfig("http://mocked-upstream.local");
+      const result = await proxyRequest(
+        makeRequest("/v1/messages", { headers: { "x-request-id": "trace-gap-1" } }),
+        km,
+        config,
+        st,
+      );
+
+      expect(result.kind).toBe("success");
+      if (result.kind === "success") {
+        const bodyPromise = result.response.text();
+        releaseSecondChunk();
+        await bodyPromise;
+      }
+
+      const entries = parseConsoleEntries(logSpy);
+      const gap = entries.find((entry) => entry.msg === "Stream silence gap");
+      const closed = entries.find((entry) => entry.msg === "Stream closed");
+
+      expect(gap).toBeDefined();
+      expect(gap?.traceId).toBe("trace-gap-1");
+      expect(gap?.silenceGapMs).toBe(6_123);
+      expect(gap?.chunkCountBeforeGap).toBe(1);
+      expect(gap?.eventCountBeforeGap).toBe(1);
+
+      expect(closed).toBeDefined();
+      expect(closed?.traceId).toBe("trace-gap-1");
+      expect(closed?.maxSilenceGapMs).toBe(6_123);
+    } finally {
+      Date.now = originalNow;
+      fetchSpy.mockRestore();
+      logSpy.mockRestore();
+      setLogLevel("info");
     }
   });
 
