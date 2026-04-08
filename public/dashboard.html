@@ -723,9 +723,19 @@ function shortSignalName(name) {
 function signalCoverage(key, signalName) {
   return (key.capacity?.signalCoverage || []).find(signal => signal.signalName === signalName) || null;
 }
-function activeCapacityWindows(key) {
+const CAPACITY_TELEMETRY_STALE_MS = 6 * 60 * 60 * 1000;
+
+function isFreshCapacityTimestamp(value) {
+  return value !== null && value !== undefined && (Date.now() - value) <= CAPACITY_TELEMETRY_STALE_MS;
+}
+function activeCapacityWindows(key, options = {}) {
   const nowMs = Date.now();
-  return (key.capacity?.windows || []).filter(window => window.resetAt === null || window.resetAt === undefined || window.resetAt > nowMs);
+  const includeOverage = options.includeOverage === true;
+  return (key.capacity?.windows || []).filter(window => {
+    if (!includeOverage && window.windowName === 'unified-overage') return false;
+    if (!isFreshCapacityTimestamp(window.lastSeenAt)) return false;
+    return window.resetAt === null || window.resetAt === undefined || window.resetAt > nowMs;
+  });
 }
 function routingBadge(key) {
   if (!key.isAvailable) {
@@ -745,9 +755,7 @@ function windowSortRank(windowName) {
   return 10;
 }
 function sortedCapacityWindows(key, options = {}) {
-  const includeOverage = options.includeOverage === true;
-  return activeCapacityWindows(key)
-    .filter(window => includeOverage || window.windowName !== 'unified-overage')
+  return activeCapacityWindows(key, options)
     .sort((a, b) => {
       const aRank = windowSortRank(a.windowName);
       const bRank = windowSortRank(b.windowName);
@@ -860,6 +868,14 @@ function overageNote(key) {
   const reason = key.capacity?.overageDisabledReason || 'provider policy';
   return `Extra usage is blocked (${reason}). That does not remove the key from rotation by itself.`;
 }
+function staleTelemetryNote(key) {
+  if (!key.capacity?.lastHeaderAt) return 'No recent parsed limit telemetry is available for this key yet.';
+  return `Last parsed limit telemetry was seen ${fmtRelative(new Date(key.capacity.lastHeaderAt).toISOString())}. Treat current quota state as unknown until this key is used again.`;
+}
+function staleTelemetryLabel(key) {
+  if (!key.capacity?.lastHeaderAt) return 'No recent limit telemetry';
+  return `Telemetry stale (${fmtRelative(new Date(key.capacity.lastHeaderAt).toISOString())})`;
+}
 function telemetryCoverageLabel(key) {
   const responseCount = key.capacity?.responseCount || 0;
   const normalizedCount = key.capacity?.normalizedHeaderCount || 0;
@@ -899,6 +915,13 @@ function compactQuotaState(key) {
       className: 'badge-unknown',
       label: 'Unparsed',
       title: 'Responses were observed, but none carried the normalized limit headers this dashboard understands.',
+    };
+  }
+  if (windows.length === 0) {
+    return {
+      className: 'badge-unknown',
+      label: 'Stale',
+      title: staleTelemetryNote(key),
     };
   }
   if (conflictingWindow) {
@@ -963,6 +986,14 @@ function capacityHeadline(key) {
       subtitle: `Seen ${fmtNum(responseCount)} responses so far. Keep using the key, but treat quota telemetry as unavailable.`,
     };
   }
+  if (windows.length === 0) {
+    return {
+      badgeClass: 'badge-unknown',
+      badgeLabel: 'Telemetry is stale',
+      title: 'The dashboard has parsed limit headers for this key before, but not recently enough to trust them as current state.',
+      subtitle: staleTelemetryNote(key),
+    };
+  }
   if (conflictingWindow) {
     return {
       badgeClass: 'badge-warning',
@@ -1016,6 +1047,12 @@ function capacityTableSummary(key, telemetry) {
     return {
       main: 'Responses were observed, but no supported limit headers were parsed.',
       sub: 'Treat quota telemetry as unavailable for now.',
+    };
+  }
+  if (windows.length === 0) {
+    return {
+      main: 'Parsed limit telemetry exists, but it is stale.',
+      sub: staleTelemetryNote(key),
     };
   }
   if (conflictingWindow) {
@@ -1177,7 +1214,7 @@ function renderKeys() {
           <div class="limit-value${row.reset === '--' ? '-dim' : ''}" title="${esc(row.title)}">${esc(row.reset)}</div>
         `).join('')}
       </div>
-      ${hasAnyWindow ? '' : '<div class="table-sub">Awaiting limit headers</div>'}
+      ${hasAnyWindow ? '' : `<div class="table-sub" title="${esc((k.capacity?.normalizedHeaderCount || 0) > 0 ? staleTelemetryNote(k) : 'Awaiting limit headers')}">${esc((k.capacity?.normalizedHeaderCount || 0) > 0 ? staleTelemetryLabel(k) : 'Awaiting limit headers')}</div>`}
     </div>`;
     const keyRef = JSON.stringify(k.maskedKey);
     const usageLines = [
@@ -1213,6 +1250,7 @@ function renderKeys() {
           <div class="badge-row">
             ${routingBadge(k)}
             ${k.isAvailable ? `<span class="badge ${esc(quotaState.className)}" title="${esc(quotaState.title)}">${esc(quotaState.label)}</span>` : ''}
+            ${k.capacity?.overageStatus === 'rejected' ? `<span class="badge badge-blue" title="${esc(overageNote(k))}">Extra usage off</span>` : ''}
             ${retryBadge(k)}
           </div>
           <div class="metric-inline">${esc(routingDetail || '--')}</div>

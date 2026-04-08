@@ -1293,9 +1293,10 @@ describe("Capacity telemetry", () => {
   test("recordCapacityObservation merges sparse updates without wiping prior fields", () => {
     const km = create();
     const entry = km.addKey(VALID_KEY_1, "cap-merge");
+    const baseNow = Date.now();
 
     km.recordCapacityObservation(entry, {
-      seenAt: unixMs(1_000),
+      seenAt: unixMs(baseNow),
       httpStatus: 200,
       organizationId: "org-1",
       representativeClaim: "seven_day",
@@ -1310,7 +1311,7 @@ describe("Capacity telemetry", () => {
     });
 
     km.recordCapacityObservation(entry, {
-      seenAt: unixMs(2_000),
+      seenAt: unixMs(baseNow + 1_000),
       httpStatus: 200,
       requestId: "req-123",
       windows: [
@@ -1339,9 +1340,10 @@ describe("Capacity telemetry", () => {
   test("capacity state persists across reload", async () => {
     const km1 = create();
     const entry = km1.addKey(VALID_KEY_1, "cap-persist");
+    const baseNow = Date.now();
 
     km1.recordCapacityObservation(entry, {
-      seenAt: unixMs(5_000),
+      seenAt: unixMs(baseNow),
       httpStatus: 429,
       organizationId: "org-persist",
       retryAfterSecs: 45,
@@ -1370,40 +1372,45 @@ describe("Capacity telemetry", () => {
     expect(key.capacity.windows[0]!.status).toBe("rejected");
   });
 
-  test("getCapacitySummary keeps successful-response rejection telemetry in warning-only health", () => {
+  test("legacy overage window telemetry is ignored for primary capacity health", () => {
     const km = create();
     const healthy = km.addKey(VALID_KEY_1, "healthy");
     const warning = km.addKey(VALID_KEY_2, "warning");
     const observedRejected = km.addKey(VALID_KEY_3, "observed-rejected");
+    const baseNow = Date.now();
 
     km.recordCapacityObservation(healthy, {
-      seenAt: unixMs(1_000),
+      seenAt: unixMs(baseNow),
       httpStatus: 200,
       organizationId: "org-a",
       windows: [{ windowName: "unified-5h", status: "allowed", utilization: 0.25, resetAt: unixMs(Date.now() + 60_000) }],
     });
     km.recordCapacityObservation(warning, {
-      seenAt: unixMs(1_100),
+      seenAt: unixMs(baseNow + 100),
       httpStatus: 200,
       organizationId: "org-a",
       fallbackAvailable: true,
       windows: [{ windowName: "unified-5h", status: "allowed_warning", utilization: 0.86, resetAt: unixMs(Date.now() + 60_000) }],
     });
     km.recordCapacityObservation(observedRejected, {
-      seenAt: unixMs(1_200),
+      seenAt: unixMs(baseNow + 200),
       httpStatus: 200,
       organizationId: "org-b",
       overageStatus: "rejected",
-      windows: [{ windowName: "unified-5h", status: "rejected", utilization: 1, resetAt: unixMs(Date.now() + 60_000) }],
+      windows: [
+        { windowName: "unified-5h", status: "allowed", utilization: 0.18, resetAt: unixMs(Date.now() + 60_000) },
+        { windowName: "unified-overage", status: "rejected", utilization: null, resetAt: null, lastSeenAt: unixMs(baseNow + 200) },
+      ],
     });
 
     const summary = km.getCapacitySummary();
     const observed = km.listKeys().find((key) => key.label === "observed-rejected");
     expect(observed).toBeDefined();
     expect(observed!.isAvailable).toBe(true);
-    expect(observed!.capacityHealth).toBe("warning");
-    expect(summary.healthyKeys).toBe(1);
-    expect(summary.warningKeys).toBe(2);
+    expect(observed!.capacity.windows.find((window) => window.windowName === "unified-overage")).toBeUndefined();
+    expect(observed!.capacityHealth).toBe("healthy");
+    expect(summary.healthyKeys).toBe(2);
+    expect(summary.warningKeys).toBe(1);
     expect(summary.rejectedKeys).toBe(0);
     expect(summary.coolingDownKeys).toBe(0);
     expect(summary.fallbackAvailableKeys).toBe(1);
@@ -1411,7 +1418,38 @@ describe("Capacity telemetry", () => {
     expect(summary.distinctOrganizations).toBe(2);
     expect(summary.windows[0]!.windowName).toBe("unified-5h");
     expect(summary.windows[0]!.warningKeys).toBe(1);
-    expect(summary.windows[0]!.rejectedKeys).toBe(1);
+    expect(summary.windows[0]!.rejectedKeys).toBe(0);
+  });
+
+  test("stale capacity windows are discarded instead of lingering as current warnings", () => {
+    const km = create();
+    const originalNow = Date.now;
+    const fakeNow = 1_000_000_000;
+    Date.now = () => fakeNow;
+    try {
+      const entry = km.addKey(VALID_KEY_1, "stale-window");
+      km.recordCapacityObservation(entry, {
+        seenAt: unixMs(fakeNow - (7 * 60 * 60 * 1000)),
+        httpStatus: 200,
+        windows: [
+          {
+            windowName: "unified-7d",
+            status: "allowed_warning",
+            utilization: 1,
+            resetAt: unixMs(fakeNow + (7 * 24 * 60 * 60 * 1000)),
+          },
+        ],
+      });
+
+      const key = km.listKeys()[0]!;
+      const summary = km.getCapacitySummary();
+      expect(key.capacity.windows).toEqual([]);
+      expect(key.capacityHealth).toBe("unknown");
+      expect(summary.warningKeys).toBe(0);
+      expect(summary.windows).toEqual([]);
+    } finally {
+      Date.now = originalNow;
+    }
   });
 
   test("queryCapacityTimeseries returns per-window rollups", async () => {

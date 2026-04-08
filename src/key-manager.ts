@@ -176,6 +176,8 @@ function currentBucketKey(): string {
 
 const CONVERSATION_AFFINITY_TTL_MS = 60 * 60 * 1000;
 const RECENT_SESSION_WINDOW_MS = 15 * 60 * 1000;
+const CAPACITY_TELEMETRY_STALE_MS = 6 * 60 * 60 * 1000;
+const PRIMARY_CAPACITY_WINDOW_NAMES = new Set(["unified", "unified-5h", "unified-7d"]);
 
 export class KeyManager {
   private keys: ApiKeyEntry[] = [];
@@ -366,6 +368,7 @@ export class KeyManager {
     migrate("api_key_capacity_state", "response_count");
     migrate("api_key_capacity_state", "normalized_header_count");
     migrate("capacity_window_timeseries", "utilization_samples");
+    try { this.db.exec("DELETE FROM api_key_capacity_windows WHERE window_name = 'unified-overage'"); } catch {}
     try { this.db.exec("ALTER TABLE conversation_affinities ADD COLUMN session_id TEXT"); } catch {}
     try {
       this.db.exec(`
@@ -854,7 +857,7 @@ export class KeyManager {
       next.lastHeaderAt = observation.seenAt;
     }
     next.signalCoverage = [...signalCoverageMap.values()].sort((a, b) => a.signalName.localeCompare(b.signalName));
-    next.windows = [...windowMap.values()].sort((a, b) => a.windowName.localeCompare(b.windowName));
+    next.windows = sanitizeCapacityWindows([...windowMap.values()], now());
     entry.capacity = next;
     this.scheduleSave();
   }
@@ -1735,6 +1738,7 @@ function stateToCapacity(
   windows: CapacityWindowRow[],
 ): ApiKeyCapacityState {
   if (state === null && coverage.length === 0 && windows.length === 0) return freshCapacityState();
+  const currentTime = now();
   return {
     responseCount: state?.response_count ?? 0,
     normalizedHeaderCount: state?.normalized_header_count ?? 0,
@@ -1758,7 +1762,7 @@ function stateToCapacity(
         lastSeenAt: (signal.last_seen_at as UnixMs | null) ?? null,
       }))
       .sort((a, b) => a.signalName.localeCompare(b.signalName)),
-    windows: windows
+    windows: sanitizeCapacityWindows(windows
       .map((window): CapacityWindowSnapshot => ({
         windowName: window.window_name,
         status: window.status ?? null,
@@ -1767,7 +1771,7 @@ function stateToCapacity(
         surpassedThreshold: window.surpassed_threshold ?? null,
         lastSeenAt: (window.last_seen_at as UnixMs | null) ?? null,
       }))
-      .sort((a, b) => a.windowName.localeCompare(b.windowName)),
+    , currentTime),
   };
 }
 
@@ -1780,19 +1784,37 @@ function deriveCapacityHealth(entry: ApiKeyEntry): CapacityHealth {
 }
 
 function activeCapacityWindows(entry: ApiKeyEntry): CapacityWindowSnapshot[] {
-  const nowMs = now();
-  return entry.capacity.windows.filter((window) => window.resetAt === null || window.resetAt > nowMs);
+  return sanitizeCapacityWindows(entry.capacity.windows, now());
 }
 
 function hasCapacityWarningTelemetry(windows: CapacityWindowSnapshot[]): boolean {
-  // Claude Code treats observed unified quota statuses as informational context on
-  // otherwise successful responses. Preserve "rejected" telemetry as a warning
-  // signal here instead of elevating it to an operationally blocked state.
   return windows.some((window) => window.status === "rejected" || window.status === "allowed_warning");
 }
 
 function hasCapacityHealthyTelemetry(windows: CapacityWindowSnapshot[]): boolean {
   return windows.some((window) => window.status === "allowed");
+}
+
+function sanitizeCapacityWindows(
+  windows: readonly CapacityWindowSnapshot[],
+  currentTime: UnixMs,
+): CapacityWindowSnapshot[] {
+  return windows
+    .filter((window) => isRelevantCapacityWindow(window, currentTime))
+    .sort((a, b) => a.windowName.localeCompare(b.windowName));
+}
+
+function isRelevantCapacityWindow(
+  window: CapacityWindowSnapshot,
+  currentTime: UnixMs,
+): boolean {
+  if (!PRIMARY_CAPACITY_WINDOW_NAMES.has(window.windowName)) return false;
+  if (window.lastSeenAt === null) return false;
+  if (currentTime - window.lastSeenAt > CAPACITY_TELEMETRY_STALE_MS) {
+    return false;
+  }
+  if (window.resetAt !== null && window.resetAt <= currentTime) return false;
+  return true;
 }
 
 function boolToInt(value: boolean | null): number | null {

@@ -286,8 +286,9 @@ describe("Route Dispatch", () => {
 describe("Capacity admin payloads", () => {
   test("GET /admin/stats includes keys with capacity state and a pool summary", async () => {
     const entry = km.addKey(VALID_KEY, "cap-admin");
+    const baseNow = Date.now();
     km.recordCapacityObservation(entry, {
-      seenAt: unixMs(1_000),
+      seenAt: unixMs(baseNow),
       httpStatus: 200,
       organizationId: "org-admin",
       windows: [{ windowName: "unified", status: "allowed_warning", utilization: 0.75, resetAt: unixMs(Date.now() + 60_000) }],
@@ -333,8 +334,9 @@ describe("Capacity admin payloads", () => {
 
   test("GET /admin/stats keeps successful-response rejected telemetry out of hard-rejection counts", async () => {
     const entry = km.addKey(VALID_KEY, "cap-observed-rejected");
+    const baseNow = Date.now();
     km.recordCapacityObservation(entry, {
-      seenAt: unixMs(1_500),
+      seenAt: unixMs(baseNow),
       httpStatus: 200,
       organizationId: "org-admin",
       overageStatus: "rejected",
