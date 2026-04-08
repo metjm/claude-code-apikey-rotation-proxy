@@ -1216,16 +1216,10 @@ function buildUpstreamHeaders(incoming: Headers, apiKey: string): Headers {
 
 type QuotaStatus = "allowed" | "allowed_warning" | "rejected";
 
-type EarlyWarningThreshold = {
-  readonly utilization: number;
-  readonly timePct: number;
-};
-
-type EarlyWarningWindowConfig = {
+type SupportedCapacityWindowConfig = {
   readonly windowName: string;
   readonly claimAbbrev: string;
-  readonly windowDurationMs: number;
-  readonly thresholds: readonly EarlyWarningThreshold[];
+  readonly advisoryWarningUtilization: number;
 };
 
 type CapacityWindowDraft = {
@@ -1236,22 +1230,16 @@ type CapacityWindowDraft = {
   surpassedThreshold?: number | null;
 };
 
-const EARLY_WARNING_WINDOWS: readonly EarlyWarningWindowConfig[] = [
+const SUPPORTED_CAPACITY_WINDOWS: readonly SupportedCapacityWindowConfig[] = [
   {
     windowName: "unified-5h",
     claimAbbrev: "5h",
-    windowDurationMs: 5 * 60 * 60 * 1000,
-    thresholds: [{ utilization: 0.9, timePct: 0.72 }],
+    advisoryWarningUtilization: 0.9,
   },
   {
     windowName: "unified-7d",
     claimAbbrev: "7d",
-    windowDurationMs: 7 * 24 * 60 * 60 * 1000,
-    thresholds: [
-      { utilization: 0.75, timePct: 0.6 },
-      { utilization: 0.5, timePct: 0.35 },
-      { utilization: 0.25, timePct: 0.15 },
-    ],
+    advisoryWarningUtilization: 0.75,
   },
 ] as const;
 
@@ -1284,26 +1272,24 @@ function normalizeQuotaStatus(value: string | null): QuotaStatus | null {
   return null;
 }
 
-function computeTimeProgress(resetAt: ReturnType<typeof unixMs>, windowDurationMs: number): number {
-  const resetAtMs = Number(resetAt);
-  const windowStart = resetAtMs - windowDurationMs;
-  const elapsed = Date.now() - windowStart;
-  return Math.max(0, Math.min(1, elapsed / windowDurationMs));
+function hasReachedWindowThreshold(
+  utilization: number | null | undefined,
+  surpassedThreshold: number | null | undefined,
+): boolean {
+  return utilization !== null
+    && utilization !== undefined
+    && surpassedThreshold !== null
+    && surpassedThreshold !== undefined
+    && utilization >= surpassedThreshold;
 }
 
-function shouldWarnForWindow(
+function shouldWarnForWindowUtilization(
   utilization: number | null | undefined,
-  resetAt: ReturnType<typeof unixMs> | null | undefined,
-  config: EarlyWarningWindowConfig,
+  config: SupportedCapacityWindowConfig,
 ): boolean {
-  if (utilization === null || utilization === undefined || resetAt === null || resetAt === undefined) {
-    return false;
-  }
-
-  const timeProgress = computeTimeProgress(resetAt, config.windowDurationMs);
-  return config.thresholds.some(
-    (threshold) => utilization >= threshold.utilization && timeProgress <= threshold.timePct,
-  );
+  return utilization !== null
+    && utilization !== undefined
+    && utilization >= config.advisoryWarningUtilization;
 }
 
 function setWindowField<T extends keyof CapacityWindowDraft>(
@@ -1325,7 +1311,7 @@ function extractSupportedCapacityWindows(headers: Headers): CapacityWindowDraft[
   const unifiedUtilization = parseFinite(headers.get("anthropic-ratelimit-unified-utilization"));
   const unifiedSurpassedThreshold = parseFinite(headers.get("anthropic-ratelimit-unified-surpassed-threshold"));
 
-  for (const config of EARLY_WARNING_WINDOWS) {
+  for (const config of SUPPORTED_CAPACITY_WINDOWS) {
     const utilization = parseFinite(headers.get(`anthropic-ratelimit-unified-${config.claimAbbrev}-utilization`));
     const resetAt = parseEpochMs(headers.get(`anthropic-ratelimit-unified-${config.claimAbbrev}-reset`));
     const surpassedThreshold = parseFinite(headers.get(
@@ -1334,7 +1320,8 @@ function extractSupportedCapacityWindows(headers: Headers): CapacityWindowDraft[
 
     if (utilization === null && resetAt === null && surpassedThreshold === null) continue;
 
-    const status: QuotaStatus = surpassedThreshold !== null || shouldWarnForWindow(utilization, resetAt, config)
+    const status: QuotaStatus = hasReachedWindowThreshold(utilization, surpassedThreshold)
+      || shouldWarnForWindowUtilization(utilization, config)
       ? "allowed_warning"
       : "allowed";
     if (status === "allowed_warning") earlyWarningObserved = true;
@@ -1354,7 +1341,9 @@ function extractSupportedCapacityWindows(headers: Headers): CapacityWindowDraft[
   ) {
     let status = unifiedStatusHeader;
     if (status === "allowed" || status === "allowed_warning") {
-      status = earlyWarningObserved || unifiedSurpassedThreshold !== null ? "allowed_warning" : "allowed";
+      status = earlyWarningObserved || hasReachedWindowThreshold(unifiedUtilization, unifiedSurpassedThreshold)
+        ? "allowed_warning"
+        : status;
     }
 
     const draft: CapacityWindowDraft = { windowName: "unified" };

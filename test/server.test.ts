@@ -1520,6 +1520,61 @@ describe("Capacity Telemetry End-to-End", () => {
     up.stop();
     cleanupTempDir(dir);
   });
+
+  test("/admin/stats keeps low-utilization threshold headers healthy until the threshold is actually crossed", async () => {
+    const dir = makeTempDir();
+    const up = startMockUpstream(() =>
+      new Response(
+        JSON.stringify({ ok: true }),
+        {
+          status: 200,
+          headers: {
+            "content-type": "application/json",
+            "request-id": "req-cap-low-threshold",
+            "anthropic-organization-id": "org-cap-low-threshold",
+            "anthropic-ratelimit-unified-representative-claim": "five_hour",
+            "anthropic-ratelimit-unified-status": "allowed",
+            "anthropic-ratelimit-unified-reset": futureEpochSeconds(26 * 60_000),
+            "anthropic-ratelimit-unified-5h-utilization": "0.14",
+            "anthropic-ratelimit-unified-5h-reset": futureEpochSeconds(26 * 60_000),
+            "anthropic-ratelimit-unified-5h-surpassed-threshold": "0.9",
+            "anthropic-ratelimit-unified-7d-utilization": "0.25",
+            "anthropic-ratelimit-unified-7d-reset": futureEpochSeconds(6 * 24 * 60 * 60_000 + 7 * 60 * 60_000),
+            "anthropic-ratelimit-unified-7d-surpassed-threshold": "0.75",
+          },
+        },
+      ),
+    );
+    const p = startProxy({ dataDir: dir, upstream: up.url });
+    p.km.addKey(FAKE_KEY_1, "cap-low-threshold-key");
+
+    const res = await fetch(`${p.url}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-sonnet-4",
+        messages: [{ role: "user", content: "capacity low threshold" }],
+      }),
+    });
+    expect(res.status).toBe(200);
+    await res.json();
+
+    const stats = await fetch(`${p.url}/admin/stats`);
+    const body = await stats.json();
+    const key = body.keys.find((k: { label: string }) => k.label === "cap-low-threshold-key");
+    expect(key).toBeDefined();
+    expect(key.capacityHealth).toBe("healthy");
+    expect(key.capacity.windows.find((w: { windowName: string }) => w.windowName === "unified")!.status).toBe("allowed");
+    expect(key.capacity.windows.find((w: { windowName: string }) => w.windowName === "unified-5h")!.status).toBe("allowed");
+    expect(key.capacity.windows.find((w: { windowName: string }) => w.windowName === "unified-7d")!.status).toBe("allowed");
+
+    expect(body.capacitySummary.healthyKeys).toBe(1);
+    expect(body.capacitySummary.warningKeys).toBe(0);
+
+    p.stop();
+    up.stop();
+    cleanupTempDir(dir);
+  });
 });
 
 // ── Rate Limit Rotation End-to-End ───────────────────────────────

@@ -2646,6 +2646,44 @@ describe("Capacity observation integration", () => {
     expect(key.capacityHealth).toBe("warning");
   });
 
+  test("threshold headers stay informational until utilization actually reaches them", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    const mock = upstream(() =>
+      new Response(JSON.stringify({ ok: true, usage: { input_tokens: 2, output_tokens: 1 } }), {
+        status: 200,
+        headers: {
+          "content-type": "application/json",
+          "request-id": "req_capacity_threshold_only",
+          "anthropic-organization-id": "org-threshold",
+          "anthropic-ratelimit-unified-representative-claim": "five_hour",
+          "anthropic-ratelimit-unified-status": "allowed",
+          "anthropic-ratelimit-unified-reset": futureEpochSeconds(26 * 60_000),
+          "anthropic-ratelimit-unified-5h-utilization": "0.14",
+          "anthropic-ratelimit-unified-5h-reset": futureEpochSeconds(26 * 60_000),
+          "anthropic-ratelimit-unified-5h-surpassed-threshold": "0.9",
+          "anthropic-ratelimit-unified-7d-utilization": "0.25",
+          "anthropic-ratelimit-unified-7d-reset": futureEpochSeconds(6 * 24 * 60 * 60_000 + 7 * 60 * 60_000),
+          "anthropic-ratelimit-unified-7d-surpassed-threshold": "0.75",
+        },
+      }),
+    );
+
+    const config = makeConfig(mock.url);
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config, st);
+    expect(result.kind).toBe("success");
+
+    const key = km.listKeys()[0]!;
+    expect(key.capacity.windows.find((w) => w.windowName === "unified")!.status).toBe("allowed");
+    expect(key.capacity.windows.find((w) => w.windowName === "unified-5h")!.status).toBe("allowed");
+    expect(key.capacity.windows.find((w) => w.windowName === "unified-5h")!.surpassedThreshold).toBe(0.9);
+    expect(key.capacity.windows.find((w) => w.windowName === "unified-7d")!.status).toBe("allowed");
+    expect(key.capacity.windows.find((w) => w.windowName === "unified-7d")!.utilization).toBe(0.25);
+    expect(key.capacity.windows.find((w) => w.windowName === "unified-7d")!.surpassedThreshold).toBe(0.75);
+    expect(key.capacityHealth).toBe("healthy");
+  });
+
   test("partial capacity headers merge while ignoring raw per-window status headers", async () => {
     const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
