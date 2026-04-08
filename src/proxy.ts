@@ -1188,12 +1188,27 @@ function fetchUpstream(
   signal?: AbortSignal,
 ): Promise<Response> {
   const normalizedSignal = signal ?? null;
+  const upstreamHeaders = new Headers(headers);
+  upstreamHeaders.set("connection", "close");
+
   if (method === "GET" || method === "HEAD" || method === "OPTIONS") {
-    return fetch(url, { method, headers, signal: normalizedSignal });
+    return fetch(url, {
+      method,
+      headers: upstreamHeaders,
+      signal: normalizedSignal,
+      keepalive: false,
+    });
   }
   return fetch(
     url,
-    { method, headers, body, signal: normalizedSignal, duplex: "half" } satisfies BunFetchRequestInit,
+    {
+      method,
+      headers: upstreamHeaders,
+      body,
+      signal: normalizedSignal,
+      keepalive: false,
+      duplex: "half",
+    } satisfies BunFetchRequestInit,
   );
 }
 

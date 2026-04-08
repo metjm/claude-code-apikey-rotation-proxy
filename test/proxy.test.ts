@@ -252,6 +252,30 @@ describe("Basic Proxying", () => {
 // ────────────────────────────────────────────────────────────────────
 
 describe("Header Handling", () => {
+  test("disables upstream keep-alive for every fetch", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    const fetchSpy = spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response("ok", { status: 200 }),
+    );
+
+    try {
+      const result = await proxyRequest(makeRequest("/v1/messages"), km, makeConfig("https://api.anthropic.com"), st);
+
+      expect(result.kind).toBe("success");
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+      const [, init] = fetchSpy.mock.calls[0]!;
+      expect(init).toBeDefined();
+      expect((init as RequestInit).keepalive).toBe(false);
+      expect((init as RequestInit).headers).toBeInstanceOf(Headers);
+      expect(((init as RequestInit).headers as Headers).get("connection")).toBe("close");
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
   test("strips x-api-key from outgoing request", async () => {
     const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
