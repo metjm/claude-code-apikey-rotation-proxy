@@ -2568,15 +2568,14 @@ describe("Header Handling", () => {
     expect(capturedHeaders["x-api-key"]).toBe(FAKE_KEY_1);
     // Custom headers should pass through
     expect(capturedHeaders["x-custom-header"]).toBe("should-survive");
-    // anthropic-version should be set
-    expect(capturedHeaders["anthropic-version"]).toBeDefined();
+    expect(capturedHeaders["anthropic-version"]).toBeUndefined();
 
     p.stop();
     up.stop();
     cleanupTempDir(dir);
   });
 
-  test("anthropic-version defaults to 2023-06-01 if not provided", async () => {
+  test("anthropic-version is omitted if the client does not provide it", async () => {
     const dir = makeTempDir();
     let capturedHeaders: Record<string, string> = {};
     const up = startMockUpstreamWithBody((req) => {
@@ -2602,7 +2601,7 @@ describe("Header Handling", () => {
     });
     await res.json();
 
-    expect(capturedHeaders["anthropic-version"]).toBe("2023-06-01");
+    expect(capturedHeaders["anthropic-version"]).toBeUndefined();
 
     p.stop();
     up.stop();

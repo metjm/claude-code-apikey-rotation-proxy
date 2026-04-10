@@ -1270,15 +1270,10 @@ function buildUpstreamHeaders(incoming: Headers, apiKey: string): Headers {
 
   if (apiKey.startsWith("sk-ant-oat")) {
     headers.set("authorization", `Bearer ${apiKey}`);
-    const beta = headers.get("anthropic-beta") ?? "";
-    if (!beta.includes("oauth-2025-04-20")) {
-      headers.set("anthropic-beta", beta ? `${beta},oauth-2025-04-20` : "oauth-2025-04-20");
-    }
   } else {
     headers.set("x-api-key", apiKey);
   }
 
-  headers.set("anthropic-version", incoming.get("anthropic-version") ?? "2023-06-01");
   return headers;
 }
 

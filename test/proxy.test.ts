@@ -396,11 +396,10 @@ describe("Header Handling", () => {
     expect(receivedHeaders!.get("x-api-key")).toBeNull();
   });
 
-  test("sets anthropic-version from incoming or defaults to 2023-06-01", async () => {
+  test("forwards client-provided anthropic-version without adding a default", async () => {
     const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
 
-    // Test default
     let receivedVersion: string | null = null;
     const mock = upstream((req) => {
       receivedVersion = req.headers.get("anthropic-version");
@@ -409,9 +408,8 @@ describe("Header Handling", () => {
 
     const config = makeConfig(mock.url);
     await proxyRequest(makeRequest("/v1/messages"), km, config, st);
-    expect(receivedVersion).toBe("2023-06-01");
+    expect(receivedVersion).toBeNull();
 
-    // Test custom version preserved
     await proxyRequest(
       makeRequest("/v1/messages", {
         headers: { "anthropic-version": "2024-01-01" },
