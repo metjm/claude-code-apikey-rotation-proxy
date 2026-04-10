@@ -515,10 +515,10 @@
     </div>
     <div id="setup-body" class="collapsed">
       <div style="padding:8px 0;font-size:12px;line-height:1.7;color:var(--text-dim)">
-        <p style="margin-bottom:8px">Add this to each user's <code style="color:var(--cyan)">~/.claude/settings.json</code>:</p>
+        <p style="margin-bottom:8px">Add this to each user's <code style="color:var(--cyan)">~/.claude/settings.json</code> so Claude Code sends the proxy token as <code style="color:var(--cyan)">ANTHROPIC_AUTH_TOKEN</code>:</p>
         <pre id="setup-snippet" style="background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:10px 12px;color:var(--text);font-size:12px;overflow-x:auto;position:relative;margin-bottom:8px"></pre>
         <button class="btn" onclick="copySnippet()" id="copy-btn" style="margin-bottom:12px">Copy to clipboard</button>
-        <p style="margin-bottom:4px">Replace <code style="color:var(--yellow)">TOKEN_HERE</code> with the user's proxy token from the panel above.</p>
+        <p style="margin-bottom:4px">Replace <code style="color:var(--yellow)">TOKEN_HERE</code> with the user's proxy token from the panel above. Do not use <code style="color:var(--cyan)">ANTHROPIC_API_KEY</code> here.</p>
         <p>New Claude Code sessions will route through the proxy automatically.</p>
       </div>
     </div>
@@ -538,7 +538,7 @@
 <div id="token-modal" class="hidden">
   <div class="modal-box">
     <h3>Token created</h3>
-    <p>Send this to the user. Add to <code style="color:var(--cyan)">~/.claude/settings.json</code>:</p>
+    <p>Send this to the user. Add to <code style="color:var(--cyan)">~/.claude/settings.json</code> as <code style="color:var(--cyan)">ANTHROPIC_AUTH_TOKEN</code>:</p>
     <pre id="token-modal-snippet"></pre>
     <div class="modal-actions">
       <button class="btn-submit" onclick="copyModalSnippet()" id="modal-copy-btn" style="padding:6px 14px;background:var(--green);color:var(--bg);border:none;border-radius:4px;font-family:var(--font);font-size:12px;cursor:pointer;font-weight:600">Copy to clipboard</button>

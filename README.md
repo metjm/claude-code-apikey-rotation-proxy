@@ -41,13 +41,23 @@ curl -X POST http://localhost:4080/admin/tokens \
   -d '{"token": "alice-secret-token", "label": "alice"}'
 ```
 
-Each user sets their Claude Code API key to their proxy token:
+Each user sets their Claude Code auth token to their proxy token. Use
+`ANTHROPIC_AUTH_TOKEN`, not `ANTHROPIC_API_KEY`. For example, put this in
+`~/.claude/settings.json`:
 
-```bash
-ANTHROPIC_API_KEY=alice-secret-token claude
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://localhost:4080",
+    "ANTHROPIC_AUTH_TOKEN": "alice-secret-token"
+  }
+}
 ```
 
-The proxy authenticates the user via the `x-api-key` or `Authorization: Bearer` header (the same headers Claude Code already sends), then replaces it with a real API key before forwarding to Anthropic. The user's proxy token never reaches the upstream API.
+The proxy authenticates the user via the `x-api-key` or `Authorization: Bearer`
+header (the same headers Claude Code can send), then replaces it with an
+upstream credential before forwarding to Anthropic. The user's proxy token
+never reaches the upstream API.
 
 Manage tokens via the admin API:
 
