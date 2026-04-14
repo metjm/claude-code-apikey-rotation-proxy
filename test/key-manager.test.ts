@@ -1466,32 +1466,85 @@ describe("Capacity telemetry", () => {
     expect(key!.capacity.windows.find((window) => window.windowName === "unified-7d")!.status).toBe("allowed");
   });
 
-  test("stale capacity windows are discarded instead of lingering as current warnings", () => {
+  test("observations remain valid until their resetAt passes, regardless of how old the observation is", () => {
+    // A 7-day window observed a week ago is still informative for the first
+    // 7 days — the resetAt is the canonical expiry, not lastSeenAt. Earlier
+    // behavior discarded anything not seen in the last 6 hours, which threw
+    // away 7d telemetry prematurely.
     const km = create();
     const originalNow = Date.now;
     const fakeNow = 1_000_000_000;
     Date.now = () => fakeNow;
     try {
-      const entry = km.addKey(VALID_KEY_1, "stale-window");
+      const entry = km.addKey(VALID_KEY_1, "observed-a-while-ago");
       km.recordCapacityObservation(entry, {
-        seenAt: unixMs(fakeNow - (7 * 60 * 60 * 1000)),
+        seenAt: unixMs(fakeNow - (7 * 60 * 60 * 1000)), // 7h ago
         httpStatus: 200,
         windows: [
           {
             windowName: "unified-7d",
             status: "allowed_warning",
             utilization: 1,
-            resetAt: unixMs(fakeNow + (7 * 24 * 60 * 60 * 1000)),
+            resetAt: unixMs(fakeNow + (7 * 24 * 60 * 60 * 1000)), // 7d ahead
           },
         ],
       });
 
       const key = km.listKeys()[0]!;
       const summary = km.getCapacitySummary();
-      expect(key.capacity.windows).toEqual([]);
-      expect(key.capacityHealth).toBe("unknown");
-      expect(summary.warningKeys).toBe(0);
-      expect(summary.windows).toEqual([]);
+      const sevenD = key.capacity.windows.find((w) => w.windowName === "unified-7d");
+      expect(sevenD).toBeDefined();
+      expect(sevenD!.utilization).toBe(1);
+      expect(key.capacityHealth).toBe("warning");
+      expect(summary.warningKeys).toBe(1);
+      expect(summary.windows.some((w) => w.windowName === "unified-7d")).toBe(true);
+    } finally {
+      Date.now = originalNow;
+    }
+  });
+
+  test("windows whose resetAt has passed are hidden from listKeys and pruned on the periodic sweep", () => {
+    // Observe a 7d window with resetAt in the future. Then advance the clock
+    // past the resetAt without any further observation — which is what
+    // happens when a key sits idle through its reset. The zombie state in
+    // memory should not leak into listKeys (sanitize hides it) and the
+    // periodic prune should drop it entirely.
+    const km = create();
+    const originalNow = Date.now;
+    let fakeNow = 1_000_000_000;
+    Date.now = () => fakeNow;
+    try {
+      const entry = km.addKey(VALID_KEY_1, "past-reset");
+      km.recordCapacityObservation(entry, {
+        seenAt: unixMs(fakeNow - (60 * 1000)),
+        httpStatus: 200,
+        windows: [
+          {
+            windowName: "unified-7d",
+            status: "allowed",
+            utilization: 0.5,
+            resetAt: unixMs(fakeNow + (60 * 60 * 1000)), // 1h in future at observation time
+          },
+        ],
+      });
+
+      // Before reset — present in listKeys.
+      expect(km.listKeys()[0]!.capacity.windows.some((w) => w.windowName === "unified-7d")).toBe(true);
+
+      // Advance the clock past the resetAt.
+      fakeNow += 2 * 60 * 60 * 1000;
+
+      // listKeys now hides the past-reset window via sanitize.
+      const masked = km.listKeys()[0]!;
+      expect(masked.capacity.windows.some((w) => w.windowName === "unified-7d")).toBe(false);
+
+      // Raw in-memory state still holds the zombie until prune.
+      const raw = (km as unknown as { keys: Array<{ capacity: { windows: Array<{ windowName: string }> } }> }).keys;
+      expect(raw[0]!.capacity.windows.some((w) => w.windowName === "unified-7d")).toBe(true);
+
+      // Prune removes it.
+      (km as unknown as { prunePastResetCapacityWindows: () => void }).prunePastResetCapacityWindows();
+      expect(raw[0]!.capacity.windows.some((w) => w.windowName === "unified-7d")).toBe(false);
     } finally {
       Date.now = originalNow;
     }

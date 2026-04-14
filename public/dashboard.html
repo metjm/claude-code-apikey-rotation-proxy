@@ -877,17 +877,14 @@ function shortSignalName(name) {
 function signalCoverage(key, signalName) {
   return (key.capacity?.signalCoverage || []).find(signal => signal.signalName === signalName) || null;
 }
-const CAPACITY_TELEMETRY_STALE_MS = 6 * 60 * 60 * 1000;
-
-function isFreshCapacityTimestamp(value) {
-  return value !== null && value !== undefined && (Date.now() - value) <= CAPACITY_TELEMETRY_STALE_MS;
-}
 function activeCapacityWindows(key, options = {}) {
   const nowMs = Date.now();
   const includeOverage = options.includeOverage === true;
   return (key.capacity?.windows || []).filter(window => {
     if (!includeOverage && window.windowName === 'unified-overage') return false;
-    if (!isFreshCapacityTimestamp(window.lastSeenAt)) return false;
+    // Data stays valid until the window's resetAt passes. No lastSeenAt-based
+    // stale-out — a 7d observation is useful for the whole 7-day cycle even
+    // if the key hasn't been used since.
     return window.resetAt === null || window.resetAt === undefined || window.resetAt > nowMs;
   });
 }
@@ -1032,13 +1029,13 @@ function overageNote(key) {
   const reason = key.capacity?.overageDisabledReason || 'provider policy';
   return `Extra usage is blocked (${reason}). That does not remove the key from rotation by itself.`;
 }
-function staleTelemetryNote(key) {
-  if (!key.capacity?.lastHeaderAt) return 'No recent parsed limit telemetry is available for this key yet.';
-  return `Last parsed limit telemetry was seen ${fmtRelative(new Date(key.capacity.lastHeaderAt).toISOString())}. Treat current quota state as unknown until this key is used again.`;
+function telemetryAwaitingNote(key) {
+  if (!key.capacity?.lastHeaderAt) return 'No parsed limit telemetry has been seen for this key yet. Routing will send traffic to it so we can learn its state.';
+  return `Last parsed limit telemetry was seen ${fmtRelative(new Date(key.capacity.lastHeaderAt).toISOString())}. All observed windows have since reset, so the current quota is awaiting a fresh observation.`;
 }
-function staleTelemetryLabel(key) {
-  if (!key.capacity?.lastHeaderAt) return 'No recent limit telemetry';
-  return `Telemetry stale (${fmtRelative(new Date(key.capacity.lastHeaderAt).toISOString())})`;
+function telemetryAwaitingLabel(key) {
+  if (!key.capacity?.lastHeaderAt) return 'Awaiting limit telemetry';
+  return 'All windows reset — awaiting fresh data';
 }
 function telemetryCoverageLabel(key) {
   const responseCount = key.capacity?.responseCount || 0;
@@ -1084,8 +1081,8 @@ function compactQuotaState(key) {
   if (windows.length === 0) {
     return {
       className: 'badge-unknown',
-      label: 'Stale',
-      title: staleTelemetryNote(key),
+      label: 'Awaiting data',
+      title: telemetryAwaitingNote(key),
     };
   }
   if (conflictingWindow) {
@@ -1153,9 +1150,9 @@ function capacityHeadline(key) {
   if (windows.length === 0) {
     return {
       badgeClass: 'badge-unknown',
-      badgeLabel: 'Telemetry is stale',
-      title: 'The dashboard has parsed limit headers for this key before, but not recently enough to trust them as current state.',
-      subtitle: staleTelemetryNote(key),
+      badgeLabel: 'Awaiting telemetry',
+      title: 'No active rate-limit windows right now — either this key was never observed, or every observed window has already reset.',
+      subtitle: telemetryAwaitingNote(key),
     };
   }
   if (conflictingWindow) {
@@ -1215,8 +1212,8 @@ function capacityTableSummary(key, telemetry) {
   }
   if (windows.length === 0) {
     return {
-      main: 'Parsed limit telemetry exists, but it is stale.',
-      sub: staleTelemetryNote(key),
+      main: 'All observed rate-limit windows have reset — waiting for a fresh response to know the current quota state.',
+      sub: telemetryAwaitingNote(key),
     };
   }
   if (conflictingWindow) {
@@ -1610,7 +1607,7 @@ function renderKeysInner() {
           <span class="pace-cell-reset">${esc(row.reset)}</span>
         </div>
       `).join('')}
-      ${hasAnyWindow ? '' : `<div class="table-sub" title="${esc((k.capacity?.normalizedHeaderCount || 0) > 0 ? staleTelemetryNote(k) : 'Awaiting limit headers')}">${esc((k.capacity?.normalizedHeaderCount || 0) > 0 ? staleTelemetryLabel(k) : 'Awaiting limit headers')}</div>`}
+      ${hasAnyWindow ? '' : `<div class="table-sub" title="${esc((k.capacity?.normalizedHeaderCount || 0) > 0 ? telemetryAwaitingNote(k) : 'Awaiting limit headers')}">${esc((k.capacity?.normalizedHeaderCount || 0) > 0 ? telemetryAwaitingLabel(k) : 'Awaiting limit headers')}</div>`}
     </div>`;
     const keyRef = JSON.stringify(k.maskedKey);
     const usageLines = [

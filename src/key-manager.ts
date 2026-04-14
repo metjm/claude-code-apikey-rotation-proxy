@@ -182,7 +182,6 @@ function currentBucketKey(): string {
 
 const CONVERSATION_AFFINITY_TTL_MS = 60 * 60 * 1000;
 const RECENT_SESSION_WINDOW_MS = 15 * 60 * 1000;
-const CAPACITY_TELEMETRY_STALE_MS = 6 * 60 * 60 * 1000;
 const PRIMARY_CAPACITY_WINDOW_NAMES = new Set(["unified", "unified-5h", "unified-7d"]);
 
 // Tier-reserve routing. Lower-priority tiers keep a headroom floor: the proxy
@@ -240,6 +239,7 @@ export class KeyManager {
       try {
         this.cleanupOldTimeseries();
         this.cleanupExpiredConversationAffinities(true);
+        this.prunePastResetCapacityWindows();
       } catch (error) {
         log("warn", "Failed to clean up key manager timeseries", {
           dbPath: this.dbPath,
@@ -247,6 +247,27 @@ export class KeyManager {
         });
       }
     }, 60 * 60 * 1000);
+  }
+
+  // Drop in-memory window records whose resetAt has already passed — the
+  // stored utilization is stale (the rate-limit cycle has flipped) and the
+  // next API response will repopulate with fresh values. Keeping expired
+  // entries around makes routing, dashboards, and debugging harder. Also
+  // persists the pruned state so we don't reload zombies on restart.
+  private prunePastResetCapacityWindows(): void {
+    const currentTime = now();
+    let prunedAny = false;
+    for (const entry of this.keys) {
+      const kept = entry.capacity.windows.filter((w) => {
+        if (w.resetAt === null || w.resetAt === undefined) return true;
+        return w.resetAt > currentTime;
+      });
+      if (kept.length !== entry.capacity.windows.length) {
+        entry.capacity = { ...entry.capacity, windows: kept };
+        prunedAny = true;
+      }
+    }
+    if (prunedAny) this.scheduleSave();
   }
 
   close(): void {
@@ -541,6 +562,7 @@ export class KeyManager {
       });
     }
     this.cleanupExpiredConversationAffinities(true);
+    this.prunePastResetCapacityWindows();
 
     log("info", `Loaded ${this.keys.length} key(s) and ${this.tokens.length} token(s) from SQLite`);
   }
@@ -1051,7 +1073,11 @@ export class KeyManager {
         maskedKey: maskKey(k.key),
         label: k.label,
         stats: k.stats,
-        capacity: k.capacity,
+        // Surface sanitized windows to the dashboard so past-reset windows
+        // (where the stored util is stale) don't show as "80% used" when the
+        // reset has actually happened. Routing still uses raw windows but
+        // applies its own near-reset bypass.
+        capacity: { ...k.capacity, windows: sanitizeCapacityWindows(k.capacity.windows, currentTime) },
         capacityHealth: this.getCapacityHealth(k),
         availableAt: k.availableAt,
         isAvailable: k.availableAt <= currentTime && k.allowedDays.includes(currentDay),
@@ -2011,9 +2037,10 @@ function isRelevantCapacityWindow(
 ): boolean {
   if (!PRIMARY_CAPACITY_WINDOW_NAMES.has(window.windowName)) return false;
   if (window.lastSeenAt === null) return false;
-  if (currentTime - window.lastSeenAt > CAPACITY_TELEMETRY_STALE_MS) {
-    return false;
-  }
+  // Data stays valid until the window's resetAt passes. Once resetAt is
+  // behind us, the observed utilization is meaningless (the rate-limit
+  // cycle has flipped). No lastSeenAt-based stale-out — a 7d observation
+  // is useful for the whole cycle even if the key sat idle since.
   if (window.resetAt !== null && window.resetAt <= currentTime) return false;
   return true;
 }
