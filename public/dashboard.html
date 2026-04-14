@@ -262,44 +262,55 @@
   }
   .pool-widget-pace b { color: var(--text); }
 
-  /* Reset calendar — horizontal timeline of upcoming resets */
+  /* Reset calendar — two proportional tracks (5h, 7d).
+     Track and axis share the same parent's width so positions align to the
+     pixel: neither element has a border/padding that would shift the
+     coordinate system. */
   .reset-calendar {
     margin-top: 12px; padding: 10px 12px; background: var(--bg);
     border: 1px solid var(--border); border-radius: 6px;
   }
   .reset-calendar-head {
     display: flex; justify-content: space-between; align-items: baseline;
-    margin-bottom: 8px;
+    margin-bottom: 10px;
   }
   .reset-calendar-title { color: var(--text-bright); font-weight: 600; font-size: 12px; }
   .reset-calendar-range { color: var(--text-dim); font-size: 11px; }
+  .reset-calendar-row {
+    display: flex; align-items: flex-start; gap: 10px; margin-bottom: 10px;
+  }
+  .reset-calendar-row:last-of-type { margin-bottom: 0; }
+  .reset-calendar-row-label {
+    width: 72px; flex-shrink: 0; color: var(--text-dim); font-size: 10px;
+    padding-top: 4px;
+  }
+  .reset-calendar-row-body { flex: 1; position: relative; min-width: 0; }
   .reset-calendar-track {
-    position: relative; height: 28px; background: var(--bg3);
-    border-radius: 4px; border: 1px solid var(--border);
+    position: relative; height: 14px; background: var(--bg3); border-radius: 3px;
   }
   .reset-tick {
     position: absolute; top: 0; bottom: 0; width: 2px;
-    transform: translateX(-1px);
+    transform: translateX(-1px); border-radius: 1px;
   }
   .reset-tick.tone-dim    { background: var(--text-dim); }
   .reset-tick.tone-green  { background: var(--green); }
   .reset-tick.tone-yellow { background: var(--yellow); }
   .reset-tick.tone-orange { background: #ffa657; }
   .reset-tick.tone-red    { background: var(--red); }
-  .reset-tick.window-7d   { top: 4px; bottom: 50%; }
-  .reset-tick.window-5h   { top: 50%; bottom: 4px; }
   .reset-calendar-axis {
     position: relative; height: 14px; margin-top: 2px;
     color: var(--text-dim); font-size: 9px;
   }
   .reset-calendar-axis span {
-    position: absolute; transform: translateX(-50%);
+    position: absolute; top: 0; transform: translateX(-50%); white-space: nowrap;
   }
+  .reset-calendar-axis span.align-start { transform: translateX(0); }
+  .reset-calendar-axis span.align-end   { transform: translateX(-100%); }
   .reset-calendar-empty {
     color: var(--text-dim); font-size: 11px; padding: 4px 0;
   }
   .reset-calendar-legend {
-    margin-top: 6px; color: var(--text-dim); font-size: 10px;
+    margin-top: 8px; color: var(--text-dim); font-size: 10px;
   }
   .reset-calendar-legend span { display: inline-block; margin-right: 12px; }
   .reset-calendar-legend .swatch {
@@ -1254,76 +1265,115 @@ function poolWidgetTitle(summaryWindow, agg) {
   return bits.join(' · ');
 }
 
-// Reset calendar — horizontal timeline of upcoming resets across the fleet.
-// 7d ticks sit above the midline; 5h ticks sit below. Color encodes the
-// projected utilization at reset (so a red tick means "this key will likely
-// hit its limit before it resets"). Cluster visually = capacity crunch.
+// Reset calendar — two independent proportional timelines (one per window
+// type). Keeping 5h and 7d on the same scale cramped short-window ticks into
+// a sliver whenever a 7d reset was days away. Tick color encodes the
+// projected utilization at reset; clustering = capacity crunch incoming.
 function renderResetCalendar() {
   const el = document.getElementById('reset-calendar');
   if (!el || typeof window.PaceMath === 'undefined') return;
   const now = Date.now();
   const calendar = window.PaceMath.upcomingResets(keys, now);
+  const tracks = calendar && calendar.tracks ? calendar.tracks : {};
+  const totalTicks = (tracks['unified-5h']?.ticks.length || 0) + (tracks['unified-7d']?.ticks.length || 0);
 
-  if (!calendar.ticks || calendar.ticks.length === 0) {
+  if (totalTicks === 0) {
     el.style.display = 'none';
     return;
   }
   el.style.display = '';
 
-  const span = Math.max(1, calendar.displayEnd - calendar.displayStart);
-  const axisLabels = buildCalendarAxisLabels(calendar.displayStart, calendar.displayEnd);
-  const horizonLabel = fmtCountdown(calendar.horizonAt - now);
-
-  const ticks = calendar.ticks.map(tick => {
-    const pct = Math.max(0, Math.min(100, tick.position * 100));
-    const remaining = Math.max(0, tick.resetAt - now);
-    const title = `${tick.keyLabel} · ${friendlyWindowName(tick.windowName)} resets in ${fmtCountdown(remaining)} · ${tick.tone} (${tick.utilization === null ? '--' : fmtPct(tick.utilization)} used)`;
-    const windowClass = tick.windowName === 'unified-7d' ? 'window-7d' : 'window-5h';
-    return `<div class="reset-tick tone-${esc(tick.tone)} ${esc(windowClass)}" style="left:${pct.toFixed(2)}%" title="${esc(title)}"></div>`;
-  }).join('');
-
-  const axis = axisLabels.map(lbl => {
-    const pos = Math.max(0, Math.min(100, ((lbl.at - calendar.displayStart) / span) * 100));
-    return `<span style="left:${pos.toFixed(2)}%">${esc(lbl.text)}</span>`;
-  }).join('');
+  const rowHtml = ['unified-5h', 'unified-7d']
+    .map(name => renderCalendarTrack(tracks[name], now))
+    .join('');
 
   el.innerHTML = `
     <div class="reset-calendar-head">
       <span class="reset-calendar-title">Upcoming resets</span>
-      <span class="reset-calendar-range">horizon ${esc(horizonLabel)} · ${calendar.ticks.length} reset(s)</span>
+      <span class="reset-calendar-range">${totalTicks} reset(s) on deck</span>
     </div>
-    <div class="reset-calendar-track">${ticks}</div>
-    <div class="reset-calendar-axis">${axis}</div>
+    ${rowHtml}
     <div class="reset-calendar-legend">
       <span><span class="swatch" style="background:var(--text-dim)"></span>coasting</span>
       <span><span class="swatch" style="background:var(--green)"></span>on pace</span>
       <span><span class="swatch" style="background:var(--yellow)"></span>slightly ahead</span>
       <span><span class="swatch" style="background:#ffa657"></span>watch</span>
       <span><span class="swatch" style="background:var(--red)"></span>burning hot</span>
-      <span>(top row 7d · bottom row 5h)</span>
     </div>
   `;
 }
 
-// Build human labels for the calendar axis. "now", "+1h", "+4h", "+24h",
-// "+3d" depending on horizon length. Keep to 4-5 labels to avoid clutter.
-function buildCalendarAxisLabels(start, end) {
-  const span = end - start;
+function renderCalendarTrack(track, now) {
+  if (!track) return '';
+  const friendly = friendlyWindowName(track.windowName);
+  const summary = track.ticks.length === 0
+    ? 'no upcoming resets'
+    : `${track.ticks.length} · next ${fmtCountdown(track.ticks[0].resetAt - now)}`;
+
+  if (track.ticks.length === 0) {
+    return `
+      <div class="reset-calendar-row">
+        <div class="reset-calendar-row-label">${esc(friendly)}</div>
+        <div class="reset-calendar-row-body">
+          <div class="reset-calendar-empty">No upcoming ${esc(friendly.toLowerCase())} resets</div>
+        </div>
+      </div>
+    `;
+  }
+
+  const tickHtml = track.ticks.map(tick => {
+    const pct = Math.max(0, Math.min(100, tick.position * 100));
+    const remaining = Math.max(0, tick.resetAt - now);
+    const utilTxt = tick.utilization === null ? '--' : fmtPct(tick.utilization);
+    const title = `${tick.keyLabel} resets in ${fmtCountdown(remaining)} · ${utilTxt} used · projected ${tick.tone}`;
+    return `<div class="reset-tick tone-${esc(tick.tone)}" style="left:${pct.toFixed(2)}%" title="${esc(title)}"></div>`;
+  }).join('');
+
+  const labels = buildCalendarAxisLabels(track);
+  const axisHtml = labels.map(lbl => {
+    const pos = Math.max(0, Math.min(100, ((lbl.at - track.displayStart) / track.span) * 100));
+    // Edge labels align to their edge so they don't get half-clipped.
+    const align = pos < 1 ? ' align-start' : pos > 99 ? ' align-end' : '';
+    return `<span class="${esc(align.trim())}" style="left:${pos.toFixed(2)}%">${esc(lbl.text)}</span>`;
+  }).join('');
+
+  return `
+    <div class="reset-calendar-row">
+      <div class="reset-calendar-row-label" title="${esc(summary)}">${esc(friendly)}</div>
+      <div class="reset-calendar-row-body">
+        <div class="reset-calendar-track">${tickHtml}</div>
+        <div class="reset-calendar-axis">${axisHtml}</div>
+      </div>
+    </div>
+  `;
+}
+
+// Axis labels sized to the track's own span. Uses floor bounds so the
+// generated label times never extend past displayEnd (which otherwise
+// stacks a label on the far right that represents nothing).
+function buildCalendarAxisLabels(track) {
   const ONE_HOUR = 60 * 60 * 1000;
-  const ONE_DAY = 24 * ONE_HOUR;
-  const labels = [{ at: start, text: 'now' }];
-  if (span <= 6 * ONE_HOUR) {
-    for (let h = 1; h <= Math.ceil(span / ONE_HOUR); h++) {
-      labels.push({ at: start + h * ONE_HOUR, text: `+${h}h` });
+  const ONE_DAY  = 24 * ONE_HOUR;
+  const span = track.span;
+  const labels = [{ at: track.displayStart, text: 'now' }];
+
+  if (span <= 90 * 60 * 1000) {
+    // < 90 minutes: label every 15 minutes.
+    for (let m = 15; m * 60 * 1000 <= span; m += 15) {
+      labels.push({ at: track.displayStart + m * 60 * 1000, text: `+${m}m` });
+    }
+  } else if (span <= 6 * ONE_HOUR) {
+    for (let h = 1; h * ONE_HOUR <= span; h++) {
+      labels.push({ at: track.displayStart + h * ONE_HOUR, text: `+${h}h` });
     }
   } else if (span <= 48 * ONE_HOUR) {
     const step = span <= 12 * ONE_HOUR ? 3 : 6;
-    for (let h = step; h <= Math.ceil(span / ONE_HOUR); h += step) {
-      labels.push({ at: start + h * ONE_HOUR, text: `+${h}h` });
+    for (let h = step; h * ONE_HOUR <= span; h += step) {
+      labels.push({ at: track.displayStart + h * ONE_HOUR, text: `+${h}h` });
     }
   } else {
-    for (let d = 1; d <= Math.ceil(span / ONE_DAY); d++) {
-      labels.push({ at: start + d * ONE_DAY, text: `+${d}d` });
+    for (let d = 1; d * ONE_DAY <= span; d++) {
+      labels.push({ at: track.displayStart + d * ONE_DAY, text: `+${d}d` });
     }
   }
   return labels;

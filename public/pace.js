@@ -254,34 +254,63 @@
     });
   }
 
-  // upcomingResets: flattens per-key windows into a single timeline.
-  // Auto-zooms the horizon: max(next 5h reset + 1h, furthest reset in 24h),
-  // but always include the next 2 resets per window even if outside.
-  // Returns ticks ordered by resetAt ASC.
+  // upcomingResets: one timeline per window type (5h and 7d), each
+  // auto-zoomed to its own data so the scales are proportional instead
+  // of cramming short-window ticks into 10% of a stretched-out calendar.
+  //
+  // Returns:
+  //   {
+  //     tracks: {
+  //       'unified-5h': { windowName, ticks[], displayStart, displayEnd, span },
+  //       'unified-7d': { ... }
+  //     },
+  //     now
+  //   }
+  //
+  // Each track:
+  //   - Auto-zooms displayEnd to a bit past the last tick, with a minimum
+  //     so a single imminent tick doesn't create a one-pixel-wide track.
+  //   - Tick positions are 0..1 within the track's own span.
+  //   - Ticks are sorted by resetAt ASC.
   function upcomingResets(keys, now) {
     var nowMs = Number(now);
+    return {
+      tracks: {
+        'unified-5h': buildResetTrack(keys, 'unified-5h', nowMs),
+        'unified-7d': buildResetTrack(keys, 'unified-7d', nowMs),
+      },
+      now: nowMs,
+    };
+  }
+
+  function buildResetTrack(keys, windowName, nowMs) {
+    var ONE_HOUR = 60 * 60 * 1000;
+    var ONE_DAY = 24 * ONE_HOUR;
+    // Minimum span keeps the axis readable when the next reset is < 1 minute
+    // away (for 5h) or < 1 hour away (for 7d).
+    var minSpan = windowName === 'unified-5h' ? 30 * 60 * 1000 : 6 * ONE_HOUR;
     var keysArr = Array.isArray(keys) ? keys : [];
-    var allTicks = [];
+    var ticks = [];
 
     for (var i = 0; i < keysArr.length; i++) {
       var k = keysArr[i];
       var windows = (k && k.capacity && k.capacity.windows) || [];
       for (var j = 0; j < windows.length; j++) {
         var w = windows[j];
-        if (w.windowName !== 'unified-5h' && w.windowName !== 'unified-7d') continue;
+        if (w.windowName !== windowName) continue;
         if (w.resetAt === null || w.resetAt === undefined) continue;
-        if (Number(w.resetAt) <= nowMs) continue; // already reset
+        if (Number(w.resetAt) <= nowMs) continue;
 
         var pace = computeWindowPace({
           utilization: w.utilization,
           resetAt: w.resetAt,
-          windowName: w.windowName,
+          windowName: windowName,
           now: nowMs,
         });
 
-        allTicks.push({
+        ticks.push({
           keyLabel: String((k && k.label) || ''),
-          windowName: w.windowName,
+          windowName: windowName,
           resetAt: Number(w.resetAt),
           utilization: w.utilization === null || w.utilization === undefined ? null : Number(w.utilization),
           projectedUtilAtReset: pace.projectedUtilAtReset,
@@ -291,48 +320,25 @@
       }
     }
 
-    allTicks.sort(function (a, b) { return a.resetAt - b.resetAt; });
+    ticks.sort(function (a, b) { return a.resetAt - b.resetAt; });
 
-    // Horizon: max(next 5h reset + 1h, furthest reset in next 24h).
-    var ONE_HOUR = 60 * 60 * 1000;
-    var TWENTY_FOUR = 24 * ONE_HOUR;
-    var next5h = null;
-    var furthestIn24h = nowMs + TWENTY_FOUR;
-    var furthestWithin = nowMs;
-    for (var t = 0; t < allTicks.length; t++) {
-      var tick = allTicks[t];
-      if (tick.windowName === 'unified-5h' && next5h === null) next5h = tick.resetAt;
-      if (tick.resetAt <= furthestIn24h && tick.resetAt > furthestWithin) furthestWithin = tick.resetAt;
-    }
-    var horizonFromResets = next5h !== null ? next5h + ONE_HOUR : nowMs + 5 * ONE_HOUR;
-    var horizon = Math.max(horizonFromResets, furthestWithin);
-
-    // Always include the next 2 resets per window (even beyond horizon).
-    var counts = { 'unified-5h': 0, 'unified-7d': 0 };
-    var ticks = [];
-    for (var m = 0; m < allTicks.length; m++) {
-      var cur = allTicks[m];
-      var withinHorizon = cur.resetAt <= horizon;
-      var countForcedInclude = counts[cur.windowName] < 2;
-      if (withinHorizon || countForcedInclude) {
-        ticks.push(cur);
-        counts[cur.windowName]++;
-      }
-    }
-
-    // Compute each tick's x position (0..1) within the displayed range.
+    var furthestRemaining = ticks.length > 0 ? ticks[ticks.length - 1].resetAt - nowMs : 0;
+    // Pad the right edge by 10% so the last tick isn't flush against it.
+    // Fall back to minSpan when there are no ticks or all ticks are very close.
+    var span = Math.max(minSpan, Math.ceil(furthestRemaining * 1.1));
     var displayStart = nowMs;
-    var displayEnd = ticks.length > 0 ? Math.max(horizon, ticks[ticks.length - 1].resetAt) : horizon;
-    var span = Math.max(1, displayEnd - displayStart);
-    for (var n = 0; n < ticks.length; n++) {
-      ticks[n].position = (ticks[n].resetAt - displayStart) / span;
+    var displayEnd = nowMs + span;
+
+    for (var t = 0; t < ticks.length; t++) {
+      ticks[t].position = (ticks[t].resetAt - displayStart) / span;
     }
 
     return {
+      windowName: windowName,
       ticks: ticks,
-      horizonAt: horizon,
       displayStart: displayStart,
       displayEnd: displayEnd,
+      span: span,
     };
   }
 

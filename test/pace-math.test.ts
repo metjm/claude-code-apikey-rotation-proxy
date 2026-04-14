@@ -512,7 +512,7 @@ describe("sortKeysForDisplay", () => {
 // ── upcomingResets ─────────────────────────────────────────────────────────
 
 describe("upcomingResets", () => {
-  test("returns ticks sorted by resetAt ASC", () => {
+  test("splits ticks into per-window tracks sorted by resetAt ASC", () => {
     const keys = [
       mkKey("a", 1, [
         mkWindow("unified-5h", 0.5, NOW + FIVE_H / 2),
@@ -521,10 +521,48 @@ describe("upcomingResets", () => {
       mkKey("b", 1, [mkWindow("unified-5h", 0.5, NOW + FIVE_H / 4)]),
     ];
     const result = PaceMath.upcomingResets(keys, NOW);
-    const times = result.ticks.map((t: any) => t.resetAt);
-    for (let i = 1; i < times.length; i++) {
-      expect(times[i]).toBeGreaterThanOrEqual(times[i - 1]);
-    }
+    expect(result.tracks).toBeTruthy();
+    const fiveH = result.tracks["unified-5h"];
+    const sevenD = result.tracks["unified-7d"];
+    expect(fiveH.ticks.length).toBe(2);
+    expect(sevenD.ticks.length).toBe(1);
+    // Ticks sorted by resetAt within each track.
+    expect(fiveH.ticks[0].resetAt).toBeLessThan(fiveH.ticks[1].resetAt);
+  });
+
+  test("each track scales to its own data", () => {
+    // 5h tick imminent, 7d tick 5 days out. Previously the calendar would
+    // stretch to cover the 7d reset and crush the 5h tick into the left edge.
+    // Now each track auto-zooms: the 5h span covers just past the 5h tick,
+    // the 7d span covers just past the 7d tick.
+    const keys = [
+      mkKey("a", 1, [
+        mkWindow("unified-5h", 0.5, NOW + FIVE_H / 2),
+        mkWindow("unified-7d", 0.5, NOW + 5 * 24 * 3600 * 1000),
+      ]),
+    ];
+    const result = PaceMath.upcomingResets(keys, NOW);
+    const fiveH = result.tracks["unified-5h"];
+    const sevenD = result.tracks["unified-7d"];
+    // 5h span covers ~5h/2 * 1.1 ≈ 2.75h — orders of magnitude smaller than
+    // the 7d span, which is the whole point of independent scaling.
+    expect(fiveH.span).toBeLessThan(FIVE_H);
+    expect(sevenD.span).toBeGreaterThan(4 * 24 * 3600 * 1000);
+    expect(sevenD.span / fiveH.span).toBeGreaterThan(40); // different magnitudes
+    // Each tick visible in the middle-to-right of its track, not crammed in.
+    expect(fiveH.ticks[0].position).toBeGreaterThan(0.5);
+    expect(sevenD.ticks[0].position).toBeGreaterThan(0.5);
+  });
+
+  test("minimum span keeps axis readable when reset is imminent", () => {
+    // 5h reset in 30 seconds — without minSpan we'd have a 30-second span
+    // which is useless on an axis.
+    const keys = [
+      mkKey("a", 1, [mkWindow("unified-5h", 0.8, NOW + 30 * 1000)]),
+    ];
+    const result = PaceMath.upcomingResets(keys, NOW);
+    // Minimum span for 5h track is 30 minutes (30 * 60 * 1000 ms).
+    expect(result.tracks["unified-5h"].span).toBeGreaterThanOrEqual(30 * 60 * 1000);
   });
 
   test("filters out resets in the past", () => {
@@ -533,31 +571,18 @@ describe("upcomingResets", () => {
       mkKey("b", 1, [mkWindow("unified-5h", 0.5, NOW + FIVE_H / 2)]),
     ];
     const result = PaceMath.upcomingResets(keys, NOW);
-    expect(result.ticks.length).toBe(1);
-    expect(result.ticks[0].keyLabel).toBe("b");
+    expect(result.tracks["unified-5h"].ticks.length).toBe(1);
+    expect(result.tracks["unified-5h"].ticks[0].keyLabel).toBe("b");
   });
 
-  test("filters out unknown window names", () => {
+  test("ignores windows that aren't 5h or 7d", () => {
     const keys = [
       mkKey("a", 1, [{ ...mkWindow("unified-5h", 0.5, NOW + FIVE_H), windowName: "other" }]),
       mkKey("b", 1, [mkWindow("unified-5h", 0.5, NOW + FIVE_H / 2)]),
     ];
     const result = PaceMath.upcomingResets(keys, NOW);
-    expect(result.ticks.length).toBe(1);
-    expect(result.ticks[0].keyLabel).toBe("b");
-  });
-
-  test("always includes next 2 per window, even if beyond horizon", () => {
-    // Three keys, all with 7d resets 5, 6, 7 days out (beyond 24h horizon)
-    const keys = [
-      mkKey("a", 1, [mkWindow("unified-7d", 0.1, NOW + 5 * 24 * 3600 * 1000)]),
-      mkKey("b", 1, [mkWindow("unified-7d", 0.1, NOW + 6 * 24 * 3600 * 1000)]),
-      mkKey("c", 1, [mkWindow("unified-7d", 0.1, NOW + 7 * 24 * 3600 * 1000)]),
-    ];
-    const result = PaceMath.upcomingResets(keys, NOW);
-    // Should include at least 2 of these 7d resets
-    const sevenD = result.ticks.filter((t: any) => t.windowName === "unified-7d");
-    expect(sevenD.length).toBeGreaterThanOrEqual(2);
+    expect(result.tracks["unified-5h"].ticks.length).toBe(1);
+    expect(result.tracks["unified-5h"].ticks[0].keyLabel).toBe("b");
   });
 
   test("positions normalized 0..1", () => {
@@ -566,15 +591,16 @@ describe("upcomingResets", () => {
       mkKey("b", 1, [mkWindow("unified-5h", 0.5, NOW + FIVE_H / 4)]),
     ];
     const result = PaceMath.upcomingResets(keys, NOW);
-    for (const t of result.ticks) {
+    for (const t of result.tracks["unified-5h"].ticks) {
       expect(t.position).toBeGreaterThanOrEqual(0);
       expect(t.position).toBeLessThanOrEqual(1);
     }
   });
 
-  test("empty keys → empty ticks", () => {
+  test("empty keys → both tracks empty", () => {
     const result = PaceMath.upcomingResets([], NOW);
-    expect(result.ticks).toEqual([]);
+    expect(result.tracks["unified-5h"].ticks).toEqual([]);
+    expect(result.tracks["unified-7d"].ticks).toEqual([]);
   });
 
   test("each tick has a tone derived from projected utilization", () => {
@@ -583,20 +609,25 @@ describe("upcomingResets", () => {
       mkKey("ok",  1, [mkWindow("unified-5h", 0.5, NOW + FIVE_H / 2)]),   // green
     ];
     const result = PaceMath.upcomingResets(keys, NOW);
-    const hot = result.ticks.find((t: any) => t.keyLabel === "hot");
-    const ok  = result.ticks.find((t: any) => t.keyLabel === "ok");
+    const ticks = result.tracks["unified-5h"].ticks;
+    const hot = ticks.find((t: any) => t.keyLabel === "hot");
+    const ok  = ticks.find((t: any) => t.keyLabel === "ok");
     expect(hot.tone).toBe("red");
     expect(ok.tone).toBe("green");
   });
 
-  test("real-data: produces a calendar with the expected upcoming resets", () => {
+  test("real-data: produces tracks with the expected upcoming resets", () => {
     const keys = [realMailTill, realOnegc, realTrainly, realGabe];
     const result = PaceMath.upcomingResets(keys, NOW);
-    // There should be 8 resets (4 keys × 2 windows), all in the future.
-    expect(result.ticks.length).toBeGreaterThanOrEqual(4);
-    // Earliest should be ~15min out (mail@till.dev 7d or till@onegc 5h)
-    const earliest = result.ticks[0];
-    expect(earliest.resetAt - NOW).toBeLessThan(16 * 60 * 1000);
+    const fiveH = result.tracks["unified-5h"];
+    const sevenD = result.tracks["unified-7d"];
+    // 4 keys × 2 windows = 8 resets, minus mail@till.dev 7d which resets very
+    // soon. All should be in the future.
+    expect(fiveH.ticks.length + sevenD.ticks.length).toBeGreaterThanOrEqual(4);
+    // 5h track earliest should be ~15 min out (till@onegc).
+    expect(fiveH.ticks[0].resetAt - NOW).toBeLessThan(16 * 60 * 1000);
+    // 7d track earliest should be ~15 min out (mail@till.dev 7d).
+    expect(sevenD.ticks[0].resetAt - NOW).toBeLessThan(16 * 60 * 1000);
   });
 });
 
