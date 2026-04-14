@@ -418,6 +418,7 @@ function handleStats(
     totals,
     keys,
     capacitySummary,
+    requestsByTier: keyManager.getRequestsByTier(),
   });
 }
 
@@ -468,6 +469,7 @@ function handleEvents(
             keys: keyManager.listKeys(), tokens: keyManager.listTokens(),
             currentBucket: keyManager.getCurrentBucket(),
             capacitySummary: keyManager.getCapacitySummary(),
+            requestsByTier: keyManager.getRequestsByTier(),
           };
           controller.enqueue(`data: ${JSON.stringify(ev)}\n\n`);
         } catch {}

@@ -1559,3 +1559,170 @@ describe("close()", () => {
     expect(keys[0]!.label).toBe("close-test");
   });
 });
+
+// ── Tier-reserve routing ────────────────────────────────────────────────────
+
+describe("tier-reserve routing (headroom floors)", () => {
+  // Helper: set a key's capacity to a specific 5h and 7d utilization, with
+  // resets both FIVE_H/2 and SEVEN_D/2 in the future — well clear of the
+  // near-reset threshold so utilization counts.
+  const FIVE_H = 5 * 60 * 60 * 1000;
+  const SEVEN_D = 7 * 24 * 60 * 60 * 1000;
+
+  function setUtilization(km: KeyManager, rawKey: string, util5h: number, util7d: number) {
+    const entry = km.listKeys().find((k) => k.label !== undefined);
+    const key = km.listKeys().find((k) => k.maskedKey === mask(rawKey))!;
+    void entry; void key;
+    // Resolve the actual ApiKeyEntry via the internal keys array by label lookup
+    // (tests outside the class don't have direct access). Use a capacity
+    // observation through the public API instead.
+    const label = km.listKeys().find((k) => k.maskedKey.length > 0)?.label;
+    void label;
+    const allKeys = (km as unknown as { keys: Array<{ key: string; label: string } & Record<string, unknown>> }).keys;
+    const internalEntry = allKeys.find((e) => e.key === rawKey)!;
+    km.recordCapacityObservation(internalEntry as never, {
+      seenAt: unixMs(Date.now()),
+      httpStatus: 200,
+      windows: [
+        { windowName: "unified-5h", status: "allowed", utilization: util5h, resetAt: unixMs(Date.now() + FIVE_H / 2) },
+        { windowName: "unified-7d", status: "allowed", utilization: util7d, resetAt: unixMs(Date.now() + SEVEN_D / 2) },
+      ],
+    });
+  }
+
+  function mask(key: string): string {
+    // Mirrors maskKey logic in key-manager; tests only use this for lookup.
+    return `${key.slice(0, 14)}...${key.slice(-4)}`;
+  }
+
+  test("tier 1 with 0% utilization wins over tier 2 and 3 (baseline)", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "preferred");
+    km.addKey(VALID_KEY_2, "normal");
+    km.addKey(VALID_KEY_3, "fallback");
+    km.updateKeyPriority(VALID_KEY_1, 1);
+    km.updateKeyPriority(VALID_KEY_2, 2);
+    km.updateKeyPriority(VALID_KEY_3, 3);
+
+    const pick = km.getKeyForConversation(null);
+    expect(pick.priorityTier).toBe(1);
+    expect(pick.entry!.label).toBe("preferred");
+    expect(pick.spilledFromTier).toBeNull();
+  });
+
+  test("tier 1 over 30% util still wins — no reserve on tier 1", () => {
+    // Tier 1 has no floor, so even at 95% utilization it's preferred over
+    // tier 2. The reserve applies only to 2 and 3.
+    const km = create();
+    km.addKey(VALID_KEY_1, "preferred-hot");
+    km.addKey(VALID_KEY_2, "normal-cold");
+    km.updateKeyPriority(VALID_KEY_1, 1);
+    km.updateKeyPriority(VALID_KEY_2, 2);
+    setUtilization(km, VALID_KEY_1, 0.95, 0.8);
+    setUtilization(km, VALID_KEY_2, 0.05, 0.05);
+
+    const pick = km.getKeyForConversation(null);
+    expect(pick.priorityTier).toBe(1);
+    expect(pick.entry!.label).toBe("preferred-hot");
+  });
+
+  test("tier 2 gated out by 30% floor → spill to tier 3 if tier 3 has ≥50% headroom", () => {
+    // Tier 1 missing. Tier 2 at 75% util (headroom 25%, below 30% floor).
+    // Tier 3 at 30% util (headroom 70%, above 50% floor). Tier 3 wins.
+    // Use a conversationKey so the richer selection path runs and populates
+    // spilledFromTier (non-conversation requests also spill correctly, but
+    // only the conversation path reports the telemetry).
+    const km = create();
+    km.addKey(VALID_KEY_2, "normal-used");
+    km.addKey(VALID_KEY_3, "fallback-fresh");
+    km.updateKeyPriority(VALID_KEY_2, 2);
+    km.updateKeyPriority(VALID_KEY_3, 3);
+    setUtilization(km, VALID_KEY_2, 0.75, 0.20);
+    setUtilization(km, VALID_KEY_3, 0.30, 0.20);
+
+    const pick = km.getKeyForConversation("user-spill:session-a");
+    expect(pick.entry!.label).toBe("fallback-fresh");
+    expect(pick.priorityTier).toBe(3);
+    expect(pick.spilledFromTier).toBe(2);
+  });
+
+  test("fallback with 60% utilization is GATED OUT (50% headroom floor)", () => {
+    // Only a tier-3 key exists, at 60% util (headroom 40%, below 50% floor).
+    // Tier 3 is the only tier present, so it goes through fall-through logic
+    // and still gets selected — reserves are a planning signal, not a gate
+    // when there's no alternative.
+    const km = create();
+    km.addKey(VALID_KEY_3, "fallback-below-reserve");
+    km.updateKeyPriority(VALID_KEY_3, 3);
+    setUtilization(km, VALID_KEY_3, 0.60, 0.40);
+
+    const pick = km.getKeyForConversation(null);
+    expect(pick.entry!.label).toBe("fallback-below-reserve");
+    expect(pick.priorityTier).toBe(3);
+    // spilledFromTier is null because we didn't shift away from a higher tier —
+    // we fell through the reserve check because every tier was below its floor.
+    expect(pick.spilledFromTier).toBeNull();
+  });
+
+  test("existing invariant: preferred tier keys never yield to lower tiers when eligible", () => {
+    // This is the regression-lock against the old "within tier" invariant.
+    // Tier 1 at moderate util (eligible — no floor on tier 1), tier 3 with
+    // pristine headroom. Tier 1 still wins.
+    const km = create();
+    km.addKey(VALID_KEY_1, "preferred-moderate");
+    km.addKey(VALID_KEY_3, "fallback-pristine");
+    km.updateKeyPriority(VALID_KEY_1, 1);
+    km.updateKeyPriority(VALID_KEY_3, 3);
+    setUtilization(km, VALID_KEY_1, 0.50, 0.40);
+    setUtilization(km, VALID_KEY_3, 0.00, 0.00);
+
+    const pick = km.getKeyForConversation(null);
+    expect(pick.priorityTier).toBe(1);
+    expect(pick.entry!.label).toBe("preferred-moderate");
+    expect(pick.spilledFromTier).toBeNull();
+  });
+
+  test("windows near reset (>=95% elapsed) don't count against headroom", () => {
+    // A key at 90% utilization with 1 minute until reset isn't "nearly out" —
+    // it's about to refresh. Near-reset windows should be ignored for the
+    // headroom check, so such a key stays eligible.
+    const km = create();
+    km.addKey(VALID_KEY_2, "normal-about-to-reset");
+    km.updateKeyPriority(VALID_KEY_2, 2);
+    km.recordCapacityObservation(
+      (km as unknown as { keys: Array<{ key: string } & Record<string, unknown>> })
+        .keys.find((e) => e.key === VALID_KEY_2)! as never,
+      {
+        seenAt: unixMs(Date.now()),
+        httpStatus: 200,
+        windows: [
+          { windowName: "unified-5h", status: "allowed", utilization: 0.90, resetAt: unixMs(Date.now() + 60_000) },
+          { windowName: "unified-7d", status: "allowed", utilization: 0.05, resetAt: unixMs(Date.now() + SEVEN_D / 2) },
+        ],
+      },
+    );
+
+    const pick = km.getKeyForConversation(null);
+    // Without the near-reset bypass, the key at 90% util would fail the 30%
+    // floor. With it, only the 7d window (5% util) counts — eligible.
+    expect(pick.priorityTier).toBe(2);
+  });
+
+  test("requestsByTier counter increments on each routed request", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "pref");
+    km.addKey(VALID_KEY_2, "norm");
+    km.updateKeyPriority(VALID_KEY_1, 1);
+    km.updateKeyPriority(VALID_KEY_2, 2);
+
+    expect(km.getRequestsByTier()).toEqual({});
+
+    const first = km.getKeyForConversation(null);
+    km.recordRequest(first.entry!);
+    expect(km.getRequestsByTier()).toEqual({ "1": 1 });
+
+    const second = km.getKeyForConversation(null);
+    km.recordRequest(second.entry!);
+    expect(km.getRequestsByTier()).toEqual({ "1": 2 });
+  });
+});

@@ -130,6 +130,8 @@ type RoutingSelection = {
   readonly priorityTier: number | null;
   readonly candidateCount: number;
   readonly conversationCountForSelectedKey: number | null;
+  readonly spilledFromTier: number | null;
+  readonly worstHeadroom: number | null;
 };
 
 type StreamStartFailureReason =
@@ -274,6 +276,8 @@ export async function proxyRequest(
           priorityTier: preferredRetryKey.priority,
           candidateCount: 1,
           conversationCountForSelectedKey: null,
+          spilledFromTier: null,
+          worstHeadroom: null,
         }
       : keyManager.getKeyForConversation(conversationKey, sessionId);
     const entry: ApiKeyEntry | null = selection.entry;
@@ -312,6 +316,8 @@ export async function proxyRequest(
       priorityTier: selection.priorityTier,
       candidateCount: selection.candidateCount,
       conversationCountForSelectedKey: selection.conversationCountForSelectedKey,
+      spilledFromTier: selection.spilledFromTier,
+      worstHeadroom: selection.worstHeadroom,
       upstreamUrl,
       requestContentLength,
       requestBodyState,

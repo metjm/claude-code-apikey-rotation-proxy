@@ -696,6 +696,10 @@ let evtSource = null;
 const MAX_LOG = 200;
 const keyColorMap = {};
 let colorIdx = 0;
+// Cumulative per-tier request counts from the server. Resets on server
+// restart. Shown as a "spill" indicator so operators can see whether
+// tier 2/3 keys are actually receiving traffic.
+let requestsByTier = {};
 
 // Demo mode: ?pace-demo=1 overlays a synthetic fixture covering every tone
 // bucket and reset-soon case. Used for visual QA of the pace viz without
@@ -1406,12 +1410,22 @@ function renderCapacitySummaryInner() {
     updatedEl.textContent = 'Waiting for normalized headers';
   }
 
+  const tierCounts = requestsByTier || {};
+  const tierTotal = (tierCounts["1"] || 0) + (tierCounts["2"] || 0) + (tierCounts["3"] || 0);
+  const tierLabel = tierTotal === 0
+    ? '—'
+    : `${tierCounts["1"] || 0} / ${tierCounts["2"] || 0} / ${tierCounts["3"] || 0}`;
+  const tierPct = tierTotal === 0
+    ? 'no requests yet this session'
+    : `preferred ${fmtPct((tierCounts["1"] || 0) / tierTotal)} · normal ${fmtPct((tierCounts["2"] || 0) / tierTotal)} · fallback ${fmtPct((tierCounts["3"] || 0) / tierTotal)}`;
+
   const cards = [
     { label: 'Telemetry Looks OK', value: capacitySummary.healthyKeys, sub: `${capacitySummary.warningKeys} keys need attention / ${capacitySummary.unknownKeys} no signal yet` },
     { label: 'Cooling', value: capacitySummary.coolingDownKeys, sub: 'paused after real rate-limit responses' },
     { label: 'Organizations', value: capacitySummary.distinctOrganizations, sub: 'distinct org IDs seen' },
     { label: 'Responses', value: fmtNum(totalResponses), sub: 'upstream responses observed' },
     { label: 'Signals', value: normalizedPct, sub: `${fmtNum(normalizedResponses)} / ${fmtNum(totalResponses)} responses carried normalized signals` },
+    { label: 'Requests by tier', value: tierLabel, sub: tierPct },
     { label: 'Fallback Path', value: capacitySummary.fallbackAvailableKeys, sub: 'keys with fallback available' },
     { label: 'Extra Usage Blocked', value: capacitySummary.overageRejectedKeys, sub: 'analytics only; not a routing block by itself' },
   ];
@@ -1825,6 +1839,10 @@ function connectSSE() {
       }
       if (event.capacitySummary) {
         capacitySummary = event.capacitySummary;
+        renderCapacitySummary();
+      }
+      if (event.requestsByTier) {
+        requestsByTier = event.requestsByTier;
         renderCapacitySummary();
       }
       // Update tokens from heartbeat
