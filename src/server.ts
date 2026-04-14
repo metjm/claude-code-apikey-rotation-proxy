@@ -116,6 +116,11 @@ function startServer(): void {
       if (url.pathname === "/dashboard/chart.umd.min.js.map") {
         return new Response(null, { status: 204 });
       }
+      if (url.pathname === "/dashboard/pace.js") {
+        return new Response(Bun.file(join(import.meta.dir, "../public/pace.js")), {
+          headers: { "content-type": "application/javascript" },
+        });
+      }
       if (url.pathname === "/favicon.ico") {
         return new Response(null, { status: 204 });
       }

@@ -194,6 +194,125 @@
   .card-stats b { color: var(--text); }
   .card-bar { height: 4px; border-radius: 2px; background: var(--bg3); margin: 6px 0; overflow: hidden; }
   .card-bar-fill { height: 100%; border-radius: 2px; transition: width 0.3s; }
+
+  /* Pace bar — fill encodes utilization, tick marks the "expected by now" position */
+  .pace-bar {
+    position: relative; height: 6px; border-radius: 3px; background: var(--bg3);
+    min-width: 60px;
+  }
+  .pace-bar-fill {
+    height: 100%; border-radius: 3px; transition: width 0.3s, background 0.3s;
+    background: var(--text-dim);
+  }
+  .pace-bar.tone-dim    .pace-bar-fill { background: var(--text-dim); }
+  .pace-bar.tone-green  .pace-bar-fill { background: var(--green); }
+  .pace-bar.tone-yellow .pace-bar-fill { background: var(--yellow); }
+  .pace-bar.tone-orange .pace-bar-fill { background: #ffa657; }
+  .pace-bar.tone-red    .pace-bar-fill { background: var(--red); }
+  .pace-bar-tick {
+    position: absolute; top: -2px; bottom: -2px; width: 2px;
+    background: var(--text-bright); transform: translateX(-1px);
+    border-radius: 1px; pointer-events: none;
+  }
+  .pace-cell {
+    display: grid; grid-template-columns: 30px 1fr 56px; gap: 3px 8px;
+    align-items: center; font-size: 10px;
+  }
+  .pace-cell-label { color: var(--text-bright); font-weight: 600; }
+  .pace-cell-reset { color: var(--text-dim); text-align: right; white-space: nowrap; }
+
+  /* Pool widget — one per window, sits in the capacity-window-summary grid */
+  .pool-widget {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+    padding: 10px 12px;
+  }
+  .pool-widget-head {
+    display: flex; justify-content: space-between; gap: 8px; align-items: baseline;
+    margin-bottom: 6px;
+  }
+  .pool-widget-name { color: var(--text-bright); font-weight: 600; font-size: 12px; }
+  .pool-widget-reset { color: var(--text-dim); font-size: 11px; }
+  .pool-widget-bar {
+    position: relative; height: 10px; border-radius: 4px; background: var(--bg3);
+    overflow: visible; margin-bottom: 6px;
+  }
+  .pool-widget-bar-fill { height: 100%; border-radius: 4px; transition: width 0.3s, background 0.3s; }
+  .pool-widget-bar.tone-dim    .pool-widget-bar-fill { background: var(--text-dim); }
+  .pool-widget-bar.tone-green  .pool-widget-bar-fill { background: var(--green); }
+  .pool-widget-bar.tone-yellow .pool-widget-bar-fill { background: var(--yellow); }
+  .pool-widget-bar.tone-orange .pool-widget-bar-fill { background: #ffa657; }
+  .pool-widget-bar.tone-red    .pool-widget-bar-fill { background: var(--red); }
+  .pool-widget-bar-elapsed {
+    position: absolute; top: -2px; bottom: -2px; width: 2px;
+    background: var(--text-bright); transform: translateX(-1px);
+    border-radius: 1px;
+  }
+  .pool-widget-bar-max {
+    position: absolute; top: -3px; bottom: -3px; width: 2px;
+    background: var(--red); transform: translateX(-1px);
+    border-radius: 1px; opacity: 0.7;
+  }
+  .pool-widget-stats {
+    display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 2px 10px; font-size: 11px; color: var(--text-dim);
+  }
+  .pool-widget-stats b { color: var(--text); }
+  .pool-widget-pace {
+    font-size: 10px; color: var(--text-dim); margin-top: 4px;
+  }
+  .pool-widget-pace b { color: var(--text); }
+
+  /* Reset calendar — horizontal timeline of upcoming resets */
+  .reset-calendar {
+    margin-top: 12px; padding: 10px 12px; background: var(--bg);
+    border: 1px solid var(--border); border-radius: 6px;
+  }
+  .reset-calendar-head {
+    display: flex; justify-content: space-between; align-items: baseline;
+    margin-bottom: 8px;
+  }
+  .reset-calendar-title { color: var(--text-bright); font-weight: 600; font-size: 12px; }
+  .reset-calendar-range { color: var(--text-dim); font-size: 11px; }
+  .reset-calendar-track {
+    position: relative; height: 28px; background: var(--bg3);
+    border-radius: 4px; border: 1px solid var(--border);
+  }
+  .reset-tick {
+    position: absolute; top: 0; bottom: 0; width: 2px;
+    transform: translateX(-1px);
+  }
+  .reset-tick.tone-dim    { background: var(--text-dim); }
+  .reset-tick.tone-green  { background: var(--green); }
+  .reset-tick.tone-yellow { background: var(--yellow); }
+  .reset-tick.tone-orange { background: #ffa657; }
+  .reset-tick.tone-red    { background: var(--red); }
+  .reset-tick.window-7d   { top: 4px; bottom: 50%; }
+  .reset-tick.window-5h   { top: 50%; bottom: 4px; }
+  .reset-calendar-axis {
+    position: relative; height: 14px; margin-top: 2px;
+    color: var(--text-dim); font-size: 9px;
+  }
+  .reset-calendar-axis span {
+    position: absolute; transform: translateX(-50%);
+  }
+  .reset-calendar-empty {
+    color: var(--text-dim); font-size: 11px; padding: 4px 0;
+  }
+  .reset-calendar-legend {
+    margin-top: 6px; color: var(--text-dim); font-size: 10px;
+  }
+  .reset-calendar-legend span { display: inline-block; margin-right: 12px; }
+  .reset-calendar-legend .swatch {
+    display: inline-block; width: 8px; height: 8px; border-radius: 2px;
+    margin-right: 3px; vertical-align: middle;
+  }
+
+  /* Pace-demo banner */
+  .pace-demo-banner {
+    padding: 6px 10px; background: rgba(88,166,255,0.1); color: var(--blue);
+    border: 1px solid rgba(88,166,255,0.3); border-radius: 4px;
+    font-size: 11px; margin-bottom: 12px;
+  }
   .badge { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 10px; font-weight: 600; }
   .badge-ok { background: rgba(63,185,80,0.15); color: var(--green); }
   .badge-ratelimited { background: rgba(210,153,34,0.15); color: var(--yellow); }
@@ -358,6 +477,7 @@
       <div class="empty-state">No capacity data observed yet</div>
     </div>
     <div class="window-grid" id="capacity-window-summary"></div>
+    <div id="reset-calendar" class="reset-calendar" style="display:none"></div>
   </div>
 
   <div class="panel panel-full">
@@ -548,6 +668,7 @@
 </div>
 
 <script src="/dashboard/chart.umd.min.js"></script>
+<script src="/dashboard/pace.js"></script>
 <script>
 // ── Chart.js defaults (dark theme) ────────────────────────────
 Chart.defaults.color = '#8b949e';
@@ -564,6 +685,24 @@ let evtSource = null;
 const MAX_LOG = 200;
 const keyColorMap = {};
 let colorIdx = 0;
+
+// Demo mode: ?pace-demo=1 overlays a synthetic fixture covering every tone
+// bucket and reset-soon case. Used for visual QA of the pace viz without
+// needing real rate-limited traffic. Purely client-side.
+const PACE_DEMO = new URLSearchParams(location.search).has('pace-demo');
+if (PACE_DEMO) {
+  window.addEventListener('DOMContentLoaded', () => {
+    const banner = document.createElement('div');
+    banner.className = 'pace-demo-banner';
+    banner.textContent = 'Pace demo mode — synthetic keys merged into the view for visual QA.';
+    document.querySelector('.app').prepend(banner);
+  });
+}
+function mergeDemoFixture(realKeys) {
+  if (!PACE_DEMO || typeof window.PaceMath === 'undefined') return realKeys;
+  const demo = window.PaceMath.demoFixture(Date.now());
+  return (realKeys || []).concat(demo);
+}
 
 // ── Auth ───────────────────────────────────────────────────────
 async function submitAuth() {
@@ -1094,7 +1233,108 @@ function keyRowTone(key, telemetry) {
   if (telemetry.badgeClass === 'badge-ok') return 'row-ok';
   return 'row-unknown';
 }
+
+// Human phrase for a pace ratio + tone. "1.47× slightly ahead", "0.21× coasting".
+function paceLabel(tone, ratio) {
+  if (ratio === null || ratio === undefined) return '--';
+  if (tone === 'dim')    return ratio < 0.5 ? 'coasting' : 'behind pace';
+  if (tone === 'green')  return 'on pace';
+  if (tone === 'yellow') return 'slightly ahead';
+  if (tone === 'orange') return 'ahead — watch';
+  if (tone === 'red')    return 'burning hot';
+  return '';
+}
+
+function poolWidgetTitle(summaryWindow, agg) {
+  const bits = [friendlyWindowName(summaryWindow.windowName)];
+  if (agg.meanUtil !== null)   bits.push(`mean ${fmtPct(agg.meanUtil)}`);
+  if (agg.maxUtil !== null)    bits.push(`max ${fmtPct(agg.maxUtil)}`);
+  if (agg.aggregateElapsed !== null) bits.push(`${Math.round(agg.aggregateElapsed * 100)}% window elapsed`);
+  if (agg.aggregatePace !== null) bits.push(`pool pace ${agg.aggregatePace.toFixed(2)}× (${paceLabel(agg.tone, agg.aggregatePace)})`);
+  return bits.join(' · ');
+}
+
+// Reset calendar — horizontal timeline of upcoming resets across the fleet.
+// 7d ticks sit above the midline; 5h ticks sit below. Color encodes the
+// projected utilization at reset (so a red tick means "this key will likely
+// hit its limit before it resets"). Cluster visually = capacity crunch.
+function renderResetCalendar() {
+  const el = document.getElementById('reset-calendar');
+  if (!el || typeof window.PaceMath === 'undefined') return;
+  const now = Date.now();
+  const calendar = window.PaceMath.upcomingResets(keys, now);
+
+  if (!calendar.ticks || calendar.ticks.length === 0) {
+    el.style.display = 'none';
+    return;
+  }
+  el.style.display = '';
+
+  const span = Math.max(1, calendar.displayEnd - calendar.displayStart);
+  const axisLabels = buildCalendarAxisLabels(calendar.displayStart, calendar.displayEnd);
+  const horizonLabel = fmtCountdown(calendar.horizonAt - now);
+
+  const ticks = calendar.ticks.map(tick => {
+    const pct = Math.max(0, Math.min(100, tick.position * 100));
+    const remaining = Math.max(0, tick.resetAt - now);
+    const title = `${tick.keyLabel} · ${friendlyWindowName(tick.windowName)} resets in ${fmtCountdown(remaining)} · ${tick.tone} (${tick.utilization === null ? '--' : fmtPct(tick.utilization)} used)`;
+    const windowClass = tick.windowName === 'unified-7d' ? 'window-7d' : 'window-5h';
+    return `<div class="reset-tick tone-${esc(tick.tone)} ${esc(windowClass)}" style="left:${pct.toFixed(2)}%" title="${esc(title)}"></div>`;
+  }).join('');
+
+  const axis = axisLabels.map(lbl => {
+    const pos = Math.max(0, Math.min(100, ((lbl.at - calendar.displayStart) / span) * 100));
+    return `<span style="left:${pos.toFixed(2)}%">${esc(lbl.text)}</span>`;
+  }).join('');
+
+  el.innerHTML = `
+    <div class="reset-calendar-head">
+      <span class="reset-calendar-title">Upcoming resets</span>
+      <span class="reset-calendar-range">horizon ${esc(horizonLabel)} · ${calendar.ticks.length} reset(s)</span>
+    </div>
+    <div class="reset-calendar-track">${ticks}</div>
+    <div class="reset-calendar-axis">${axis}</div>
+    <div class="reset-calendar-legend">
+      <span><span class="swatch" style="background:var(--text-dim)"></span>coasting</span>
+      <span><span class="swatch" style="background:var(--green)"></span>on pace</span>
+      <span><span class="swatch" style="background:var(--yellow)"></span>slightly ahead</span>
+      <span><span class="swatch" style="background:#ffa657"></span>watch</span>
+      <span><span class="swatch" style="background:var(--red)"></span>burning hot</span>
+      <span>(top row 7d · bottom row 5h)</span>
+    </div>
+  `;
+}
+
+// Build human labels for the calendar axis. "now", "+1h", "+4h", "+24h",
+// "+3d" depending on horizon length. Keep to 4-5 labels to avoid clutter.
+function buildCalendarAxisLabels(start, end) {
+  const span = end - start;
+  const ONE_HOUR = 60 * 60 * 1000;
+  const ONE_DAY = 24 * ONE_HOUR;
+  const labels = [{ at: start, text: 'now' }];
+  if (span <= 6 * ONE_HOUR) {
+    for (let h = 1; h <= Math.ceil(span / ONE_HOUR); h++) {
+      labels.push({ at: start + h * ONE_HOUR, text: `+${h}h` });
+    }
+  } else if (span <= 48 * ONE_HOUR) {
+    const step = span <= 12 * ONE_HOUR ? 3 : 6;
+    for (let h = step; h <= Math.ceil(span / ONE_HOUR); h += step) {
+      labels.push({ at: start + h * ONE_HOUR, text: `+${h}h` });
+    }
+  } else {
+    for (let d = 1; d <= Math.ceil(span / ONE_DAY); d++) {
+      labels.push({ at: start + d * ONE_DAY, text: `+${d}d` });
+    }
+  }
+  return labels;
+}
+
 function renderCapacitySummary() {
+  try { return renderCapacitySummaryInner(); } catch (err) {
+    console.warn('renderCapacitySummary failed, keeping previous DOM:', err);
+  }
+}
+function renderCapacitySummaryInner() {
   const grid = document.getElementById('capacity-summary-grid');
   const windowsEl = document.getElementById('capacity-window-summary');
   const updatedEl = document.getElementById('pool-updated');
@@ -1131,42 +1371,106 @@ function renderCapacitySummary() {
 
   if (!capacitySummary.windows || capacitySummary.windows.length === 0) {
     windowsEl.innerHTML = '<div class="empty-state">No rate-limit windows observed yet</div>';
+    renderResetCalendar();
     return;
   }
 
-  windowsEl.innerHTML = capacitySummary.windows.map(window => `
-    <div class="window-card">
-      <div class="window-card-head">
-        <span class="window-card-name">${esc(humanizeWindowName(window.windowName))}</span>
-        <span class="window-card-reset">${window.nextResetAt ? `reset ${fmtCountdown(window.nextResetAt - Date.now())}` : 'reset --'}</span>
+  // Render one pool widget per primary window (5h and 7d). The math module
+  // computes aggregate pace by taking the mean utilization across reporting
+  // keys, against the max elapsed fraction (the "oldest" window's position),
+  // which matches operator intuition: "how close is the fleet, collectively,
+  // to hitting the wall?"
+  const PRIMARY_WINDOWS = ['unified-5h', 'unified-7d'];
+  const now = Date.now();
+  const renderableWindows = PRIMARY_WINDOWS
+    .map(name => capacitySummary.windows.find(w => w.windowName === name))
+    .filter(Boolean);
+  if (renderableWindows.length === 0) {
+    // No primary windows — fall back to raw summary in a compact form
+    windowsEl.innerHTML = capacitySummary.windows.map(window => `
+      <div class="window-card">
+        <div class="window-card-head">
+          <span class="window-card-name">${esc(humanizeWindowName(window.windowName))}</span>
+          <span class="window-card-reset">${window.nextResetAt ? `reset ${fmtCountdown(window.nextResetAt - Date.now())}` : 'reset --'}</span>
+        </div>
+        <div class="window-card-stats">
+          <span><b>${fmtPct(window.maxUtilization)}</b> max util</span>
+          <span><b>${fmtPct(window.medianUtilization)}</b> median util</span>
+          <span><b>${fmtNum(window.knownKeys)}</b> keys reporting</span>
+        </div>
       </div>
-      <div class="window-card-stats">
-        <span><b>${fmtPct(window.maxUtilization)}</b> max util</span>
-        <span><b>${fmtPct(window.medianUtilization)}</b> median util</span>
-        <span><b>${fmtNum(window.allowedKeys)}</b> OK</span>
-        <span><b>${fmtNum(window.warningKeys)}</b> close</span>
-        <span><b>${fmtNum(window.rejectedKeys)}</b> header said reached</span>
-        <span><b>${fmtNum(window.knownKeys)}</b> keys reporting</span>
-      </div>
-    </div>
-  `).join('');
+    `).join('');
+    renderResetCalendar();
+    return;
+  }
+
+  windowsEl.innerHTML = renderableWindows.map(summaryWindow => {
+    const agg = window.PaceMath.computePoolAggregate(summaryWindow, keys, summaryWindow.windowName, now);
+    const meanPct   = agg.meanUtil === null   ? 0 : Math.round(agg.meanUtil * 100);
+    const maxPct    = agg.maxUtil === null    ? null : Math.round(agg.maxUtil * 100);
+    const elapsedPct = agg.aggregateElapsed === null ? null : Math.round(agg.aggregateElapsed * 100);
+    const paceText = agg.aggregatePace === null
+      ? '—'
+      : (agg.aggregatePace.toFixed(2) + '× ' + paceLabel(agg.tone, agg.aggregatePace));
+    const resetText = summaryWindow.nextResetAt
+      ? `next reset ${fmtCountdown(summaryWindow.nextResetAt - now)}`
+      : 'next reset —';
+    return `
+      <div class="pool-widget" title="${esc(poolWidgetTitle(summaryWindow, agg))}">
+        <div class="pool-widget-head">
+          <span class="pool-widget-name">${esc(friendlyWindowName(summaryWindow.windowName))}</span>
+          <span class="pool-widget-reset">${esc(resetText)}</span>
+        </div>
+        <div class="pool-widget-bar tone-${esc(agg.tone)}">
+          <div class="pool-widget-bar-fill" style="width:${meanPct}%"></div>
+          ${elapsedPct !== null ? `<div class="pool-widget-bar-elapsed" style="left:${elapsedPct}%" title="expected by now: ${elapsedPct}%"></div>` : ''}
+          ${maxPct !== null ? `<div class="pool-widget-bar-max" style="left:${maxPct}%" title="hottest key: ${maxPct}%"></div>` : ''}
+        </div>
+        <div class="pool-widget-stats">
+          <span><b>${fmtPct(agg.meanUtil)}</b> mean</span>
+          <span><b>${fmtPct(agg.maxUtil)}</b> max</span>
+          <span><b>${fmtNum(agg.keysReporting)}</b> keys</span>
+        </div>
+        <div class="pool-widget-pace">Pool pace <b>${esc(paceText)}</b>${elapsedPct !== null ? ` · ${elapsedPct}% of window elapsed` : ''}</div>
+      </div>`;
+  }).join('');
+
+  renderResetCalendar();
 }
 
 // ── Render keys ────────────────────────────────────────────────
 function renderKeys() {
+  try { return renderKeysInner(); } catch (err) {
+    // Preserve the previously-rendered DOM on an unexpected error.
+    // Without this, a single bad pace computation would blank the whole table.
+    console.warn('renderKeys failed, keeping previous DOM:', err);
+  }
+}
+function renderKeysInner() {
   const el = document.getElementById('key-cards');
   const active = document.activeElement;
   if (active && active.tagName === 'SELECT' && active.closest('#key-cards')) {
+    // Don't re-render while the user is interacting with a dropdown — would
+    // snap focus away. The countdown timer fires every second, so we'd
+    // otherwise blow away the open select on every tick.
     return;
   }
   if (keys.length === 0) {
     el.innerHTML = '<div class="empty-state">No API keys configured</div>';
     return;
   }
-  const displayKeys = [...keys].sort((a, b) =>
-    (Number(a.priority || 2) - Number(b.priority || 2))
-    || String(a.label).localeCompare(String(b.label))
-  );
+  const now = Date.now();
+  // Priority-preserving sort: priority tier ASC (preferred before normal
+  // before fallback — must match the routing logic in
+  // selectLeastLoadedAvailableKey which fully exhausts tier 1 before tier 2).
+  // Within a tier: worst-tone-first, then reset-soonest, then label.
+  // The tone quantization avoids per-second row jitter from raw pace ratios.
+  const displayKeys = typeof window.PaceMath !== 'undefined'
+    ? window.PaceMath.sortKeysForDisplay(keys, now)
+    : [...keys].sort((a, b) =>
+        (Number(a.priority || 2) - Number(b.priority || 2))
+        || String(a.label).localeCompare(String(b.label))
+      );
 
   let html = `<table class="ops-table">
     <thead>
@@ -1199,31 +1503,49 @@ function renderKeys() {
       `Primary limit driver: ${claim}`,
     ].filter(Boolean).join('\n');
     const hasAnyWindow = sortedCapacityWindows(k).length > 0;
+    // For each primary window, build a pace bar (fill = utilization,
+    // tick = time elapsed). The bar IS the "used %" value — fill color
+    // encodes pace relative to elapsed, tick gives the reference line.
     const limitRows = ['unified-5h', 'unified-7d'].map(windowName => {
-      const window = capacityWindow(k, windowName);
+      const w = capacityWindow(k, windowName);
+      const pace = (typeof window.PaceMath !== 'undefined')
+        ? window.PaceMath.computeWindowPace({
+            utilization: w?.utilization,
+            resetAt: w?.resetAt,
+            windowName: windowName,
+            now: now,
+          })
+        : null;
+      const utilPct = pace && pace.utilization !== null ? Math.round(pace.utilization * 100) : null;
+      const elapsedPct = pace && pace.elapsedFrac !== null ? Math.round(pace.elapsedFrac * 100) : null;
+      const tone = pace ? pace.tone : 'dim';
+      const paceText = pace && pace.paceRatio !== null
+        ? `${pace.paceRatio.toFixed(2)}× ${paceLabel(pace.tone, pace.paceRatio)}`
+        : 'no signal yet';
+      const title = w
+        ? `${friendlyWindowName(windowName)} · used ${utilPct === null ? '--' : utilPct + '%'} · elapsed ${elapsedPct === null ? '--' : elapsedPct + '%'} · pace ${paceText}${w.resetAt ? ' · resets in ' + fmtCountdown(w.resetAt - now) : ''}`
+        : `No ${friendlyWindowName(windowName).toLowerCase()} telemetry observed recently.`;
       return {
         label: compactWindowName(windowName),
-        utilization: window?.utilization !== null && window?.utilization !== undefined ? fmtPct(window.utilization) : '--',
-        state: compactWindowStateLabel(window),
-        reset: window?.resetAt ? fmtCountdown(window.resetAt - Date.now()) : '--',
-        title: window ? summarizeWindow(window) : `No ${friendlyWindowName(windowName).toLowerCase()} telemetry observed recently.`,
-        stateClass: limitStateClass(window),
+        utilPct: utilPct,
+        elapsedPct: elapsedPct,
+        tone: tone,
+        reset: w?.resetAt ? fmtCountdown(w.resetAt - now) : '--',
+        title: title,
       };
     });
     const limitsHtml = `<div class="limit-summary">
       <div class="limit-driver" title="${esc(keyMetaTitle)}">driver ${esc(claim)}</div>
-      <div class="limit-matrix">
-        <div class="limit-head">win</div>
-        <div class="limit-head">used</div>
-        <div class="limit-head">state</div>
-        <div class="limit-head">reset</div>
-        ${limitRows.map(row => `
-          <div class="limit-label" title="${esc(row.title)}">${esc(row.label)}</div>
-          <div class="limit-value${row.utilization === '--' ? '-dim' : ''}" title="${esc(row.title)}">${esc(row.utilization)}</div>
-          <div class="limit-value ${esc(row.stateClass)}" title="${esc(row.title)}">${esc(row.state)}</div>
-          <div class="limit-value${row.reset === '--' ? '-dim' : ''}" title="${esc(row.title)}">${esc(row.reset)}</div>
-        `).join('')}
-      </div>
+      ${limitRows.map(row => `
+        <div class="pace-cell" title="${esc(row.title)}">
+          <span class="pace-cell-label">${esc(row.label)}</span>
+          <div class="pace-bar tone-${esc(row.tone)}">
+            <div class="pace-bar-fill" style="width:${row.utilPct === null ? 0 : row.utilPct}%"></div>
+            ${row.elapsedPct === null ? '' : `<div class="pace-bar-tick" style="left:${row.elapsedPct}%"></div>`}
+          </div>
+          <span class="pace-cell-reset">${esc(row.reset)}</span>
+        </div>
+      `).join('')}
       ${hasAnyWindow ? '' : `<div class="table-sub" title="${esc((k.capacity?.normalizedHeaderCount || 0) > 0 ? staleTelemetryNote(k) : 'Awaiting limit headers')}">${esc((k.capacity?.normalizedHeaderCount || 0) > 0 ? staleTelemetryLabel(k) : 'Awaiting limit headers')}</div>`}
     </div>`;
     const keyRef = JSON.stringify(k.maskedKey);
@@ -1447,7 +1769,7 @@ function connectSSE() {
       const event = JSON.parse(e.data);
       // Update keys from any event that carries them
       if (event.keys) {
-        keys = event.keys;
+        keys = mergeDemoFixture(event.keys);
         renderKeys();
         renderHeader();
       }

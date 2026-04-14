@@ -133,6 +133,12 @@ function startProxy(opts: {
       if (url.pathname === "/dashboard/chart.umd.min.js.map") {
         return new Response(null, { status: 204 });
       }
+      if (url.pathname === "/dashboard/pace.js") {
+        return new Response(
+          Bun.file(new URL("../public/pace.js", import.meta.url).pathname),
+          { headers: { "content-type": "application/javascript" } },
+        );
+      }
       if (url.pathname === "/favicon.ico") {
         return new Response(null, { status: 204 });
       }
@@ -368,6 +374,33 @@ describe("Dashboard", () => {
   test("GET /dashboard/chart.umd.min.js.map returns 204", async () => {
     const res = await fetch(`${proxy.url}/dashboard/chart.umd.min.js.map`);
     expect(res.status).toBe(204);
+  });
+
+  test("GET /dashboard/pace.js serves the pace-math module", async () => {
+    const res = await fetch(`${proxy.url}/dashboard/pace.js`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("application/javascript");
+    const body = await res.text();
+    // The IIFE wires PaceMath onto the target global. Each named export must
+    // be present — if one is dropped by a refactor, the dashboard silently
+    // breaks. Pin these substrings so the wiring is regression-proof.
+    expect(body).toContain("PaceMath");
+    expect(body).toContain("computeWindowPace");
+    expect(body).toContain("computePoolAggregate");
+    expect(body).toContain("sortKeysForDisplay");
+    expect(body).toContain("upcomingResets");
+  });
+
+  test("dashboard HTML references the pace.js module and has the new widgets", () => {
+    const html = readFileSync(new URL("../public/dashboard.html", import.meta.url), "utf8");
+    // Script tag loads the module before the inline dashboard script.
+    expect(html).toContain('src="/dashboard/pace.js"');
+    // Reset calendar widget is present.
+    expect(html).toContain('id="reset-calendar"');
+    // Pace bar CSS classes are declared.
+    expect(html).toContain(".pace-bar");
+    expect(html).toContain(".pace-bar-fill");
+    expect(html).toContain(".pace-bar-tick");
   });
 });
 
