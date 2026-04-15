@@ -719,3 +719,132 @@ describe("toneFromPace thresholds", () => {
     expect(PaceMath.toneFromPace(10)).toBe("red");
   });
 });
+
+// ── computeFleetPressureGradient ───────────────────────────────────────────
+
+describe("computeFleetPressureGradient", () => {
+  test("empty keys → all samples dim, no pressure", () => {
+    const result = PaceMath.computeFleetPressureGradient([], "unified-5h", NOW, 10);
+    expect(result.samples.length).toBe(11);
+    for (const s of result.samples) {
+      expect(s.pressure).toBe(0);
+      expect(s.tone).toBe("dim");
+    }
+    expect(result.maxPressureInWindow).toBe(0);
+    expect(result.currentTone).toBe("dim");
+  });
+
+  test("all-coasting fleet → gradient stays dim throughout", () => {
+    // Three keys, each at 10% util with 30% elapsed. Pace 0.33× — coasting.
+    // Projected forward, they'd still be well under 50% at window end.
+    const keys = [
+      mkKey("a", 1, [mkWindow("unified-5h", 0.10, NOW + FIVE_H * 0.7)]),
+      mkKey("b", 1, [mkWindow("unified-5h", 0.10, NOW + FIVE_H * 0.7)]),
+      mkKey("c", 1, [mkWindow("unified-5h", 0.10, NOW + FIVE_H * 0.7)]),
+    ];
+    const result = PaceMath.computeFleetPressureGradient(keys, "unified-5h", NOW, 20);
+    for (const s of result.samples) {
+      expect(s.tone).toBe("dim");
+    }
+    expect(result.maxPressureInWindow).toBeLessThan(0.5);
+  });
+
+  test("one key burning hot → strip lights up before the reset", () => {
+    // util=0.8 at 50% elapsed → pace 1.6. Projected linearly, it hits the
+    // limit before the current window resets. The strip should show orange/red
+    // at some point during the current cycle.
+    const keys = [
+      mkKey("hot", 1, [mkWindow("unified-5h", 0.8, NOW + FIVE_H * 0.5)]),
+    ];
+    const result = PaceMath.computeFleetPressureGradient(keys, "unified-5h", NOW, 60);
+    const hotSamples = result.samples.filter(
+      (s: any) => s.tone === "orange" || s.tone === "red",
+    );
+    expect(hotSamples.length).toBeGreaterThan(0);
+    expect(result.maxPressureInWindow).toBeGreaterThan(0.85);
+  });
+
+  test("reset mid-horizon → pressure drops after the reset sample", () => {
+    // Key at 0.8 util with reset in 1 hour. Burn rate is high. Pressure
+    // should peak near the reset, then drop, then climb again through the
+    // next cycle.
+    const keys = [
+      mkKey("peaky", 1, [mkWindow("unified-5h", 0.8, NOW + FIVE_H * 0.2)]),
+    ];
+    const result = PaceMath.computeFleetPressureGradient(keys, "unified-5h", NOW, 100);
+    // Find a sample right before the reset and one right after.
+    const resetPosition = 0.2; // reset happens at 20% of horizon (1h into 5h)
+    const samplesBeforeReset = result.samples.filter(
+      (s: any) => s.position > 0.15 && s.position < 0.2,
+    );
+    const samplesAfterReset = result.samples.filter(
+      (s: any) => s.position > 0.2 && s.position < 0.25,
+    );
+    expect(samplesBeforeReset.length).toBeGreaterThan(0);
+    expect(samplesAfterReset.length).toBeGreaterThan(0);
+    const maxBefore = Math.max(...samplesBeforeReset.map((s: any) => s.pressure));
+    const minAfter = Math.min(...samplesAfterReset.map((s: any) => s.pressure));
+    expect(minAfter).toBeLessThan(maxBefore);
+  });
+
+  test("dead-zone keys (elapsed < 2%) contribute nothing to pressure", () => {
+    // A key at 5% util with only 1% elapsed would look like pace 5× and
+    // project to catastrophe. Dead-zone rule suppresses this early-window
+    // noise.
+    const keys = [
+      mkKey("early", 1, [mkWindow("unified-5h", 0.05, NOW + FIVE_H * 0.99)]),
+    ];
+    const result = PaceMath.computeFleetPressureGradient(keys, "unified-5h", NOW, 20);
+    expect(result.maxPressureInWindow).toBe(0);
+    for (const s of result.samples) {
+      expect(s.tone).toBe("dim");
+    }
+  });
+
+  test("unknown keys (null utilization) contribute nothing to pressure", () => {
+    // A window present in the list but with no observed utilization is
+    // unknown — it shouldn't project as if it were at 0% either. Just skip.
+    const keys = [
+      mkKey("unknown", 1, [mkWindow("unified-5h", null, NOW + FIVE_H * 0.5)]),
+    ];
+    const result = PaceMath.computeFleetPressureGradient(keys, "unified-5h", NOW, 20);
+    expect(result.maxPressureInWindow).toBe(0);
+  });
+
+  test("sample count honored, positions 0..1", () => {
+    const keys = [
+      mkKey("a", 1, [mkWindow("unified-5h", 0.5, NOW + FIVE_H * 0.5)]),
+    ];
+    const result = PaceMath.computeFleetPressureGradient(keys, "unified-5h", NOW, 30);
+    expect(result.samples.length).toBe(31); // inclusive: sampleCount + 1
+    expect(result.samples[0].position).toBe(0);
+    expect(result.samples[30].position).toBe(1);
+  });
+
+  test("pressureStateWord maps tones to human labels", () => {
+    expect(PaceMath.pressureStateWord("dim")).toBe("Coasting");
+    expect(PaceMath.pressureStateWord("yellow")).toBe("Steady");
+    expect(PaceMath.pressureStateWord("orange")).toBe("Watch");
+    expect(PaceMath.pressureStateWord("red")).toBe("Tight");
+  });
+
+  test("pressureTone bucket boundaries", () => {
+    expect(PaceMath.pressureTone(0.0)).toBe("dim");
+    expect(PaceMath.pressureTone(0.49)).toBe("dim");
+    expect(PaceMath.pressureTone(0.5)).toBe("yellow");
+    expect(PaceMath.pressureTone(0.69)).toBe("yellow");
+    expect(PaceMath.pressureTone(0.7)).toBe("orange");
+    expect(PaceMath.pressureTone(0.84)).toBe("orange");
+    expect(PaceMath.pressureTone(0.85)).toBe("red");
+    expect(PaceMath.pressureTone(1.0)).toBe("red");
+  });
+
+  test("real-data: produces a coasting gradient for the current fleet state", () => {
+    // Real data: all keys at low util → gradient should be entirely dim.
+    const keys = [realMailTill, realOnegc, realTrainly, realGabe];
+    const result5h = PaceMath.computeFleetPressureGradient(keys, "unified-5h", NOW, 30);
+    expect(result5h.currentTone).toBe("dim");
+    const result7d = PaceMath.computeFleetPressureGradient(keys, "unified-7d", NOW, 30);
+    expect(result7d.currentTone).toBe("dim");
+  });
+});

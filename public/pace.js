@@ -342,6 +342,119 @@
     };
   }
 
+  // computeFleetPressureGradient: samples projected fleet pressure across
+  // a single window's horizon (5h or 7d, same length as the window itself).
+  //
+  // For each sample at future time T, we linearly project each key's
+  // utilization forward from its current pace (utilization / elapsed). If
+  // the key's resetAt falls between now and T, the projection resets to 0
+  // at that moment and resumes burning in the fresh cycle at the same
+  // rate. Fleet pressure at T is the MAX projected utilization across
+  // keys — the weakest link decides when the pool is in trouble.
+  //
+  // Dead-zone: a key in the first few minutes of its window has noisy
+  // pace and is excluded from projection. Unknown-headroom keys (no window
+  // observed) contribute nothing — they're treated as "no data, no
+  // pressure to add" rather than optimistic full-budget.
+  //
+  // Returns { samples: [{ position, pressure, tone }], currentTone, maxPressureInWindow }.
+  function computeFleetPressureGradient(keys, windowName, now, sampleCount) {
+    var duration = WINDOW_DURATION_MS[windowName];
+    if (!duration) return { samples: [], currentTone: 'dim', maxPressureInWindow: 0 };
+    var n = sampleCount && sampleCount > 0 ? Math.floor(sampleCount) : 60;
+    var keysArr = Array.isArray(keys) ? keys : [];
+    var nowMs = Number(now);
+
+    // Pre-compute per-key burn rates once. Burn rate = util per ms,
+    // derived from the current cycle's util / elapsed-ms.
+    var active = [];
+    for (var i = 0; i < keysArr.length; i++) {
+      var k = keysArr[i];
+      var w = findWindow(k, windowName);
+      if (!w) continue;
+      if (w.utilization === null || w.utilization === undefined) continue;
+      if (w.resetAt === null || w.resetAt === undefined) continue;
+
+      var util = Math.max(0, Math.min(1, Number(w.utilization)));
+      var resetAt = Number(w.resetAt);
+      var elapsedMs = duration - (resetAt - nowMs);
+      if (elapsedMs <= 0) continue; // hasn't started yet somehow
+
+      var elapsedFrac = elapsedMs / duration;
+      // Dead-zone: ignore keys too early in the window to have meaningful
+      // pace. Same thresholds as computeWindowPace.
+      if (elapsedFrac < DEAD_ZONE.minElapsedFrac) continue;
+      if (elapsedMs < DEAD_ZONE.minElapsedMs) continue;
+      if (util < DEAD_ZONE.minUtilization) continue;
+
+      active.push({
+        utilNow: util,
+        resetAt: resetAt,
+        burnPerMs: util / elapsedMs,
+      });
+    }
+
+    var maxPressureInWindow = 0;
+    var samples = [];
+    var horizonMs = duration;
+
+    for (var s = 0; s <= n; s++) {
+      var position = s / n;
+      var t = nowMs + position * horizonMs;
+      var fleetPressure = 0;
+
+      for (var j = 0; j < active.length; j++) {
+        var a = active[j];
+        var sampleUtil;
+        if (t >= a.resetAt) {
+          // Post-reset: fresh cycle since a.resetAt. Carry forward the
+          // same burn rate into the new cycle.
+          var msIntoNewCycle = t - a.resetAt;
+          sampleUtil = a.burnPerMs * msIntoNewCycle;
+        } else {
+          // Still in current cycle.
+          var msElapsedAtT = duration - (a.resetAt - t);
+          sampleUtil = a.burnPerMs * msElapsedAtT;
+        }
+        if (sampleUtil > 1) sampleUtil = 1;
+        if (sampleUtil < 0) sampleUtil = 0;
+        if (sampleUtil > fleetPressure) fleetPressure = sampleUtil;
+      }
+
+      if (fleetPressure > maxPressureInWindow) maxPressureInWindow = fleetPressure;
+      samples.push({
+        position: position,
+        pressure: fleetPressure,
+        tone: pressureTone(fleetPressure),
+      });
+    }
+
+    var currentTone = samples.length > 0 ? samples[0].tone : 'dim';
+    return {
+      samples: samples,
+      currentTone: currentTone,
+      maxPressureInWindow: maxPressureInWindow,
+    };
+  }
+
+  // Fleet pressure → one-word state. Distinct from the individual-key
+  // `paceFromTone` buckets; this one lives on the pool aggregate and
+  // uses fleet-wide thresholds that feel right on a gradient strip.
+  function pressureTone(pressure) {
+    if (pressure < 0.5)  return 'dim';    // coasting — lots of headroom
+    if (pressure < 0.7)  return 'yellow'; // steady — still comfortable
+    if (pressure < 0.85) return 'orange'; // watch — close to the line
+    return 'red';                          // tight — will hit the limit
+  }
+
+  function pressureStateWord(tone) {
+    if (tone === 'dim')    return 'Coasting';
+    if (tone === 'yellow') return 'Steady';
+    if (tone === 'orange') return 'Watch';
+    if (tone === 'red')    return 'Tight';
+    return 'Unknown';
+  }
+
   // demoFixture: seven synthetic keys covering every tone bucket and a
   // reset-soon case, for visual QA via ?pace-demo=1. Not used by tests
   // directly — tests use purpose-built fixtures — but kept here so the
@@ -429,6 +542,9 @@
     DEAD_ZONE: DEAD_ZONE,
     computeWindowPace: computeWindowPace,
     computePoolAggregate: computePoolAggregate,
+    computeFleetPressureGradient: computeFleetPressureGradient,
+    pressureTone: pressureTone,
+    pressureStateWord: pressureStateWord,
     sortKeysForDisplay: sortKeysForDisplay,
     upcomingResets: upcomingResets,
     demoFixture: demoFixture,

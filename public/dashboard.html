@@ -221,101 +221,61 @@
   .pace-cell-label { color: var(--text-bright); font-weight: 600; }
   .pace-cell-reset { color: var(--text-dim); text-align: right; white-space: nowrap; }
 
-  /* Pool widget — one per window, sits in the capacity-window-summary grid */
-  .pool-widget {
+  /* Fleet pressure — one horizontal gradient strip per window (5h, 7d).
+     Color at each x position encodes projected fleet pressure at that
+     future moment. The state word on the left is the hero: one glance
+     tells you whether the fleet is fine or in trouble, no reading. */
+  .fleet-pressure {
+    display: flex; flex-direction: column; gap: 14px;
+    padding: 14px 16px;
     background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
-    padding: 10px 12px;
+    font-feature-settings: "tnum" 1, "zero" 1;
   }
-  .pool-widget-head {
-    display: flex; justify-content: space-between; gap: 8px; align-items: baseline;
-    margin-bottom: 6px;
+  .fleet-pressure-row {
+    display: grid;
+    grid-template-columns: 32px minmax(90px, auto) 1fr auto;
+    align-items: center;
+    gap: 4px 14px;
   }
-  .pool-widget-name { color: var(--text-bright); font-weight: 600; font-size: 12px; }
-  .pool-widget-reset { color: var(--text-dim); font-size: 11px; }
-  .pool-widget-bar {
-    position: relative; height: 10px; border-radius: 4px; background: var(--bg3);
-    overflow: visible; margin-bottom: 6px;
+  .fleet-pressure-label {
+    font-size: 11px; font-weight: 600; letter-spacing: 0.1em;
+    text-transform: uppercase; color: var(--text-dim);
   }
-  .pool-widget-bar-fill { height: 100%; border-radius: 4px; transition: width 0.3s, background 0.3s; }
-  .pool-widget-bar.tone-dim    .pool-widget-bar-fill { background: var(--text-dim); }
-  .pool-widget-bar.tone-green  .pool-widget-bar-fill { background: var(--green); }
-  .pool-widget-bar.tone-yellow .pool-widget-bar-fill { background: var(--yellow); }
-  .pool-widget-bar.tone-orange .pool-widget-bar-fill { background: #ffa657; }
-  .pool-widget-bar.tone-red    .pool-widget-bar-fill { background: var(--red); }
-  .pool-widget-bar-elapsed {
-    position: absolute; top: -2px; bottom: -2px; width: 2px;
-    background: var(--text-bright); transform: translateX(-1px);
+  .fleet-pressure-state {
+    font-size: 18px; font-weight: 600; letter-spacing: 0.01em;
+    text-transform: uppercase; color: var(--text-dim);
+    transition: color 400ms ease-out;
+  }
+  .fleet-pressure-state.tone-dim    { color: var(--green); }
+  .fleet-pressure-state.tone-yellow { color: var(--yellow); }
+  .fleet-pressure-state.tone-orange { color: #ffa657; }
+  .fleet-pressure-state.tone-red    { color: var(--red); }
+  .fleet-pressure-strip {
+    position: relative; height: 18px;
+    border-radius: 3px; background: var(--bg3);
+    overflow: hidden;
+    min-width: 160px;
+  }
+  .fleet-pressure-strip-fill {
+    position: absolute; inset: 0;
+    transition: background 800ms ease-out;
+  }
+  .fleet-pressure-strip-now {
+    position: absolute; top: -2px; bottom: -2px; left: 0; width: 2px;
+    background: var(--text-bright); opacity: 0.8;
     border-radius: 1px;
+    pointer-events: none;
   }
-  .pool-widget-bar-max {
-    position: absolute; top: -3px; bottom: -3px; width: 2px;
-    background: var(--red); transform: translateX(-1px);
-    border-radius: 1px; opacity: 0.7;
+  .fleet-pressure-caption {
+    font-size: 11px; color: var(--text-dim); white-space: nowrap;
   }
-  .pool-widget-stats {
-    display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: 2px 10px; font-size: 11px; color: var(--text-dim);
+  .fleet-pressure-caption b { color: var(--text); font-weight: 500; }
+  .fleet-pressure-horizon {
+    font-size: 10px; color: var(--text-dim); letter-spacing: 0.05em;
+    text-align: right;
   }
-  .pool-widget-stats b { color: var(--text); }
-  .pool-widget-pace {
-    font-size: 10px; color: var(--text-dim); margin-top: 4px;
-  }
-  .pool-widget-pace b { color: var(--text); }
-
-  /* Reset calendar — two proportional tracks (5h, 7d).
-     Track and axis share the same parent's width so positions align to the
-     pixel: neither element has a border/padding that would shift the
-     coordinate system. */
-  .reset-calendar {
-    margin-top: 12px; padding: 10px 12px; background: var(--bg);
-    border: 1px solid var(--border); border-radius: 6px;
-  }
-  .reset-calendar-head {
-    display: flex; justify-content: space-between; align-items: baseline;
-    margin-bottom: 10px;
-  }
-  .reset-calendar-title { color: var(--text-bright); font-weight: 600; font-size: 12px; }
-  .reset-calendar-range { color: var(--text-dim); font-size: 11px; }
-  .reset-calendar-row {
-    display: flex; align-items: flex-start; gap: 10px; margin-bottom: 10px;
-  }
-  .reset-calendar-row:last-of-type { margin-bottom: 0; }
-  .reset-calendar-row-label {
-    width: 72px; flex-shrink: 0; color: var(--text-dim); font-size: 10px;
-    padding-top: 4px;
-  }
-  .reset-calendar-row-body { flex: 1; position: relative; min-width: 0; }
-  .reset-calendar-track {
-    position: relative; height: 14px; background: var(--bg3); border-radius: 3px;
-  }
-  .reset-tick {
-    position: absolute; top: 0; bottom: 0; width: 2px;
-    transform: translateX(-1px); border-radius: 1px;
-  }
-  .reset-tick.tone-dim    { background: var(--text-dim); }
-  .reset-tick.tone-green  { background: var(--green); }
-  .reset-tick.tone-yellow { background: var(--yellow); }
-  .reset-tick.tone-orange { background: #ffa657; }
-  .reset-tick.tone-red    { background: var(--red); }
-  .reset-calendar-axis {
-    position: relative; height: 14px; margin-top: 2px;
-    color: var(--text-dim); font-size: 9px;
-  }
-  .reset-calendar-axis span {
-    position: absolute; top: 0; transform: translateX(-50%); white-space: nowrap;
-  }
-  .reset-calendar-axis span.align-start { transform: translateX(0); }
-  .reset-calendar-axis span.align-end   { transform: translateX(-100%); }
-  .reset-calendar-empty {
-    color: var(--text-dim); font-size: 11px; padding: 4px 0;
-  }
-  .reset-calendar-legend {
-    margin-top: 8px; color: var(--text-dim); font-size: 10px;
-  }
-  .reset-calendar-legend span { display: inline-block; margin-right: 12px; }
-  .reset-calendar-legend .swatch {
-    display: inline-block; width: 8px; height: 8px; border-radius: 2px;
-    margin-right: 3px; vertical-align: middle;
+  .fleet-pressure-empty {
+    font-size: 11px; color: var(--text-dim); padding: 4px 0;
   }
 
   /* Pace-demo banner */
@@ -487,8 +447,7 @@
     <div class="summary-grid" id="capacity-summary-grid">
       <div class="empty-state">No capacity data observed yet</div>
     </div>
-    <div class="window-grid" id="capacity-window-summary"></div>
-    <div id="reset-calendar" class="reset-calendar" style="display:none"></div>
+    <div class="fleet-pressure" id="fleet-pressure"></div>
   </div>
 
   <div class="panel panel-full">
@@ -1257,127 +1216,69 @@ function paceLabel(tone, ratio) {
   return '';
 }
 
-function poolWidgetTitle(summaryWindow, agg) {
-  const bits = [friendlyWindowName(summaryWindow.windowName)];
-  if (agg.meanUtil !== null)   bits.push(`mean ${fmtPct(agg.meanUtil)}`);
-  if (agg.maxUtil !== null)    bits.push(`max ${fmtPct(agg.maxUtil)}`);
-  if (agg.aggregateElapsed !== null) bits.push(`${Math.round(agg.aggregateElapsed * 100)}% window elapsed`);
-  if (agg.aggregatePace !== null) bits.push(`pool pace ${agg.aggregatePace.toFixed(2)}× (${paceLabel(agg.tone, agg.aggregatePace)})`);
-  return bits.join(' · ');
-}
-
-// Reset calendar — two independent proportional timelines (one per window
-// type). Keeping 5h and 7d on the same scale cramped short-window ticks into
-// a sliver whenever a 7d reset was days away. Tick color encodes the
-// projected utilization at reset; clustering = capacity crunch incoming.
-function renderResetCalendar() {
-  const el = document.getElementById('reset-calendar');
+// Fleet pressure renderer — one horizontal gradient strip per window.
+// Color at each x position = projected fleet max utilization at that
+// future moment. Answers "will I be fine for the next 5h / 7d?" at a
+// glance, without reading numbers.
+function renderFleetPressure() {
+  const el = document.getElementById('fleet-pressure');
   if (!el || typeof window.PaceMath === 'undefined') return;
   const now = Date.now();
-  const calendar = window.PaceMath.upcomingResets(keys, now);
-  const tracks = calendar && calendar.tracks ? calendar.tracks : {};
-  const totalTicks = (tracks['unified-5h']?.ticks.length || 0) + (tracks['unified-7d']?.ticks.length || 0);
 
-  if (totalTicks === 0) {
-    el.style.display = 'none';
+  if (!capacitySummary || !capacitySummary.windows || capacitySummary.windows.length === 0) {
+    el.innerHTML = '<div class="fleet-pressure-empty">No rate-limit windows observed yet — waiting for upstream responses.</div>';
     return;
   }
-  el.style.display = '';
 
-  const rowHtml = ['unified-5h', 'unified-7d']
-    .map(name => renderCalendarTrack(tracks[name], now))
-    .join('');
-
-  el.innerHTML = `
-    <div class="reset-calendar-head">
-      <span class="reset-calendar-title">Upcoming resets</span>
-      <span class="reset-calendar-range">${totalTicks} reset(s) on deck</span>
-    </div>
-    ${rowHtml}
-    <div class="reset-calendar-legend">
-      <span><span class="swatch" style="background:var(--text-dim)"></span>coasting</span>
-      <span><span class="swatch" style="background:var(--green)"></span>on pace</span>
-      <span><span class="swatch" style="background:var(--yellow)"></span>slightly ahead</span>
-      <span><span class="swatch" style="background:#ffa657"></span>watch</span>
-      <span><span class="swatch" style="background:var(--red)"></span>burning hot</span>
-    </div>
-  `;
+  const rows = ['unified-5h', 'unified-7d'].map(name => {
+    const summaryWindow = capacitySummary.windows.find(w => w.windowName === name);
+    return fleetPressureRow(name, summaryWindow, now);
+  }).join('');
+  el.innerHTML = rows;
 }
 
-function renderCalendarTrack(track, now) {
-  if (!track) return '';
-  const friendly = friendlyWindowName(track.windowName);
-  const summary = track.ticks.length === 0
-    ? 'no upcoming resets'
-    : `${track.ticks.length} · next ${fmtCountdown(track.ticks[0].resetAt - now)}`;
+function fleetPressureRow(windowName, summaryWindow, now) {
+  const gradient = window.PaceMath.computeFleetPressureGradient(keys, windowName, now);
+  const stateWord = window.PaceMath.pressureStateWord(gradient.currentTone);
+  const shortName = windowName === 'unified-5h' ? '5h' : '7d';
+  const horizonLabel = windowName === 'unified-5h' ? '+5h' : '+7d';
+  const maxPctRaw = gradient.maxPressureInWindow;
+  const maxPct = maxPctRaw > 0 ? Math.round(maxPctRaw * 100) + '%' : '—';
 
-  if (track.ticks.length === 0) {
-    return `
-      <div class="reset-calendar-row">
-        <div class="reset-calendar-row-label">${esc(friendly)}</div>
-        <div class="reset-calendar-row-body">
-          <div class="reset-calendar-empty">No upcoming ${esc(friendly.toLowerCase())} resets</div>
-        </div>
-      </div>
-    `;
+  // Build CSS linear-gradient from the sample points. Each sample becomes
+  // a color stop; the browser interpolates between them smoothly.
+  let stops;
+  if (gradient.samples.length === 0) {
+    stops = 'var(--bg3)';
+  } else {
+    stops = gradient.samples.map(s => {
+      const pct = (s.position * 100).toFixed(2);
+      return `${toneToColor(s.tone)} ${pct}%`;
+    }).join(', ');
+    stops = `linear-gradient(to right, ${stops})`;
   }
 
-  const tickHtml = track.ticks.map(tick => {
-    const pct = Math.max(0, Math.min(100, tick.position * 100));
-    const remaining = Math.max(0, tick.resetAt - now);
-    const utilTxt = tick.utilization === null ? '--' : fmtPct(tick.utilization);
-    const title = `${tick.keyLabel} resets in ${fmtCountdown(remaining)} · ${utilTxt} used · projected ${tick.tone}`;
-    return `<div class="reset-tick tone-${esc(tick.tone)}" style="left:${pct.toFixed(2)}%" title="${esc(title)}"></div>`;
-  }).join('');
-
-  const labels = buildCalendarAxisLabels(track);
-  const axisHtml = labels.map(lbl => {
-    const pos = Math.max(0, Math.min(100, ((lbl.at - track.displayStart) / track.span) * 100));
-    // Edge labels align to their edge so they don't get half-clipped.
-    const align = pos < 1 ? ' align-start' : pos > 99 ? ' align-end' : '';
-    return `<span class="${esc(align.trim())}" style="left:${pos.toFixed(2)}%">${esc(lbl.text)}</span>`;
-  }).join('');
+  const title = `${friendlyWindowName(windowName)} — projected fleet pressure over the next ${shortName}. Worst-case key utilization at each future moment; color shifts dim→yellow→orange→red. Peak in window: ${maxPct}.`;
 
   return `
-    <div class="reset-calendar-row">
-      <div class="reset-calendar-row-label" title="${esc(summary)}">${esc(friendly)}</div>
-      <div class="reset-calendar-row-body">
-        <div class="reset-calendar-track">${tickHtml}</div>
-        <div class="reset-calendar-axis">${axisHtml}</div>
+    <div class="fleet-pressure-row" title="${esc(title)}">
+      <span class="fleet-pressure-label">${esc(shortName)}</span>
+      <span class="fleet-pressure-state tone-${esc(gradient.currentTone)}">${esc(stateWord)}</span>
+      <div class="fleet-pressure-strip">
+        <div class="fleet-pressure-strip-fill" style="background: ${stops}"></div>
+        <div class="fleet-pressure-strip-now"></div>
       </div>
+      <span class="fleet-pressure-caption">peak <b>${esc(maxPct)}</b> · ${esc(horizonLabel)}</span>
     </div>
   `;
 }
 
-// Axis labels sized to the track's own span. Uses floor bounds so the
-// generated label times never extend past displayEnd (which otherwise
-// stacks a label on the far right that represents nothing).
-function buildCalendarAxisLabels(track) {
-  const ONE_HOUR = 60 * 60 * 1000;
-  const ONE_DAY  = 24 * ONE_HOUR;
-  const span = track.span;
-  const labels = [{ at: track.displayStart, text: 'now' }];
-
-  if (span <= 90 * 60 * 1000) {
-    // < 90 minutes: label every 15 minutes.
-    for (let m = 15; m * 60 * 1000 <= span; m += 15) {
-      labels.push({ at: track.displayStart + m * 60 * 1000, text: `+${m}m` });
-    }
-  } else if (span <= 6 * ONE_HOUR) {
-    for (let h = 1; h * ONE_HOUR <= span; h++) {
-      labels.push({ at: track.displayStart + h * ONE_HOUR, text: `+${h}h` });
-    }
-  } else if (span <= 48 * ONE_HOUR) {
-    const step = span <= 12 * ONE_HOUR ? 3 : 6;
-    for (let h = step; h * ONE_HOUR <= span; h += step) {
-      labels.push({ at: track.displayStart + h * ONE_HOUR, text: `+${h}h` });
-    }
-  } else {
-    for (let d = 1; d * ONE_DAY <= span; d++) {
-      labels.push({ at: track.displayStart + d * ONE_DAY, text: `+${d}d` });
-    }
-  }
-  return labels;
+function toneToColor(tone) {
+  if (tone === 'dim')    return '#3fb950'; // green — coasting
+  if (tone === 'yellow') return '#d29922';
+  if (tone === 'orange') return '#ffa657';
+  if (tone === 'red')    return '#f85149';
+  return '#8b949e';
 }
 
 function renderCapacitySummary() {
@@ -1387,14 +1288,14 @@ function renderCapacitySummary() {
 }
 function renderCapacitySummaryInner() {
   const grid = document.getElementById('capacity-summary-grid');
-  const windowsEl = document.getElementById('capacity-window-summary');
+  const pressureEl = document.getElementById('fleet-pressure');
   const updatedEl = document.getElementById('pool-updated');
   const totalResponses = keys.reduce((sum, key) => sum + (key.capacity?.responseCount || 0), 0);
   const normalizedResponses = keys.reduce((sum, key) => sum + (key.capacity?.normalizedHeaderCount || 0), 0);
   const normalizedPct = totalResponses > 0 ? fmtPct(normalizedResponses / totalResponses) : '--';
   if (!capacitySummary) {
     grid.innerHTML = '<div class="empty-state">No capacity data observed yet</div>';
-    windowsEl.innerHTML = '';
+    if (pressureEl) pressureEl.innerHTML = '';
     updatedEl.textContent = 'No normalized capacity data yet';
     return;
   }
@@ -1430,73 +1331,7 @@ function renderCapacitySummaryInner() {
     `<div class="summary-card"><div class="summary-card-label">${esc(card.label)}</div><div class="summary-card-value">${esc(String(card.value))}</div><div class="summary-card-sub">${esc(card.sub)}</div></div>`
   ).join('');
 
-  if (!capacitySummary.windows || capacitySummary.windows.length === 0) {
-    windowsEl.innerHTML = '<div class="empty-state">No rate-limit windows observed yet</div>';
-    renderResetCalendar();
-    return;
-  }
-
-  // Render one pool widget per primary window (5h and 7d). The math module
-  // computes aggregate pace by taking the mean utilization across reporting
-  // keys, against the max elapsed fraction (the "oldest" window's position),
-  // which matches operator intuition: "how close is the fleet, collectively,
-  // to hitting the wall?"
-  const PRIMARY_WINDOWS = ['unified-5h', 'unified-7d'];
-  const now = Date.now();
-  const renderableWindows = PRIMARY_WINDOWS
-    .map(name => capacitySummary.windows.find(w => w.windowName === name))
-    .filter(Boolean);
-  if (renderableWindows.length === 0) {
-    // No primary windows — fall back to raw summary in a compact form
-    windowsEl.innerHTML = capacitySummary.windows.map(window => `
-      <div class="window-card">
-        <div class="window-card-head">
-          <span class="window-card-name">${esc(humanizeWindowName(window.windowName))}</span>
-          <span class="window-card-reset">${window.nextResetAt ? `reset ${fmtCountdown(window.nextResetAt - Date.now())}` : 'reset --'}</span>
-        </div>
-        <div class="window-card-stats">
-          <span><b>${fmtPct(window.maxUtilization)}</b> max util</span>
-          <span><b>${fmtPct(window.medianUtilization)}</b> median util</span>
-          <span><b>${fmtNum(window.knownKeys)}</b> keys reporting</span>
-        </div>
-      </div>
-    `).join('');
-    renderResetCalendar();
-    return;
-  }
-
-  windowsEl.innerHTML = renderableWindows.map(summaryWindow => {
-    const agg = window.PaceMath.computePoolAggregate(summaryWindow, keys, summaryWindow.windowName, now);
-    const meanPct   = agg.meanUtil === null   ? 0 : Math.round(agg.meanUtil * 100);
-    const maxPct    = agg.maxUtil === null    ? null : Math.round(agg.maxUtil * 100);
-    const elapsedPct = agg.aggregateElapsed === null ? null : Math.round(agg.aggregateElapsed * 100);
-    const paceText = agg.aggregatePace === null
-      ? '—'
-      : (agg.aggregatePace.toFixed(2) + '× ' + paceLabel(agg.tone, agg.aggregatePace));
-    const resetText = summaryWindow.nextResetAt
-      ? `next reset ${fmtCountdown(summaryWindow.nextResetAt - now)}`
-      : 'next reset —';
-    return `
-      <div class="pool-widget" title="${esc(poolWidgetTitle(summaryWindow, agg))}">
-        <div class="pool-widget-head">
-          <span class="pool-widget-name">${esc(friendlyWindowName(summaryWindow.windowName))}</span>
-          <span class="pool-widget-reset">${esc(resetText)}</span>
-        </div>
-        <div class="pool-widget-bar tone-${esc(agg.tone)}">
-          <div class="pool-widget-bar-fill" style="width:${meanPct}%"></div>
-          ${elapsedPct !== null ? `<div class="pool-widget-bar-elapsed" style="left:${elapsedPct}%" title="expected by now: ${elapsedPct}%"></div>` : ''}
-          ${maxPct !== null ? `<div class="pool-widget-bar-max" style="left:${maxPct}%" title="hottest key: ${maxPct}%"></div>` : ''}
-        </div>
-        <div class="pool-widget-stats">
-          <span><b>${fmtPct(agg.meanUtil)}</b> mean</span>
-          <span><b>${fmtPct(agg.maxUtil)}</b> max</span>
-          <span><b>${fmtNum(agg.keysReporting)}</b> keys</span>
-        </div>
-        <div class="pool-widget-pace">Pool pace <b>${esc(paceText)}</b>${elapsedPct !== null ? ` · ${elapsedPct}% of window elapsed` : ''}</div>
-      </div>`;
-  }).join('');
-
-  renderResetCalendar();
+  renderFleetPressure();
 }
 
 // ── Render keys ────────────────────────────────────────────────

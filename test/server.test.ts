@@ -395,9 +395,12 @@ describe("Dashboard", () => {
     const html = readFileSync(new URL("../public/dashboard.html", import.meta.url), "utf8");
     // Script tag loads the module before the inline dashboard script.
     expect(html).toContain('src="/dashboard/pace.js"');
-    // Reset calendar widget is present.
-    expect(html).toContain('id="reset-calendar"');
-    // Pace bar CSS classes are declared.
+    // Fleet pressure widget (replaces both pool-widget cards and the
+    // reset calendar with a single per-window gradient strip).
+    expect(html).toContain('id="fleet-pressure"');
+    expect(html).toContain(".fleet-pressure-row");
+    expect(html).toContain(".fleet-pressure-strip");
+    // Per-key pace bar CSS classes are still declared.
     expect(html).toContain(".pace-bar");
     expect(html).toContain(".pace-bar-fill");
     expect(html).toContain(".pace-bar-tick");
