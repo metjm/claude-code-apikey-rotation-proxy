@@ -205,6 +205,56 @@ const WINDOW_DURATION_MS: Record<string, number> = {
 // it's about to refresh. Using it for reserve-gating would trap us.
 const NEAR_RESET_ELAPSED_THRESHOLD = 0.95;
 
+// Layer 2 spread thresholds — pace-aware probabilistic routing. When the
+// chosen tier is projected to exceed budget (peak at or near 100%), route
+// SOME fraction of new conversations to the next eligible tier instead.
+// Layer 1 only spills when the preferred tier is in cooldown; Layer 2 spills
+// preemptively based on trajectory.
+//
+// Probability scales with projected peak. Deliberately non-linear: no spread
+// at all below 85% peak (noise territory), then a steep ramp, capped at 60%
+// so the preferred tier still takes the majority of traffic even in a crisis
+// — priority order is preserved as a soft preference, not a hard rule.
+const LAYER2_SPREAD_START_PEAK = 0.85;
+const LAYER2_MAX_SPREAD_PROBABILITY = 0.60;
+
+// Dead-zone thresholds for projection — same purpose as in pace.js. A key
+// that's 1% into its window with 5% utilization would project as "hits 500%"
+// which is pure noise. Require enough elapsed time and utilization for the
+// pace to carry real signal.
+const LAYER2_MIN_ELAPSED_FRACTION = 0.02;
+const LAYER2_MIN_ELAPSED_MS = 60 * 1000;
+const LAYER2_MIN_UTILIZATION = 0.01;
+
+// Cap projection at 1.5 to keep the probability function bounded — beyond
+// "projecting to 150% of limit" the signal is just "definitely over" and
+// the extra precision doesn't change the routing decision.
+const LAYER2_PROJECTION_CAP = 1.5;
+
+export function spreadProbabilityFromPeak(peak: number): number {
+  if (peak < LAYER2_SPREAD_START_PEAK) return 0;
+  if (peak < 0.95) return 0.10;
+  if (peak < 1.00) return 0.30;
+  if (peak < 1.20) return 0.50;
+  return LAYER2_MAX_SPREAD_PROBABILITY;
+}
+
+// Deterministic hash of a conversation key into [0, 1). Same conversation
+// always resolves to the same value, so spread decisions are stable for a
+// given conversation — if a conversation's hash puts it in the "spread"
+// bucket, it reliably goes to tier 2 every time its affinity would be
+// re-evaluated, rather than flip-flopping.
+//
+// FNV-1a — fast, uniform enough for this purpose. Not a cryptographic hash.
+export function hashConversationKeyToUnit(key: string): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < key.length; i++) {
+    h ^= key.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0) / 0x100000000;
+}
+
 export class KeyManager {
   private keys: ApiKeyEntry[] = [];
   private tokens: ProxyTokenEntry[] = [];
@@ -220,8 +270,12 @@ export class KeyManager {
   // Not persisted — resets on restart. Serves as live observability for the
   // tier-reserve routing policy ("is traffic actually spilling to tier 2/3?").
   private readonly requestsByTier: Map<number, number> = new Map();
+  // RNG for Layer 2 spread decisions on the no-conversationKey path
+  // (global sticky fallback). Overridable for deterministic tests.
+  private rng: () => number = Math.random;
 
-  constructor(dataDir: string) {
+  constructor(dataDir: string, opts?: { rng?: () => number }) {
+    if (opts?.rng) this.rng = opts.rng;
     this.dbPath = process.env["DB_PATH"] ?? join(dataDir, "state.db");
     mkdirSync(dirname(this.dbPath), { recursive: true });
 
@@ -645,7 +699,7 @@ export class KeyManager {
       }
     }
 
-    const fallback = this.selectLeastLoadedAvailableKey();
+    const fallback = this.selectLeastLoadedAvailableKey(conversationKey);
     if (fallback === null) {
       return {
         entry: null,
@@ -1510,14 +1564,71 @@ export class KeyManager {
     return Math.max(0, 1 - highestUtilization);
   }
 
-  private selectLeastLoadedAvailableKey(): {
+  // Layer 2 projection: max projected-at-reset utilization across the tier's
+  // available keys. Linear projection from each key's current pace
+  // (util / elapsedFraction). Capped at LAYER2_PROJECTION_CAP to keep the
+  // probability curve bounded. Returns null when no key in the tier has
+  // enough data to project — in which case Layer 2 stays silent and Layer 1
+  // is the only force. This is the "tier 1 is unknown" safe default.
+  //
+  // Exposed via test-friendly public wrapper `_testTierProjectedPeak` below.
+  private tierProjectedPeak(tier: number, currentTime: UnixMs): number | null {
+    let peak: number | null = null;
+    for (const entry of this.keys) {
+      if (entry.priority !== tier) continue;
+      if (!this.isKeyAvailable(entry)) continue;
+      for (const window of entry.capacity.windows) {
+        if (window.windowName !== "unified-5h" && window.windowName !== "unified-7d") continue;
+        const duration = WINDOW_DURATION_MS[window.windowName];
+        if (duration === undefined) continue;
+        if (window.utilization === null || window.utilization === undefined) continue;
+        if (window.resetAt === null || window.resetAt === undefined) continue;
+        const elapsedMs = duration - (window.resetAt - currentTime);
+        if (elapsedMs <= 0) continue;
+        const elapsedFraction = elapsedMs / duration;
+        if (elapsedFraction < LAYER2_MIN_ELAPSED_FRACTION) continue;
+        if (elapsedMs < LAYER2_MIN_ELAPSED_MS) continue;
+        if (window.utilization < LAYER2_MIN_UTILIZATION) continue;
+        const projected = Math.min(LAYER2_PROJECTION_CAP, window.utilization / elapsedFraction);
+        if (peak === null || projected > peak) peak = projected;
+      }
+    }
+    return peak;
+  }
+
+  // Decide whether this particular selection should spread to the next
+  // tier. Deterministic given a conversationKey (same conversation =
+  // consistent decision — avoids flap if a conversation re-evaluates).
+  // Random for the no-conversationKey path (proxied tools without an
+  // affinity hint).
+  private shouldSpread(conversationKey: string | null, probability: number): boolean {
+    if (probability <= 0) return false;
+    if (probability >= 1) return true;
+    if (conversationKey !== null && conversationKey !== "") {
+      return hashConversationKeyToUnit(conversationKey) < probability;
+    }
+    return this.rng() < probability;
+  }
+
+  // Public test hooks. Prefixed with underscore to signal "not part of the
+  // public API" while still being reachable from same-package tests. Mirrors
+  // the pattern already used in the test suite for accessing internals.
+  public _testTierProjectedPeak(tier: number, currentTime: UnixMs): number | null {
+    return this.tierProjectedPeak(tier, currentTime);
+  }
+  public _testShouldSpread(conversationKey: string | null, probability: number): boolean {
+    return this.shouldSpread(conversationKey, probability);
+  }
+
+  private selectLeastLoadedAvailableKey(conversationKey: string | null = null): {
     entry: ApiKeyEntry;
     priorityTier: number;
     candidateCount: number;
     conversationCounts: Map<ApiKey, number>;
     /** The tier that would have won under strict priority, if it differs
      *  from the tier actually chosen. Set when a tier was gated out by its
-     *  reserve floor and traffic spilled into a lower tier. Useful for logs. */
+     *  reserve floor OR when Layer 2 pace-awareness preemptively spilled
+     *  traffic to a lower tier. Useful for logs. */
     spilledFromTier: number | null;
     /** Worst-window headroom of the selected key, for log observability. */
     worstHeadroom: number;
@@ -1530,20 +1641,58 @@ export class KeyManager {
     const tiers = Array.from(new Set(available.map((entry) => entry.priority))).sort((a, b) => a - b);
     const strictBestTier = tiers[0]!;
 
-    // Walk tiers ascending; first tier with keys above its reserve floor wins.
+    // Layer 1: walk tiers ascending, find the first tier with any key that
+    // clears its reserve floor. Keys below their tier's floor are held in
+    // reserve so we don't burn through the "backup" tiers casually.
+    const eligibleByTier = new Map<number, ApiKeyEntry[]>();
+    let chosenTier: number | null = null;
     for (const tier of tiers) {
       const floor = TIER_RESERVE_HEADROOM[tier] ?? 0;
       const eligible = available.filter(
         (entry) => entry.priority === tier && this.worstHeadroom(entry, currentTime) >= floor,
       );
       if (eligible.length === 0) continue;
-      const candidates = this.sortCandidatesForSelection(eligible, conversationCounts);
+      eligibleByTier.set(tier, eligible);
+      if (chosenTier === null) chosenTier = tier;
+    }
+
+    if (chosenTier !== null) {
+      // Layer 2: if the chosen tier is projected to exceed its budget before
+      // the window resets, there's a chance we route this request to the
+      // next-eligible tier instead. Spread probability scales with projected
+      // peak — the closer the tier is to blowing past 100%, the more we lean
+      // on the backup tiers. Tier priority is still a SOFT preference:
+      // maximum spread is capped so the preferred tier keeps the majority.
+      const peak = this.tierProjectedPeak(chosenTier, currentTime);
+      if (peak !== null && peak >= LAYER2_SPREAD_START_PEAK) {
+        const probability = spreadProbabilityFromPeak(peak);
+        if (this.shouldSpread(conversationKey, probability)) {
+          for (const nextTier of tiers) {
+            if (nextTier <= chosenTier) continue;
+            const nextEligible = eligibleByTier.get(nextTier);
+            if (!nextEligible || nextEligible.length === 0) continue;
+            const nextCandidates = this.sortCandidatesForSelection(nextEligible, conversationCounts);
+            return {
+              entry: nextCandidates[0]!,
+              priorityTier: nextTier,
+              candidateCount: nextCandidates.length,
+              conversationCounts,
+              spilledFromTier: chosenTier,
+              worstHeadroom: this.worstHeadroom(nextCandidates[0]!, currentTime),
+            };
+          }
+          // No lower tier had eligible keys — fall through to the chosen tier.
+        }
+      }
+
+      const chosenEligible = eligibleByTier.get(chosenTier)!;
+      const candidates = this.sortCandidatesForSelection(chosenEligible, conversationCounts);
       return {
         entry: candidates[0]!,
-        priorityTier: tier,
+        priorityTier: chosenTier,
         candidateCount: candidates.length,
         conversationCounts,
-        spilledFromTier: tier !== strictBestTier ? strictBestTier : null,
+        spilledFromTier: chosenTier !== strictBestTier ? strictBestTier : null,
         worstHeadroom: this.worstHeadroom(candidates[0]!, currentTime),
       };
     }

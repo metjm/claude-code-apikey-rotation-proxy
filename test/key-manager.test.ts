@@ -9,7 +9,11 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { KeyManager } from "../src/key-manager.ts";
+import {
+  KeyManager,
+  spreadProbabilityFromPeak,
+  hashConversationKeyToUnit,
+} from "../src/key-manager.ts";
 import type {
   ApiKeyEntry,
   ProxyTokenEntry,
@@ -1777,5 +1781,561 @@ describe("tier-reserve routing (headroom floors)", () => {
     const second = km.getKeyForConversation(null);
     km.recordRequest(second.entry!);
     expect(km.getRequestsByTier()).toEqual({ "1": 2 });
+  });
+});
+
+// ── Layer 2 pace-aware spreading ───────────────────────────────────────────
+
+describe("spreadProbabilityFromPeak (pure function)", () => {
+  test("below 85% peak → no spread", () => {
+    expect(spreadProbabilityFromPeak(0.0)).toBe(0);
+    expect(spreadProbabilityFromPeak(0.5)).toBe(0);
+    expect(spreadProbabilityFromPeak(0.849)).toBe(0);
+  });
+
+  test("85-95% peak → 10% spread", () => {
+    expect(spreadProbabilityFromPeak(0.85)).toBe(0.10);
+    expect(spreadProbabilityFromPeak(0.90)).toBe(0.10);
+    expect(spreadProbabilityFromPeak(0.949)).toBe(0.10);
+  });
+
+  test("95-100% peak → 30% spread", () => {
+    expect(spreadProbabilityFromPeak(0.95)).toBe(0.30);
+    expect(spreadProbabilityFromPeak(0.99)).toBe(0.30);
+  });
+
+  test("100-120% peak → 50% spread", () => {
+    expect(spreadProbabilityFromPeak(1.0)).toBe(0.50);
+    expect(spreadProbabilityFromPeak(1.1)).toBe(0.50);
+    expect(spreadProbabilityFromPeak(1.19)).toBe(0.50);
+  });
+
+  test(">=120% peak → 60% spread (capped)", () => {
+    expect(spreadProbabilityFromPeak(1.2)).toBe(0.60);
+    expect(spreadProbabilityFromPeak(1.5)).toBe(0.60);
+    expect(spreadProbabilityFromPeak(10)).toBe(0.60);
+  });
+
+  test("never exceeds 0.60 — preferred tier always retains the majority", () => {
+    for (let p = 0; p <= 5; p += 0.1) {
+      expect(spreadProbabilityFromPeak(p)).toBeLessThanOrEqual(0.60);
+    }
+  });
+});
+
+describe("hashConversationKeyToUnit (pure function)", () => {
+  test("returns [0, 1)", () => {
+    for (const key of ["a", "alice:session", "user-42", "", "long-session-id-with-dashes-and-uuid-1234"]) {
+      const h = hashConversationKeyToUnit(key);
+      expect(h).toBeGreaterThanOrEqual(0);
+      expect(h).toBeLessThan(1);
+    }
+  });
+
+  test("deterministic: same input → same output", () => {
+    const key = "user-alpha:session-beta";
+    expect(hashConversationKeyToUnit(key)).toBe(hashConversationKeyToUnit(key));
+  });
+
+  test("different inputs produce different outputs (reasonably uniform)", () => {
+    const samples = new Set<number>();
+    for (let i = 0; i < 100; i++) {
+      samples.add(hashConversationKeyToUnit(`user-${i}:session-${i}`));
+    }
+    // Very loose uniformity check — 100 distinct inputs shouldn't collide much.
+    expect(samples.size).toBeGreaterThan(95);
+  });
+
+  test("distribution is roughly uniform across 10 buckets for 10000 keys", () => {
+    const buckets = new Array(10).fill(0);
+    for (let i = 0; i < 10000; i++) {
+      const h = hashConversationKeyToUnit(`conv-${i}:sess-${i * 7 + 11}`);
+      buckets[Math.floor(h * 10)]++;
+    }
+    // Each bucket should hold roughly 1000; allow ±250 before we call it uneven.
+    for (const count of buckets) {
+      expect(count).toBeGreaterThan(750);
+      expect(count).toBeLessThan(1250);
+    }
+  });
+});
+
+describe("tierProjectedPeak (Layer 2 projection)", () => {
+  const FIVE_H_MS = 5 * 60 * 60 * 1000;
+  const SEVEN_D_MS = 7 * 24 * 60 * 60 * 1000;
+
+  function addKeyWithCapacity(
+    km: KeyManager,
+    rawKey: string,
+    label: string,
+    priority: number,
+    windows: Array<{ windowName: string; util: number; resetIn: number }>,
+  ): void {
+    km.addKey(rawKey, label);
+    km.updateKeyPriority(rawKey, priority);
+    const entry = (km as unknown as { keys: Array<{ key: string } & Record<string, unknown>> })
+      .keys.find((e) => e.key === rawKey)!;
+    const nowMs = Date.now();
+    km.recordCapacityObservation(entry as never, {
+      seenAt: unixMs(nowMs),
+      httpStatus: 200,
+      windows: windows.map((w) => ({
+        windowName: w.windowName,
+        status: "allowed",
+        utilization: w.util,
+        resetAt: unixMs(nowMs + w.resetIn),
+      })),
+    });
+  }
+
+  function getPeak(km: KeyManager, tier: number): number | null {
+    return (km as unknown as {
+      _testTierProjectedPeak: (t: number, n: number) => number | null;
+    })._testTierProjectedPeak(tier, Date.now());
+  }
+
+  test("no keys in tier → null", () => {
+    const km = create();
+    expect(getPeak(km, 1)).toBeNull();
+  });
+
+  test("key with no observed windows → null (no data to project)", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "fresh");
+    km.updateKeyPriority(VALID_KEY_1, 1);
+    expect(getPeak(km, 1)).toBeNull();
+  });
+
+  test("on-pace key (util ~= elapsed) → peak near 1.0", () => {
+    const km = create();
+    // util 0.60 at 60% elapsed (resetIn = 40% of window remaining)
+    addKeyWithCapacity(km, VALID_KEY_1, "on-pace", 1, [
+      { windowName: "unified-5h", util: 0.60, resetIn: FIVE_H_MS * 0.40 },
+    ]);
+    const peak = getPeak(km, 1);
+    expect(peak).not.toBeNull();
+    expect(peak!).toBeCloseTo(1.0, 1);
+  });
+
+  test("ahead-of-pace key → peak > 1.0 (projected to bust budget, below cap)", () => {
+    const km = create();
+    // util 0.45 at 40% elapsed (remaining 60%) → pace 1.125 → projected 1.125
+    // (kept below the 1.5 cap so we're testing raw projection, not clamping)
+    addKeyWithCapacity(km, VALID_KEY_1, "hot", 1, [
+      { windowName: "unified-5h", util: 0.45, resetIn: FIVE_H_MS * 0.60 },
+    ]);
+    const peak = getPeak(km, 1);
+    expect(peak).not.toBeNull();
+    expect(peak!).toBeGreaterThan(1.0);
+    expect(peak!).toBeLessThan(1.5);
+  });
+
+  test("projection capped at LAYER2_PROJECTION_CAP (1.5)", () => {
+    const km = create();
+    // Extreme pace: util 0.5 at 10% elapsed → pace 5 → projects to 5.0, capped to 1.5
+    addKeyWithCapacity(km, VALID_KEY_1, "extreme", 1, [
+      { windowName: "unified-5h", util: 0.5, resetIn: FIVE_H_MS * 0.90 },
+    ]);
+    expect(getPeak(km, 1)!).toBe(1.5);
+  });
+
+  test("dead-zone skip: util 0.05 at 1% elapsed → ignored (no peak)", () => {
+    const km = create();
+    addKeyWithCapacity(km, VALID_KEY_1, "early", 1, [
+      { windowName: "unified-5h", util: 0.05, resetIn: FIVE_H_MS * 0.99 },
+    ]);
+    expect(getPeak(km, 1)).toBeNull();
+  });
+
+  test("picks the MAX across keys in tier", () => {
+    const km = create();
+    addKeyWithCapacity(km, VALID_KEY_1, "chill", 1, [
+      { windowName: "unified-5h", util: 0.20, resetIn: FIVE_H_MS * 0.40 }, // pace 0.33
+    ]);
+    addKeyWithCapacity(km, VALID_KEY_2, "hot", 1, [
+      { windowName: "unified-5h", util: 0.80, resetIn: FIVE_H_MS * 0.60 }, // pace 2.0
+    ]);
+    const peak = getPeak(km, 1);
+    // Capped at 1.5 (from the hot key, pace 2.0)
+    expect(peak).toBe(1.5);
+  });
+
+  test("considers both 5h and 7d windows — picks whichever projects higher", () => {
+    const km = create();
+    addKeyWithCapacity(km, VALID_KEY_1, "mixed", 1, [
+      { windowName: "unified-5h", util: 0.10, resetIn: FIVE_H_MS * 0.90 }, // pace 1.0
+      { windowName: "unified-7d", util: 0.80, resetIn: SEVEN_D_MS * 0.20 }, // pace 1.0
+    ]);
+    const peak = getPeak(km, 1)!;
+    expect(peak).toBeCloseTo(1.0, 1);
+  });
+
+  test("ignores keys at other tiers", () => {
+    const km = create();
+    addKeyWithCapacity(km, VALID_KEY_1, "tier-1-chill", 1, [
+      { windowName: "unified-5h", util: 0.10, resetIn: FIVE_H_MS * 0.40 }, // pace 0.17
+    ]);
+    addKeyWithCapacity(km, VALID_KEY_2, "tier-2-hot", 2, [
+      { windowName: "unified-5h", util: 0.90, resetIn: FIVE_H_MS * 0.60 }, // pace 2.25
+    ]);
+    // Tier 1 has only the chill key — peak low.
+    const tier1Peak = getPeak(km, 1)!;
+    expect(tier1Peak).toBeLessThan(0.3);
+    // Tier 2 has only the hot key — peak high.
+    const tier2Peak = getPeak(km, 2)!;
+    expect(tier2Peak).toBeGreaterThan(1.0);
+  });
+
+  test("ignores keys in cooldown", () => {
+    const km = create();
+    const hot = addKeyWithCapacity(km, VALID_KEY_1, "cooling", 1, [
+      { windowName: "unified-5h", util: 0.90, resetIn: FIVE_H_MS * 0.60 },
+    ]);
+    void hot;
+    const rawEntry = (km as unknown as { keys: Array<{ key: string; availableAt: number }> })
+      .keys.find((e) => e.key === VALID_KEY_1)!;
+    rawEntry.availableAt = Date.now() + 60000; // 1min cooldown
+    expect(getPeak(km, 1)).toBeNull();
+  });
+});
+
+describe("shouldSpread decision (deterministic per conversation)", () => {
+  function check(km: KeyManager, key: string | null, prob: number): boolean {
+    return (km as unknown as {
+      _testShouldSpread: (k: string | null, p: number) => boolean;
+    })._testShouldSpread(key, prob);
+  }
+
+  test("probability 0 → always false", () => {
+    const km = create();
+    expect(check(km, "any", 0)).toBe(false);
+    expect(check(km, null, 0)).toBe(false);
+  });
+
+  test("probability 1 → always true", () => {
+    const km = create();
+    expect(check(km, "any", 1)).toBe(true);
+    expect(check(km, null, 1)).toBe(true);
+  });
+
+  test("same conversation → consistent answer across many calls", () => {
+    const km = create();
+    const key = "user-42:session-abc";
+    const first = check(km, key, 0.30);
+    for (let i = 0; i < 100; i++) {
+      expect(check(km, key, 0.30)).toBe(first);
+    }
+  });
+
+  test("hashed distribution tracks probability (conversation path)", () => {
+    const km = create();
+    let trueCount = 0;
+    const n = 5000;
+    for (let i = 0; i < n; i++) {
+      if (check(km, `conv-${i}:sess-${i * 3 + 7}`, 0.30)) trueCount++;
+    }
+    const ratio = trueCount / n;
+    // 30% probability over a 5000-sample hash should land within ±3%.
+    expect(ratio).toBeGreaterThan(0.27);
+    expect(ratio).toBeLessThan(0.33);
+  });
+
+  test("rng override drives the no-conversationKey path", () => {
+    // Always-0.9 rng → never below 0.3 → never true
+    const kmAlwaysHigh = new KeyManager(tempDir, { rng: () => 0.9 });
+    managers.push(kmAlwaysHigh);
+    expect(check(kmAlwaysHigh, null, 0.30)).toBe(false);
+    // Always-0.1 rng → always below 0.3 → always true
+    const tempDir2 = mkdtempSync(join(tmpdir(), "km-rng-2-"));
+    const kmAlwaysLow = new KeyManager(tempDir2, { rng: () => 0.1 });
+    managers.push(kmAlwaysLow);
+    expect(check(kmAlwaysLow, null, 0.30)).toBe(true);
+    rmSync(tempDir2, { recursive: true, force: true });
+  });
+});
+
+describe("Layer 2 integration — pace-aware tier spreading", () => {
+  const FIVE_H_MS = 5 * 60 * 60 * 1000;
+
+  function seedCapacity(
+    km: KeyManager,
+    rawKey: string,
+    windows: Array<{ windowName: string; util: number; resetIn: number }>,
+  ): void {
+    const entry = (km as unknown as { keys: Array<{ key: string } & Record<string, unknown>> })
+      .keys.find((e) => e.key === rawKey)!;
+    km.recordCapacityObservation(entry as never, {
+      seenAt: unixMs(Date.now()),
+      httpStatus: 200,
+      windows: windows.map((w) => ({
+        windowName: w.windowName,
+        status: "allowed",
+        utilization: w.util,
+        resetAt: unixMs(Date.now() + w.resetIn),
+      })),
+    });
+  }
+
+  test("low-peak tier 1 → no spread, tier 1 wins (regression on Layer 1 behavior)", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "preferred");
+    km.addKey(VALID_KEY_2, "normal");
+    km.updateKeyPriority(VALID_KEY_1, 1);
+    km.updateKeyPriority(VALID_KEY_2, 2);
+    // Tier 1 at 20% util, 40% elapsed → pace 0.5, peak 0.5 → below 0.85 threshold
+    seedCapacity(km, VALID_KEY_1, [
+      { windowName: "unified-5h", util: 0.20, resetIn: FIVE_H_MS * 0.60 },
+    ]);
+    seedCapacity(km, VALID_KEY_2, [
+      { windowName: "unified-5h", util: 0.10, resetIn: FIVE_H_MS * 0.40 },
+    ]);
+
+    for (let i = 0; i < 100; i++) {
+      const pick = km.getKeyForConversation(`conv-${i}:sess-${i}`);
+      expect(pick.priorityTier).toBe(1);
+      expect(pick.spilledFromTier).toBeNull();
+    }
+  });
+
+  test("high-peak tier 1 → some conversations spread to tier 2 (probability ~30%)", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "preferred-hot");
+    km.addKey(VALID_KEY_2, "normal-ready");
+    km.updateKeyPriority(VALID_KEY_1, 1);
+    km.updateKeyPriority(VALID_KEY_2, 2);
+    // Tier 1 on-pace (pace ~1.0 → projected 0.97, spread prob 0.30)
+    seedCapacity(km, VALID_KEY_1, [
+      { windowName: "unified-5h", util: 0.58, resetIn: FIVE_H_MS * 0.40 },
+    ]);
+    // Tier 2 fresh — passes 30% headroom floor (unknown → optimistic)
+    seedCapacity(km, VALID_KEY_2, [
+      { windowName: "unified-5h", util: 0.05, resetIn: FIVE_H_MS * 0.40 },
+    ]);
+
+    let tier1Count = 0;
+    let tier2Count = 0;
+    for (let i = 0; i < 1000; i++) {
+      const pick = km.getKeyForConversation(`conv-${i}:sess-${i * 13 + 5}`);
+      if (pick.priorityTier === 1) tier1Count++;
+      if (pick.priorityTier === 2) tier2Count++;
+      // Clear affinity so each call re-selects (otherwise the first call per
+      // conversationKey sticks for the next hour).
+      (km as unknown as { conversationAffinities: Map<string, unknown> })
+        .conversationAffinities.clear();
+    }
+    const tier2Ratio = tier2Count / 1000;
+    // Expect ~30% ±3% (hash distribution tested elsewhere at tighter bounds)
+    expect(tier2Ratio).toBeGreaterThan(0.26);
+    expect(tier2Ratio).toBeLessThan(0.34);
+    expect(tier1Count + tier2Count).toBe(1000);
+  });
+
+  test("extreme peak (pace 3x) → higher spread probability (~50%)", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "preferred-crisis");
+    km.addKey(VALID_KEY_2, "normal-ready");
+    km.updateKeyPriority(VALID_KEY_1, 1);
+    km.updateKeyPriority(VALID_KEY_2, 2);
+    // Tier 1 severely ahead of pace: projects to 3x (capped at 1.5) → prob 0.60
+    seedCapacity(km, VALID_KEY_1, [
+      { windowName: "unified-5h", util: 0.60, resetIn: FIVE_H_MS * 0.80 },
+    ]);
+    seedCapacity(km, VALID_KEY_2, [
+      { windowName: "unified-5h", util: 0.05, resetIn: FIVE_H_MS * 0.40 },
+    ]);
+
+    let tier2Count = 0;
+    for (let i = 0; i < 1000; i++) {
+      const pick = km.getKeyForConversation(`conv-${i}:sess-${i * 7 + 3}`);
+      if (pick.priorityTier === 2) tier2Count++;
+      (km as unknown as { conversationAffinities: Map<string, unknown> })
+        .conversationAffinities.clear();
+    }
+    // At pace 3x → projection 3.0 → capped to 1.5 → >=1.2 → prob 0.60
+    const ratio = tier2Count / 1000;
+    expect(ratio).toBeGreaterThan(0.55);
+    expect(ratio).toBeLessThan(0.65);
+  });
+
+  test("high peak but tier 2 below its reserve floor → stays on tier 1", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "preferred-hot");
+    km.addKey(VALID_KEY_2, "normal-also-drained");
+    km.updateKeyPriority(VALID_KEY_1, 1);
+    km.updateKeyPriority(VALID_KEY_2, 2);
+    seedCapacity(km, VALID_KEY_1, [
+      { windowName: "unified-5h", util: 0.80, resetIn: FIVE_H_MS * 0.40 },
+    ]);
+    // Tier 2 at 80% util — headroom 20%, below 30% floor — NOT eligible.
+    seedCapacity(km, VALID_KEY_2, [
+      { windowName: "unified-5h", util: 0.80, resetIn: FIVE_H_MS * 0.40 },
+    ]);
+
+    // All 200 picks should stay on tier 1 (tier 2 gated out).
+    for (let i = 0; i < 200; i++) {
+      const pick = km.getKeyForConversation(`conv-${i}:sess-${i}`);
+      expect(pick.priorityTier).toBe(1);
+    }
+  });
+
+  test("cascade: tier 1 hot, tier 2 ineligible, tier 3 eligible → some spread to tier 3", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "pref-hot");
+    km.addKey(VALID_KEY_2, "normal-drained");
+    km.addKey(VALID_KEY_3, "fallback-fresh");
+    km.updateKeyPriority(VALID_KEY_1, 1);
+    km.updateKeyPriority(VALID_KEY_2, 2);
+    km.updateKeyPriority(VALID_KEY_3, 3);
+    seedCapacity(km, VALID_KEY_1, [
+      { windowName: "unified-5h", util: 0.80, resetIn: FIVE_H_MS * 0.40 },
+    ]);
+    // Tier 2 below 30% floor
+    seedCapacity(km, VALID_KEY_2, [
+      { windowName: "unified-5h", util: 0.80, resetIn: FIVE_H_MS * 0.40 },
+    ]);
+    // Tier 3 fresh, passes 50% floor
+    seedCapacity(km, VALID_KEY_3, [
+      { windowName: "unified-5h", util: 0.05, resetIn: FIVE_H_MS * 0.40 },
+    ]);
+
+    let tier3Count = 0;
+    for (let i = 0; i < 500; i++) {
+      const pick = km.getKeyForConversation(`conv-${i}:sess-${i * 11}`);
+      if (pick.priorityTier === 3) tier3Count++;
+      (km as unknown as { conversationAffinities: Map<string, unknown> })
+        .conversationAffinities.clear();
+    }
+    // Some (but not all) conversations spread all the way to tier 3.
+    expect(tier3Count).toBeGreaterThan(0);
+    expect(tier3Count).toBeLessThan(500);
+  });
+
+  test("spilledFromTier reports the preemptive shift", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "pref");
+    km.addKey(VALID_KEY_2, "normal");
+    km.updateKeyPriority(VALID_KEY_1, 1);
+    km.updateKeyPriority(VALID_KEY_2, 2);
+    // Extreme tier 1 peak so most picks spread.
+    seedCapacity(km, VALID_KEY_1, [
+      { windowName: "unified-5h", util: 0.60, resetIn: FIVE_H_MS * 0.80 },
+    ]);
+    seedCapacity(km, VALID_KEY_2, [
+      { windowName: "unified-5h", util: 0.05, resetIn: FIVE_H_MS * 0.40 },
+    ]);
+
+    let foundSpill = false;
+    for (let i = 0; i < 100; i++) {
+      const pick = km.getKeyForConversation(`conv-${i}:sess-${i}`);
+      if (pick.priorityTier === 2) {
+        expect(pick.spilledFromTier).toBe(1);
+        foundSpill = true;
+      } else {
+        expect(pick.spilledFromTier).toBeNull();
+      }
+      (km as unknown as { conversationAffinities: Map<string, unknown> })
+        .conversationAffinities.clear();
+    }
+    expect(foundSpill).toBe(true);
+  });
+
+  test("conversation affinity wins over Layer 2 — once assigned, stays put", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "pref");
+    km.addKey(VALID_KEY_2, "normal");
+    km.updateKeyPriority(VALID_KEY_1, 1);
+    km.updateKeyPriority(VALID_KEY_2, 2);
+    // Low pace initially — no spread — assigns to tier 1.
+    seedCapacity(km, VALID_KEY_1, [
+      { windowName: "unified-5h", util: 0.10, resetIn: FIVE_H_MS * 0.80 },
+    ]);
+    seedCapacity(km, VALID_KEY_2, [
+      { windowName: "unified-5h", util: 0.05, resetIn: FIVE_H_MS * 0.40 },
+    ]);
+
+    const conversationKey = "sticky-conv:sticky-sess";
+    const firstPick = km.getKeyForConversation(conversationKey);
+    const assignedKey = firstPick.entry!.key;
+    expect(firstPick.priorityTier).toBe(1);
+
+    // Now fake heavy pressure on tier 1.
+    seedCapacity(km, VALID_KEY_1, [
+      { windowName: "unified-5h", util: 0.60, resetIn: FIVE_H_MS * 0.80 },
+    ]);
+
+    // Subsequent calls on the SAME conversation key stick with their assigned
+    // tier-1 key regardless of Layer 2 pressure.
+    for (let i = 0; i < 20; i++) {
+      const pick = km.getKeyForConversation(conversationKey);
+      expect(pick.entry!.key).toBe(assignedKey);
+      expect(pick.priorityTier).toBe(1);
+      expect(pick.routingDecision).toBe("conversation_affinity_hit");
+    }
+  });
+
+  test("no projection data (unknown keys) → Layer 2 silent, Layer 1 behavior preserved", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "pref-unknown");
+    km.addKey(VALID_KEY_2, "normal-unknown");
+    km.updateKeyPriority(VALID_KEY_1, 1);
+    km.updateKeyPriority(VALID_KEY_2, 2);
+    // No seedCapacity calls — both keys have empty capacity.windows.
+
+    // 100% of traffic to tier 1 because (a) Layer 2 can't project anything
+    // without data, (b) tier 1 floor=0 accepts the unknown key.
+    let tier1 = 0;
+    for (let i = 0; i < 100; i++) {
+      const pick = km.getKeyForConversation(`conv-${i}`);
+      if (pick.priorityTier === 1) tier1++;
+    }
+    expect(tier1).toBe(100);
+  });
+
+  test("deterministic replay: running Layer 2 twice with same inputs = identical outcomes", () => {
+    // Use a fixture whose projected peak lands well inside a probability
+    // bucket (0.45 util at 50% elapsed → projected 0.9, in the 0.85-0.95
+    // range → prob 0.10). Values exactly at a bucket boundary can flip
+    // between KeyManager instances due to sub-millisecond time drift
+    // during setup — a real ambiguity in the math, not a bug, so we test
+    // stability in a region where the two sides of the decision agree.
+    const km1 = create();
+    km1.addKey(VALID_KEY_1, "pref");
+    km1.addKey(VALID_KEY_2, "normal");
+    km1.updateKeyPriority(VALID_KEY_1, 1);
+    km1.updateKeyPriority(VALID_KEY_2, 2);
+    seedCapacity(km1, VALID_KEY_1, [
+      { windowName: "unified-5h", util: 0.45, resetIn: FIVE_H_MS * 0.50 },
+    ]);
+    seedCapacity(km1, VALID_KEY_2, [
+      { windowName: "unified-5h", util: 0.05, resetIn: FIVE_H_MS * 0.50 },
+    ]);
+
+    const tempDir2 = mkdtempSync(join(tmpdir(), "km-replay-"));
+    const km2 = new KeyManager(tempDir2);
+    managers.push(km2);
+    km2.addKey(VALID_KEY_1, "pref");
+    km2.addKey(VALID_KEY_2, "normal");
+    km2.updateKeyPriority(VALID_KEY_1, 1);
+    km2.updateKeyPriority(VALID_KEY_2, 2);
+    seedCapacity(km2, VALID_KEY_1, [
+      { windowName: "unified-5h", util: 0.45, resetIn: FIVE_H_MS * 0.50 },
+    ]);
+    seedCapacity(km2, VALID_KEY_2, [
+      { windowName: "unified-5h", util: 0.05, resetIn: FIVE_H_MS * 0.50 },
+    ]);
+
+    const outcomes1: number[] = [];
+    const outcomes2: number[] = [];
+    for (let i = 0; i < 50; i++) {
+      const key = `replay-${i}:sess`;
+      outcomes1.push(km1.getKeyForConversation(key).priorityTier!);
+      (km1 as unknown as { conversationAffinities: Map<string, unknown> })
+        .conversationAffinities.clear();
+      outcomes2.push(km2.getKeyForConversation(key).priorityTier!);
+      (km2 as unknown as { conversationAffinities: Map<string, unknown> })
+        .conversationAffinities.clear();
+    }
+    expect(outcomes1).toEqual(outcomes2);
+    rmSync(tempDir2, { recursive: true, force: true });
   });
 });
