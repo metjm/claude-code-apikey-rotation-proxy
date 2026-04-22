@@ -2896,7 +2896,7 @@ describe("Capacity observation integration", () => {
 });
 
 describe("Day-restricted keys", () => {
-  test("different Claude Code sessions balance across equal-priority keys and stay sticky", async () => {
+  test("Claude Code sessions stay sticky and the bucket-of-3 rotation distributes new sessions across keys", async () => {
     const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
     km.addKey(FAKE_KEY_B, "key-b");
@@ -2908,10 +2908,7 @@ describe("Day-restricted keys", () => {
         key: req.headers.get("x-api-key"),
       });
       return new Response(JSON.stringify({
-        usage: {
-          input_tokens: 1,
-          output_tokens: 1,
-        },
+        usage: { input_tokens: 1, output_tokens: 1 },
       }), {
         status: 200,
         headers: { "content-type": "application/json" },
@@ -2920,51 +2917,35 @@ describe("Day-restricted keys", () => {
 
     const config = makeConfig(mock.url);
 
-    const sessionA1 = await proxyRequest(makeRequest("/v1/messages", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-claude-code-session-id": "session-a",
-      },
-      body: JSON.stringify({ messages: [{ role: "user", content: "a1" }] }),
-    }), km, config, st);
-    expect(sessionA1.kind).toBe("success");
+    async function send(session: string, content: string): Promise<void> {
+      const res = await proxyRequest(makeRequest("/v1/messages", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-claude-code-session-id": session,
+        },
+        body: JSON.stringify({ messages: [{ role: "user", content }] }),
+      }), km, config, st);
+      expect(res.kind).toBe("success");
+    }
 
-    const sessionB1 = await proxyRequest(makeRequest("/v1/messages", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-claude-code-session-id": "session-b",
-      },
-      body: JSON.stringify({ messages: [{ role: "user", content: "b1" }] }),
-    }), km, config, st);
-    expect(sessionB1.kind).toBe("success");
-
-    const sessionA2 = await proxyRequest(makeRequest("/v1/messages", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-claude-code-session-id": "session-a",
-      },
-      body: JSON.stringify({ messages: [{ role: "user", content: "a2" }] }),
-    }), km, config, st);
-    expect(sessionA2.kind).toBe("success");
-
-    const sessionB2 = await proxyRequest(makeRequest("/v1/messages", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-claude-code-session-id": "session-b",
-      },
-      body: JSON.stringify({ messages: [{ role: "user", content: "b2" }] }),
-    }), km, config, st);
-    expect(sessionB2.kind).toBe("success");
+    // First three new sessions land on key-a (bucket fills 3 before rolling),
+    // the fourth new session rolls to key-b.
+    await send("session-a", "a1");
+    await send("session-b", "b1");
+    await send("session-c", "c1");
+    await send("session-d", "d1");
+    // Each session is sticky on follow-ups regardless of routing rules.
+    await send("session-a", "a2");
+    await send("session-d", "d2");
 
     expect(seen).toEqual([
       { session: "session-a", key: FAKE_KEY_A },
-      { session: "session-b", key: FAKE_KEY_B },
+      { session: "session-b", key: FAKE_KEY_A },
+      { session: "session-c", key: FAKE_KEY_A },
+      { session: "session-d", key: FAKE_KEY_B },
       { session: "session-a", key: FAKE_KEY_A },
-      { session: "session-b", key: FAKE_KEY_B },
+      { session: "session-d", key: FAKE_KEY_B },
     ]);
   });
 

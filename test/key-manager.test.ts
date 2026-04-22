@@ -9,11 +9,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import {
-  KeyManager,
-  spreadProbabilityFromPeak,
-  hashConversationKeyToUnit,
-} from "../src/key-manager.ts";
+import { KeyManager } from "../src/key-manager.ts";
 import type {
   ApiKeyEntry,
   ProxyTokenEntry,
@@ -350,13 +346,16 @@ describe("Key CRUD", () => {
       km.addKey(VALID_KEY_1, "a");
       km.addKey(VALID_KEY_2, "b");
 
+      // Bucket-of-3 routing fills A first, so use 4 sessions to land on both.
       expect(km.getKeyForConversation("user-1:session-a", "session-a").entry?.key).toBe(VALID_KEY_1);
-      expect(km.getKeyForConversation("user-1:session-b", "session-b").entry?.key).toBe(VALID_KEY_2);
+      expect(km.getKeyForConversation("user-1:session-b", "session-b").entry?.key).toBe(VALID_KEY_1);
+      expect(km.getKeyForConversation("user-1:session-c", "session-c").entry?.key).toBe(VALID_KEY_1);
+      expect(km.getKeyForConversation("user-1:session-d", "session-d").entry?.key).toBe(VALID_KEY_2);
 
       let keys = km.listKeys().sort((a, b) => String(a.label).localeCompare(String(b.label)));
-      expect(keys.map((key) => key.recentSessions15m.map((session) => session.sessionId))).toEqual([
-        ["session-a"],
-        ["session-b"],
+      expect(keys.map((key) => key.recentSessions15m.map((session) => session.sessionId).sort())).toEqual([
+        ["session-a", "session-b", "session-c"],
+        ["session-d"],
       ]);
 
       fakeNow += 16 * 60 * 1000;
@@ -493,45 +492,52 @@ describe("Key Selection", () => {
     expect(second.routingDecision).toBe("conversation_affinity_hit");
   });
 
-  test("getKeyForConversation() balances different conversations across equal-priority keys", () => {
+  test("getKeyForConversation() fills 3 sessions on one account before rotating to the next", () => {
     const km = create();
     km.addKey(VALID_KEY_1, "a");
     km.addKey(VALID_KEY_2, "b");
 
-    const first = km.getKeyForConversation("user-1:session-a");
-    expect(first.entry?.key).toBe(VALID_KEY_1);
-    km.recordRequest(first.entry!);
-
-    const second = km.getKeyForConversation("user-1:session-b");
-    expect(second.entry?.key).toBe(VALID_KEY_2);
-    km.recordRequest(second.entry!);
-
-    const third = km.getKeyForConversation("user-1:session-c");
-    expect(third.entry?.key).toBe(VALID_KEY_1);
-    expect(third.priorityTier).toBe(2);
+    const picks: string[] = [];
+    for (let i = 0; i < 6; i++) {
+      const pick = km.getKeyForConversation(`user-1:session-${i}`);
+      picks.push(pick.entry!.key);
+      km.recordRequest(pick.entry!);
+    }
+    expect(picks.slice(0, 3).every((k) => k === VALID_KEY_1)).toBe(true);
+    expect(picks.slice(3, 6).every((k) => k === VALID_KEY_2)).toBe(true);
   });
 
-  test("getKeyForConversation() only balances within the best available priority tier", () => {
+  test("getKeyForConversation() skips Normal-tier when it has been demoted to Secondary", () => {
     const km = create();
-    km.addKey(VALID_KEY_1, "preferred-a");
-    km.addKey(VALID_KEY_2, "preferred-b");
-    km.addKey(VALID_KEY_3, "normal-c");
+    const p1 = km.addKey(VALID_KEY_1, "preferred-a");
+    const p2 = km.addKey(VALID_KEY_2, "preferred-b");
+    const n3 = km.addKey(VALID_KEY_3, "normal-c");
     km.updateKeyPriority(VALID_KEY_1, 1);
     km.updateKeyPriority(VALID_KEY_2, 1);
     km.updateKeyPriority(VALID_KEY_3, 2);
+    void p1; void p2;
+    // Push the Normal account above 75% so it drops to Secondary
+    km.recordCapacityObservation(n3, {
+      seenAt: unixMs(Date.now()),
+      httpStatus: 200,
+      windows: [{
+        windowName: "unified-7d",
+        status: "allowed",
+        utilization: 0.80,
+        resetAt: unixMs(Date.now() + 24 * 60 * 60 * 1000),
+      }],
+    });
 
-    const first = km.getKeyForConversation("user-1:session-a");
-    expect(first.entry?.key).toBe(VALID_KEY_1);
-    km.recordRequest(first.entry!);
-
-    const second = km.getKeyForConversation("user-1:session-b");
-    expect(second.entry?.key).toBe(VALID_KEY_2);
-    km.recordRequest(second.entry!);
-
-    const third = km.getKeyForConversation("user-1:session-c");
-    expect([VALID_KEY_1, VALID_KEY_2]).toContain(third.entry?.key);
-    expect(third.entry?.key).not.toBe(VALID_KEY_3);
-    expect(third.priorityTier).toBe(1);
+    const tiers = new Set<number>();
+    const labels = new Set<string>();
+    for (let i = 0; i < 9; i++) {
+      const pick = km.getKeyForConversation(`user-1:session-${i}`);
+      tiers.add(pick.priorityTier!);
+      labels.add(pick.entry!.key);
+      km.recordRequest(pick.entry!);
+    }
+    expect(tiers).toEqual(new Set([1]));
+    expect(labels).toEqual(new Set([VALID_KEY_1, VALID_KEY_2]));
   });
 
   test("getKeyForConversation() remaps a conversation when its assigned key is rate-limited", () => {
@@ -882,15 +888,24 @@ describe("Key priority", () => {
     expect(km.listKeys()[0]!.priority).toBe(3);
   });
 
-  test("getNextAvailableKey() prefers lower priority number", () => {
+  test("getNextAvailableKey() picks Preferred when a hot Fallback would otherwise sit alongside it", () => {
     const km = create();
     const k1 = km.addKey(VALID_KEY_1, "fallback");
     km.addKey(VALID_KEY_2, "preferred");
-    // Make k1 more recently used so it would normally be selected first
     km.recordRequest(k1);
-    // Set k1 to Fallback, k2 to Preferred
     km.updateKeyPriority(VALID_KEY_1, 3);
     km.updateKeyPriority(VALID_KEY_2, 1);
+    // Push fallback above its 50% gate so it drops to Tertiary
+    km.recordCapacityObservation(k1, {
+      seenAt: unixMs(Date.now()),
+      httpStatus: 200,
+      windows: [{
+        windowName: "unified-7d",
+        status: "allowed",
+        utilization: 0.6,
+        resetAt: unixMs(Date.now() + 24 * 60 * 60 * 1000),
+      }],
+    });
     const selected = km.getNextAvailableKey();
     expect(selected).not.toBeNull();
     expect(selected!.key).toBe(VALID_KEY_2);
@@ -927,6 +942,68 @@ describe("Key priority", () => {
     km1.updateKeyPriority(VALID_KEY_1, 3);
     const km2 = trackManager(new KeyManager(tempDir));
     expect(km2.listKeys()[0]!.priority).toBe(3);
+  });
+});
+
+describe("Disabled priority (4)", () => {
+  test("getNextAvailableKey() skips disabled keys entirely", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "disabled-one");
+    km.addKey(VALID_KEY_2, "active");
+    km.updateKeyPriority(VALID_KEY_1, 4);
+
+    const selected = km.getNextAvailableKey();
+    expect(selected?.key).toBe(VALID_KEY_2);
+  });
+
+  test("getNextAvailableKey() returns null when all keys are disabled", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "a");
+    km.addKey(VALID_KEY_2, "b");
+    km.updateKeyPriority(VALID_KEY_1, 4);
+    km.updateKeyPriority(VALID_KEY_2, 4);
+
+    expect(km.getNextAvailableKey()).toBeNull();
+  });
+
+  test("availableCount() excludes disabled keys", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "a");
+    km.addKey(VALID_KEY_2, "b");
+    expect(km.availableCount()).toBe(2);
+
+    km.updateKeyPriority(VALID_KEY_1, 4);
+    expect(km.availableCount()).toBe(1);
+  });
+
+  test("listKeys() reports isAvailable: false for disabled keys", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "off");
+    km.updateKeyPriority(VALID_KEY_1, 4);
+
+    const listed = km.listKeys();
+    expect(listed[0]!.priority).toBe(4);
+    expect(listed[0]!.isAvailable).toBe(false);
+  });
+
+  test("disabled priority persists across reload", () => {
+    const km1 = create();
+    km1.addKey(VALID_KEY_1, "a");
+    km1.updateKeyPriority(VALID_KEY_1, 4);
+
+    const km2 = trackManager(new KeyManager(tempDir));
+    expect(km2.listKeys()[0]!.priority).toBe(4);
+    expect(km2.getNextAvailableKey()).toBeNull();
+  });
+
+  test("re-enabling a disabled key puts it back into rotation", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "a");
+    km.updateKeyPriority(VALID_KEY_1, 4);
+    expect(km.getNextAvailableKey()).toBeNull();
+
+    km.updateKeyPriority(VALID_KEY_1, 2);
+    expect(km.getNextAvailableKey()?.key).toBe(VALID_KEY_1);
   });
 });
 
@@ -1617,725 +1694,1065 @@ describe("close()", () => {
   });
 });
 
-// ── Tier-reserve routing ────────────────────────────────────────────────────
+// ── Pool-based routing (per-account pool assignment + cascade) ─────────────
 
-describe("tier-reserve routing (headroom floors)", () => {
-  // Helper: set a key's capacity to a specific 5h and 7d utilization, with
-  // resets both FIVE_H/2 and SEVEN_D/2 in the future — well clear of the
-  // near-reset threshold so utilization counts.
+describe("Pool-based routing", () => {
   const FIVE_H = 5 * 60 * 60 * 1000;
   const SEVEN_D = 7 * 24 * 60 * 60 * 1000;
+  const VALID_KEY_4 = "sk-ant-api03-dddddddddddddddddddddddddddddddddd";
+  const VALID_KEY_5 = "sk-ant-api03-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 
-  function setUtilization(km: KeyManager, rawKey: string, util5h: number, util7d: number) {
-    const entry = km.listKeys().find((k) => k.label !== undefined);
-    const key = km.listKeys().find((k) => k.maskedKey === mask(rawKey))!;
-    void entry; void key;
-    // Resolve the actual ApiKeyEntry via the internal keys array by label lookup
-    // (tests outside the class don't have direct access). Use a capacity
-    // observation through the public API instead.
-    const label = km.listKeys().find((k) => k.maskedKey.length > 0)?.label;
-    void label;
-    const allKeys = (km as unknown as { keys: Array<{ key: string; label: string } & Record<string, unknown>> }).keys;
-    const internalEntry = allKeys.find((e) => e.key === rawKey)!;
-    km.recordCapacityObservation(internalEntry as never, {
-      seenAt: unixMs(Date.now()),
+  type WindowSpec = { name: "unified-5h" | "unified-7d"; util: number; resetAt?: number };
+  function setWindows(km: KeyManager, entry: ApiKeyEntry, windows: WindowSpec[]): void {
+    const now = Date.now();
+    km.recordCapacityObservation(entry, {
+      seenAt: unixMs(now),
       httpStatus: 200,
-      windows: [
-        { windowName: "unified-5h", status: "allowed", utilization: util5h, resetAt: unixMs(Date.now() + FIVE_H / 2) },
-        { windowName: "unified-7d", status: "allowed", utilization: util7d, resetAt: unixMs(Date.now() + SEVEN_D / 2) },
-      ],
+      windows: windows.map((w) => ({
+        windowName: w.name,
+        status: "allowed",
+        utilization: w.util,
+        resetAt: unixMs(w.resetAt ?? now + (w.name === "unified-5h" ? FIVE_H / 2 : SEVEN_D / 2)),
+      })),
     });
   }
 
-  function mask(key: string): string {
-    // Mirrors maskKey logic in key-manager; tests only use this for lookup.
-    return `${key.slice(0, 14)}...${key.slice(-4)}`;
+  function callAssignPool(km: KeyManager, entry: ApiKeyEntry): "primary" | "secondary" | "tertiary" {
+    return (km as unknown as {
+      assignPool: (e: ApiKeyEntry, t: number) => "primary" | "secondary" | "tertiary";
+    }).assignPool(entry, unixMs(Date.now()));
   }
 
-  test("tier 1 with 0% utilization wins over tier 2 and 3 (baseline)", () => {
-    const km = create();
-    km.addKey(VALID_KEY_1, "preferred");
-    km.addKey(VALID_KEY_2, "normal");
-    km.addKey(VALID_KEY_3, "fallback");
-    km.updateKeyPriority(VALID_KEY_1, 1);
-    km.updateKeyPriority(VALID_KEY_2, 2);
-    km.updateKeyPriority(VALID_KEY_3, 3);
+  // ── assignPool matrix ───────────────────────────────────────────────────
 
-    const pick = km.getKeyForConversation(null);
-    expect(pick.priorityTier).toBe(1);
-    expect(pick.entry!.label).toBe("preferred");
-    expect(pick.spilledFromTier).toBeNull();
-  });
+  describe("assignPool — per-account pool placement", () => {
+    test("Preferred (priority 1) is always Primary even with no telemetry", () => {
+      const km = create();
+      const entry = km.addKey(VALID_KEY_1, "p");
+      km.updateKeyPriority(VALID_KEY_1, 1);
+      expect(callAssignPool(km, entry)).toBe("primary");
+    });
 
-  test("tier 1 over 30% util still wins — no reserve on tier 1", () => {
-    // Tier 1 has no floor, so even at 95% utilization it's preferred over
-    // tier 2. The reserve applies only to 2 and 3.
-    const km = create();
-    km.addKey(VALID_KEY_1, "preferred-hot");
-    km.addKey(VALID_KEY_2, "normal-cold");
-    km.updateKeyPriority(VALID_KEY_1, 1);
-    km.updateKeyPriority(VALID_KEY_2, 2);
-    setUtilization(km, VALID_KEY_1, 0.95, 0.8);
-    setUtilization(km, VALID_KEY_2, 0.05, 0.05);
+    test("Preferred at 99% util on both windows is still Primary", () => {
+      const km = create();
+      const entry = km.addKey(VALID_KEY_1, "p-hot");
+      km.updateKeyPriority(VALID_KEY_1, 1);
+      setWindows(km, entry, [
+        { name: "unified-5h", util: 0.99 },
+        { name: "unified-7d", util: 0.99 },
+      ]);
+      expect(callAssignPool(km, entry)).toBe("primary");
+    });
 
-    const pick = km.getKeyForConversation(null);
-    expect(pick.priorityTier).toBe(1);
-    expect(pick.entry!.label).toBe("preferred-hot");
-  });
+    test("Normal at 0/0 → Primary", () => {
+      const km = create();
+      const entry = km.addKey(VALID_KEY_1, "n");
+      setWindows(km, entry, [
+        { name: "unified-5h", util: 0 },
+        { name: "unified-7d", util: 0 },
+      ]);
+      expect(callAssignPool(km, entry)).toBe("primary");
+    });
 
-  test("tier 2 gated out by 30% floor → spill to tier 3 if tier 3 has ≥50% headroom", () => {
-    // Tier 1 missing. Tier 2 at 75% util (headroom 25%, below 30% floor).
-    // Tier 3 at 30% util (headroom 70%, above 50% floor). Tier 3 wins.
-    // Use a conversationKey so the richer selection path runs and populates
-    // spilledFromTier (non-conversation requests also spill correctly, but
-    // only the conversation path reports the telemetry).
-    const km = create();
-    km.addKey(VALID_KEY_2, "normal-used");
-    km.addKey(VALID_KEY_3, "fallback-fresh");
-    km.updateKeyPriority(VALID_KEY_2, 2);
-    km.updateKeyPriority(VALID_KEY_3, 3);
-    setUtilization(km, VALID_KEY_2, 0.75, 0.20);
-    setUtilization(km, VALID_KEY_3, 0.30, 0.20);
+    test("Normal at 74% weekly + 74% 5h → Primary (just under 75%)", () => {
+      const km = create();
+      const entry = km.addKey(VALID_KEY_1, "n-edge");
+      setWindows(km, entry, [
+        { name: "unified-5h", util: 0.74 },
+        { name: "unified-7d", util: 0.74 },
+      ]);
+      expect(callAssignPool(km, entry)).toBe("primary");
+    });
 
-    const pick = km.getKeyForConversation("user-spill:session-a");
-    expect(pick.entry!.label).toBe("fallback-fresh");
-    expect(pick.priorityTier).toBe(3);
-    expect(pick.spilledFromTier).toBe(2);
-  });
+    test("Normal at exactly 75% weekly → Secondary", () => {
+      const km = create();
+      const entry = km.addKey(VALID_KEY_1, "n-w75");
+      setWindows(km, entry, [
+        { name: "unified-7d", util: 0.75 },
+      ]);
+      expect(callAssignPool(km, entry)).toBe("secondary");
+    });
 
-  test("fallback with 60% utilization is GATED OUT (50% headroom floor)", () => {
-    // Only a tier-3 key exists, at 60% util (headroom 40%, below 50% floor).
-    // Tier 3 is the only tier present, so it goes through fall-through logic
-    // and still gets selected — reserves are a planning signal, not a gate
-    // when there's no alternative.
-    const km = create();
-    km.addKey(VALID_KEY_3, "fallback-below-reserve");
-    km.updateKeyPriority(VALID_KEY_3, 3);
-    setUtilization(km, VALID_KEY_3, 0.60, 0.40);
+    test("Normal at exactly 75% 5h → Secondary", () => {
+      const km = create();
+      const entry = km.addKey(VALID_KEY_1, "n-5h75");
+      setWindows(km, entry, [
+        { name: "unified-5h", util: 0.75 },
+      ]);
+      expect(callAssignPool(km, entry)).toBe("secondary");
+    });
 
-    const pick = km.getKeyForConversation(null);
-    expect(pick.entry!.label).toBe("fallback-below-reserve");
-    expect(pick.priorityTier).toBe(3);
-    // spilledFromTier is null because we didn't shift away from a higher tier —
-    // we fell through the reserve check because every tier was below its floor.
-    expect(pick.spilledFromTier).toBeNull();
-  });
+    test("Normal at 75% on both → Secondary", () => {
+      const km = create();
+      const entry = km.addKey(VALID_KEY_1, "n-both");
+      setWindows(km, entry, [
+        { name: "unified-5h", util: 0.75 },
+        { name: "unified-7d", util: 0.75 },
+      ]);
+      expect(callAssignPool(km, entry)).toBe("secondary");
+    });
 
-  test("existing invariant: preferred tier keys never yield to lower tiers when eligible", () => {
-    // This is the regression-lock against the old "within tier" invariant.
-    // Tier 1 at moderate util (eligible — no floor on tier 1), tier 3 with
-    // pristine headroom. Tier 1 still wins.
-    const km = create();
-    km.addKey(VALID_KEY_1, "preferred-moderate");
-    km.addKey(VALID_KEY_3, "fallback-pristine");
-    km.updateKeyPriority(VALID_KEY_1, 1);
-    km.updateKeyPriority(VALID_KEY_3, 3);
-    setUtilization(km, VALID_KEY_1, 0.50, 0.40);
-    setUtilization(km, VALID_KEY_3, 0.00, 0.00);
+    test("Normal with no capacity windows → Primary (unknown counts as 0)", () => {
+      const km = create();
+      const entry = km.addKey(VALID_KEY_1, "n-fresh");
+      expect(callAssignPool(km, entry)).toBe("primary");
+    });
 
-    const pick = km.getKeyForConversation(null);
-    expect(pick.priorityTier).toBe(1);
-    expect(pick.entry!.label).toBe("preferred-moderate");
-    expect(pick.spilledFromTier).toBeNull();
-  });
-
-  test("windows near reset (>=95% elapsed) don't count against headroom", () => {
-    // A key at 90% utilization with 1 minute until reset isn't "nearly out" —
-    // it's about to refresh. Near-reset windows should be ignored for the
-    // headroom check, so such a key stays eligible.
-    const km = create();
-    km.addKey(VALID_KEY_2, "normal-about-to-reset");
-    km.updateKeyPriority(VALID_KEY_2, 2);
-    km.recordCapacityObservation(
-      (km as unknown as { keys: Array<{ key: string } & Record<string, unknown>> })
-        .keys.find((e) => e.key === VALID_KEY_2)! as never,
-      {
+    test("Normal with windows but null utilization → Primary (null = 0)", () => {
+      const km = create();
+      const entry = km.addKey(VALID_KEY_1, "n-nullutil");
+      km.recordCapacityObservation(entry, {
         seenAt: unixMs(Date.now()),
         httpStatus: 200,
-        windows: [
-          { windowName: "unified-5h", status: "allowed", utilization: 0.90, resetAt: unixMs(Date.now() + 60_000) },
-          { windowName: "unified-7d", status: "allowed", utilization: 0.05, resetAt: unixMs(Date.now() + SEVEN_D / 2) },
-        ],
-      },
-    );
-
-    const pick = km.getKeyForConversation(null);
-    // Without the near-reset bypass, the key at 90% util would fail the 30%
-    // floor. With it, only the 7d window (5% util) counts — eligible.
-    expect(pick.priorityTier).toBe(2);
-  });
-
-  test("requestsByTier counter increments on each routed request", () => {
-    const km = create();
-    km.addKey(VALID_KEY_1, "pref");
-    km.addKey(VALID_KEY_2, "norm");
-    km.updateKeyPriority(VALID_KEY_1, 1);
-    km.updateKeyPriority(VALID_KEY_2, 2);
-
-    expect(km.getRequestsByTier()).toEqual({});
-
-    const first = km.getKeyForConversation(null);
-    km.recordRequest(first.entry!);
-    expect(km.getRequestsByTier()).toEqual({ "1": 1 });
-
-    const second = km.getKeyForConversation(null);
-    km.recordRequest(second.entry!);
-    expect(km.getRequestsByTier()).toEqual({ "1": 2 });
-  });
-});
-
-// ── Layer 2 pace-aware spreading ───────────────────────────────────────────
-
-describe("spreadProbabilityFromPeak (pure function)", () => {
-  test("below 85% peak → no spread", () => {
-    expect(spreadProbabilityFromPeak(0.0)).toBe(0);
-    expect(spreadProbabilityFromPeak(0.5)).toBe(0);
-    expect(spreadProbabilityFromPeak(0.849)).toBe(0);
-  });
-
-  test("85-95% peak → 10% spread", () => {
-    expect(spreadProbabilityFromPeak(0.85)).toBe(0.10);
-    expect(spreadProbabilityFromPeak(0.90)).toBe(0.10);
-    expect(spreadProbabilityFromPeak(0.949)).toBe(0.10);
-  });
-
-  test("95-100% peak → 30% spread", () => {
-    expect(spreadProbabilityFromPeak(0.95)).toBe(0.30);
-    expect(spreadProbabilityFromPeak(0.99)).toBe(0.30);
-  });
-
-  test("100-120% peak → 50% spread", () => {
-    expect(spreadProbabilityFromPeak(1.0)).toBe(0.50);
-    expect(spreadProbabilityFromPeak(1.1)).toBe(0.50);
-    expect(spreadProbabilityFromPeak(1.19)).toBe(0.50);
-  });
-
-  test(">=120% peak → 60% spread (capped)", () => {
-    expect(spreadProbabilityFromPeak(1.2)).toBe(0.60);
-    expect(spreadProbabilityFromPeak(1.5)).toBe(0.60);
-    expect(spreadProbabilityFromPeak(10)).toBe(0.60);
-  });
-
-  test("never exceeds 0.60 — preferred tier always retains the majority", () => {
-    for (let p = 0; p <= 5; p += 0.1) {
-      expect(spreadProbabilityFromPeak(p)).toBeLessThanOrEqual(0.60);
-    }
-  });
-});
-
-describe("hashConversationKeyToUnit (pure function)", () => {
-  test("returns [0, 1)", () => {
-    for (const key of ["a", "alice:session", "user-42", "", "long-session-id-with-dashes-and-uuid-1234"]) {
-      const h = hashConversationKeyToUnit(key);
-      expect(h).toBeGreaterThanOrEqual(0);
-      expect(h).toBeLessThan(1);
-    }
-  });
-
-  test("deterministic: same input → same output", () => {
-    const key = "user-alpha:session-beta";
-    expect(hashConversationKeyToUnit(key)).toBe(hashConversationKeyToUnit(key));
-  });
-
-  test("different inputs produce different outputs (reasonably uniform)", () => {
-    const samples = new Set<number>();
-    for (let i = 0; i < 100; i++) {
-      samples.add(hashConversationKeyToUnit(`user-${i}:session-${i}`));
-    }
-    // Very loose uniformity check — 100 distinct inputs shouldn't collide much.
-    expect(samples.size).toBeGreaterThan(95);
-  });
-
-  test("distribution is roughly uniform across 10 buckets for 10000 keys", () => {
-    const buckets = new Array(10).fill(0);
-    for (let i = 0; i < 10000; i++) {
-      const h = hashConversationKeyToUnit(`conv-${i}:sess-${i * 7 + 11}`);
-      buckets[Math.floor(h * 10)]++;
-    }
-    // Each bucket should hold roughly 1000; allow ±250 before we call it uneven.
-    for (const count of buckets) {
-      expect(count).toBeGreaterThan(750);
-      expect(count).toBeLessThan(1250);
-    }
-  });
-});
-
-describe("tierProjectedPeak (Layer 2 projection)", () => {
-  const FIVE_H_MS = 5 * 60 * 60 * 1000;
-  const SEVEN_D_MS = 7 * 24 * 60 * 60 * 1000;
-
-  function addKeyWithCapacity(
-    km: KeyManager,
-    rawKey: string,
-    label: string,
-    priority: number,
-    windows: Array<{ windowName: string; util: number; resetIn: number }>,
-  ): void {
-    km.addKey(rawKey, label);
-    km.updateKeyPriority(rawKey, priority);
-    const entry = (km as unknown as { keys: Array<{ key: string } & Record<string, unknown>> })
-      .keys.find((e) => e.key === rawKey)!;
-    const nowMs = Date.now();
-    km.recordCapacityObservation(entry as never, {
-      seenAt: unixMs(nowMs),
-      httpStatus: 200,
-      windows: windows.map((w) => ({
-        windowName: w.windowName,
-        status: "allowed",
-        utilization: w.util,
-        resetAt: unixMs(nowMs + w.resetIn),
-      })),
+        windows: [{ windowName: "unified-7d", status: "allowed", resetAt: unixMs(Date.now() + SEVEN_D / 2) }],
+      });
+      expect(callAssignPool(km, entry)).toBe("primary");
     });
-  }
 
-  function getPeak(km: KeyManager, tier: number): number | null {
-    return (km as unknown as {
-      _testTierProjectedPeak: (t: number, n: number) => number | null;
-    })._testTierProjectedPeak(tier, Date.now());
-  }
-
-  test("no keys in tier → null", () => {
-    const km = create();
-    expect(getPeak(km, 1)).toBeNull();
-  });
-
-  test("key with no observed windows → null (no data to project)", () => {
-    const km = create();
-    km.addKey(VALID_KEY_1, "fresh");
-    km.updateKeyPriority(VALID_KEY_1, 1);
-    expect(getPeak(km, 1)).toBeNull();
-  });
-
-  test("on-pace key (util ~= elapsed) → peak near 1.0", () => {
-    const km = create();
-    // util 0.60 at 60% elapsed (resetIn = 40% of window remaining)
-    addKeyWithCapacity(km, VALID_KEY_1, "on-pace", 1, [
-      { windowName: "unified-5h", util: 0.60, resetIn: FIVE_H_MS * 0.40 },
-    ]);
-    const peak = getPeak(km, 1);
-    expect(peak).not.toBeNull();
-    expect(peak!).toBeCloseTo(1.0, 1);
-  });
-
-  test("ahead-of-pace key → peak > 1.0 (projected to bust budget, below cap)", () => {
-    const km = create();
-    // util 0.45 at 40% elapsed (remaining 60%) → pace 1.125 → projected 1.125
-    // (kept below the 1.5 cap so we're testing raw projection, not clamping)
-    addKeyWithCapacity(km, VALID_KEY_1, "hot", 1, [
-      { windowName: "unified-5h", util: 0.45, resetIn: FIVE_H_MS * 0.60 },
-    ]);
-    const peak = getPeak(km, 1);
-    expect(peak).not.toBeNull();
-    expect(peak!).toBeGreaterThan(1.0);
-    expect(peak!).toBeLessThan(1.5);
-  });
-
-  test("projection capped at LAYER2_PROJECTION_CAP (1.5)", () => {
-    const km = create();
-    // Extreme pace: util 0.5 at 10% elapsed → pace 5 → projects to 5.0, capped to 1.5
-    addKeyWithCapacity(km, VALID_KEY_1, "extreme", 1, [
-      { windowName: "unified-5h", util: 0.5, resetIn: FIVE_H_MS * 0.90 },
-    ]);
-    expect(getPeak(km, 1)!).toBe(1.5);
-  });
-
-  test("dead-zone skip: util 0.05 at 1% elapsed → ignored (no peak)", () => {
-    const km = create();
-    addKeyWithCapacity(km, VALID_KEY_1, "early", 1, [
-      { windowName: "unified-5h", util: 0.05, resetIn: FIVE_H_MS * 0.99 },
-    ]);
-    expect(getPeak(km, 1)).toBeNull();
-  });
-
-  test("picks the MAX across keys in tier", () => {
-    const km = create();
-    addKeyWithCapacity(km, VALID_KEY_1, "chill", 1, [
-      { windowName: "unified-5h", util: 0.20, resetIn: FIVE_H_MS * 0.40 }, // pace 0.33
-    ]);
-    addKeyWithCapacity(km, VALID_KEY_2, "hot", 1, [
-      { windowName: "unified-5h", util: 0.80, resetIn: FIVE_H_MS * 0.60 }, // pace 2.0
-    ]);
-    const peak = getPeak(km, 1);
-    // Capped at 1.5 (from the hot key, pace 2.0)
-    expect(peak).toBe(1.5);
-  });
-
-  test("considers both 5h and 7d windows — picks whichever projects higher", () => {
-    const km = create();
-    addKeyWithCapacity(km, VALID_KEY_1, "mixed", 1, [
-      { windowName: "unified-5h", util: 0.10, resetIn: FIVE_H_MS * 0.90 }, // pace 1.0
-      { windowName: "unified-7d", util: 0.80, resetIn: SEVEN_D_MS * 0.20 }, // pace 1.0
-    ]);
-    const peak = getPeak(km, 1)!;
-    expect(peak).toBeCloseTo(1.0, 1);
-  });
-
-  test("ignores keys at other tiers", () => {
-    const km = create();
-    addKeyWithCapacity(km, VALID_KEY_1, "tier-1-chill", 1, [
-      { windowName: "unified-5h", util: 0.10, resetIn: FIVE_H_MS * 0.40 }, // pace 0.17
-    ]);
-    addKeyWithCapacity(km, VALID_KEY_2, "tier-2-hot", 2, [
-      { windowName: "unified-5h", util: 0.90, resetIn: FIVE_H_MS * 0.60 }, // pace 2.25
-    ]);
-    // Tier 1 has only the chill key — peak low.
-    const tier1Peak = getPeak(km, 1)!;
-    expect(tier1Peak).toBeLessThan(0.3);
-    // Tier 2 has only the hot key — peak high.
-    const tier2Peak = getPeak(km, 2)!;
-    expect(tier2Peak).toBeGreaterThan(1.0);
-  });
-
-  test("ignores keys in cooldown", () => {
-    const km = create();
-    const hot = addKeyWithCapacity(km, VALID_KEY_1, "cooling", 1, [
-      { windowName: "unified-5h", util: 0.90, resetIn: FIVE_H_MS * 0.60 },
-    ]);
-    void hot;
-    const rawEntry = (km as unknown as { keys: Array<{ key: string; availableAt: number }> })
-      .keys.find((e) => e.key === VALID_KEY_1)!;
-    rawEntry.availableAt = Date.now() + 60000; // 1min cooldown
-    expect(getPeak(km, 1)).toBeNull();
-  });
-});
-
-describe("shouldSpread decision (deterministic per conversation)", () => {
-  function check(km: KeyManager, key: string | null, prob: number): boolean {
-    return (km as unknown as {
-      _testShouldSpread: (k: string | null, p: number) => boolean;
-    })._testShouldSpread(key, prob);
-  }
-
-  test("probability 0 → always false", () => {
-    const km = create();
-    expect(check(km, "any", 0)).toBe(false);
-    expect(check(km, null, 0)).toBe(false);
-  });
-
-  test("probability 1 → always true", () => {
-    const km = create();
-    expect(check(km, "any", 1)).toBe(true);
-    expect(check(km, null, 1)).toBe(true);
-  });
-
-  test("same conversation → consistent answer across many calls", () => {
-    const km = create();
-    const key = "user-42:session-abc";
-    const first = check(km, key, 0.30);
-    for (let i = 0; i < 100; i++) {
-      expect(check(km, key, 0.30)).toBe(first);
-    }
-  });
-
-  test("hashed distribution tracks probability (conversation path)", () => {
-    const km = create();
-    let trueCount = 0;
-    const n = 5000;
-    for (let i = 0; i < n; i++) {
-      if (check(km, `conv-${i}:sess-${i * 3 + 7}`, 0.30)) trueCount++;
-    }
-    const ratio = trueCount / n;
-    // 30% probability over a 5000-sample hash should land within ±3%.
-    expect(ratio).toBeGreaterThan(0.27);
-    expect(ratio).toBeLessThan(0.33);
-  });
-
-  test("rng override drives the no-conversationKey path", () => {
-    // Always-0.9 rng → never below 0.3 → never true
-    const kmAlwaysHigh = new KeyManager(tempDir, { rng: () => 0.9 });
-    managers.push(kmAlwaysHigh);
-    expect(check(kmAlwaysHigh, null, 0.30)).toBe(false);
-    // Always-0.1 rng → always below 0.3 → always true
-    const tempDir2 = mkdtempSync(join(tmpdir(), "km-rng-2-"));
-    const kmAlwaysLow = new KeyManager(tempDir2, { rng: () => 0.1 });
-    managers.push(kmAlwaysLow);
-    expect(check(kmAlwaysLow, null, 0.30)).toBe(true);
-    rmSync(tempDir2, { recursive: true, force: true });
-  });
-});
-
-describe("Layer 2 integration — pace-aware tier spreading", () => {
-  const FIVE_H_MS = 5 * 60 * 60 * 1000;
-
-  function seedCapacity(
-    km: KeyManager,
-    rawKey: string,
-    windows: Array<{ windowName: string; util: number; resetIn: number }>,
-  ): void {
-    const entry = (km as unknown as { keys: Array<{ key: string } & Record<string, unknown>> })
-      .keys.find((e) => e.key === rawKey)!;
-    km.recordCapacityObservation(entry as never, {
-      seenAt: unixMs(Date.now()),
-      httpStatus: 200,
-      windows: windows.map((w) => ({
-        windowName: w.windowName,
-        status: "allowed",
-        utilization: w.util,
-        resetAt: unixMs(Date.now() + w.resetIn),
-      })),
+    test("Fallback at 49/49 → Primary (just under 50%)", () => {
+      const km = create();
+      const entry = km.addKey(VALID_KEY_1, "f-edge");
+      km.updateKeyPriority(VALID_KEY_1, 3);
+      setWindows(km, entry, [
+        { name: "unified-5h", util: 0.49 },
+        { name: "unified-7d", util: 0.49 },
+      ]);
+      expect(callAssignPool(km, entry)).toBe("primary");
     });
-  }
 
-  test("low-peak tier 1 → no spread, tier 1 wins (regression on Layer 1 behavior)", () => {
-    const km = create();
-    km.addKey(VALID_KEY_1, "preferred");
-    km.addKey(VALID_KEY_2, "normal");
-    km.updateKeyPriority(VALID_KEY_1, 1);
-    km.updateKeyPriority(VALID_KEY_2, 2);
-    // Tier 1 at 20% util, 40% elapsed → pace 0.5, peak 0.5 → below 0.85 threshold
-    seedCapacity(km, VALID_KEY_1, [
-      { windowName: "unified-5h", util: 0.20, resetIn: FIVE_H_MS * 0.60 },
-    ]);
-    seedCapacity(km, VALID_KEY_2, [
-      { windowName: "unified-5h", util: 0.10, resetIn: FIVE_H_MS * 0.40 },
-    ]);
+    test("Fallback at exactly 50% weekly → Tertiary", () => {
+      const km = create();
+      const entry = km.addKey(VALID_KEY_1, "f-w50");
+      km.updateKeyPriority(VALID_KEY_1, 3);
+      setWindows(km, entry, [
+        { name: "unified-7d", util: 0.50 },
+      ]);
+      expect(callAssignPool(km, entry)).toBe("tertiary");
+    });
 
-    for (let i = 0; i < 100; i++) {
-      const pick = km.getKeyForConversation(`conv-${i}:sess-${i}`);
-      expect(pick.priorityTier).toBe(1);
-      expect(pick.spilledFromTier).toBeNull();
-    }
+    test("Fallback at exactly 50% 5h → Tertiary", () => {
+      const km = create();
+      const entry = km.addKey(VALID_KEY_1, "f-5h50");
+      km.updateKeyPriority(VALID_KEY_1, 3);
+      setWindows(km, entry, [
+        { name: "unified-5h", util: 0.50 },
+      ]);
+      expect(callAssignPool(km, entry)).toBe("tertiary");
+    });
+
+    test("Fallback at 50% on both → Tertiary", () => {
+      const km = create();
+      const entry = km.addKey(VALID_KEY_1, "f-both50");
+      km.updateKeyPriority(VALID_KEY_1, 3);
+      setWindows(km, entry, [
+        { name: "unified-5h", util: 0.50 },
+        { name: "unified-7d", util: 0.50 },
+      ]);
+      expect(callAssignPool(km, entry)).toBe("tertiary");
+    });
+
+    test("Fallback with no capacity windows → Primary (unknown = 0)", () => {
+      const km = create();
+      const entry = km.addKey(VALID_KEY_1, "f-fresh");
+      km.updateKeyPriority(VALID_KEY_1, 3);
+      expect(callAssignPool(km, entry)).toBe("primary");
+    });
+
+    test("Near-reset window (>=95% elapsed) is ignored — Normal at 90% near reset stays Primary", () => {
+      const km = create();
+      const entry = km.addKey(VALID_KEY_1, "n-nearreset");
+      const elapsed = SEVEN_D * 0.96;
+      const resetIn = SEVEN_D - elapsed;
+      setWindows(km, entry, [
+        { name: "unified-7d", util: 0.90, resetAt: Date.now() + resetIn },
+      ]);
+      expect(callAssignPool(km, entry)).toBe("primary");
+    });
+
+    test("Other windows (e.g. 'unified') don't affect pool placement", () => {
+      const km = create();
+      const entry = km.addKey(VALID_KEY_1, "n-other");
+      km.recordCapacityObservation(entry, {
+        seenAt: unixMs(Date.now()),
+        httpStatus: 200,
+        windows: [{ windowName: "unified", status: "allowed", utilization: 0.99, resetAt: unixMs(Date.now() + 60_000) }],
+      });
+      expect(callAssignPool(km, entry)).toBe("primary");
+    });
   });
 
-  test("high-peak tier 1 → some conversations spread to tier 2 (probability ~30%)", () => {
-    const km = create();
-    km.addKey(VALID_KEY_1, "preferred-hot");
-    km.addKey(VALID_KEY_2, "normal-ready");
-    km.updateKeyPriority(VALID_KEY_1, 1);
-    km.updateKeyPriority(VALID_KEY_2, 2);
-    // Tier 1 on-pace (pace ~1.0 → projected 0.97, spread prob 0.30)
-    seedCapacity(km, VALID_KEY_1, [
-      { windowName: "unified-5h", util: 0.58, resetIn: FIVE_H_MS * 0.40 },
-    ]);
-    // Tier 2 fresh — passes 30% headroom floor (unknown → optimistic)
-    seedCapacity(km, VALID_KEY_2, [
-      { windowName: "unified-5h", util: 0.05, resetIn: FIVE_H_MS * 0.40 },
-    ]);
+  // ── Cascade Primary → Secondary → Tertiary ──────────────────────────────
 
-    let tier1Count = 0;
-    let tier2Count = 0;
-    for (let i = 0; i < 1000; i++) {
-      const pick = km.getKeyForConversation(`conv-${i}:sess-${i * 13 + 5}`);
-      if (pick.priorityTier === 1) tier1Count++;
-      if (pick.priorityTier === 2) tier2Count++;
-      // Clear affinity so each call re-selects (otherwise the first call per
-      // conversationKey sticks for the next hour).
-      (km as unknown as { conversationAffinities: Map<string, unknown> })
-        .conversationAffinities.clear();
-    }
-    const tier2Ratio = tier2Count / 1000;
-    // Expect ~30% ±3% (hash distribution tested elsewhere at tighter bounds)
-    expect(tier2Ratio).toBeGreaterThan(0.26);
-    expect(tier2Ratio).toBeLessThan(0.34);
-    expect(tier1Count + tier2Count).toBe(1000);
-  });
+  describe("Cascade: Primary → Secondary → Tertiary", () => {
+    test("Primary present → Primary picked over a demoted Secondary", () => {
+      const km = create();
+      const p = km.addKey(VALID_KEY_1, "p");
+      const n = km.addKey(VALID_KEY_2, "n-hot");
+      km.updateKeyPriority(VALID_KEY_1, 1);
+      // n must be demoted to Secondary so the cascade rule applies
+      setWindows(km, n, [{ name: "unified-7d", util: 0.80 }]);
+      const pick = km.getNextAvailableKey();
+      expect(pick?.key).toBe(p.key);
+    });
 
-  test("extreme peak (pace 3x) → higher spread probability (~50%)", () => {
-    const km = create();
-    km.addKey(VALID_KEY_1, "preferred-crisis");
-    km.addKey(VALID_KEY_2, "normal-ready");
-    km.updateKeyPriority(VALID_KEY_1, 1);
-    km.updateKeyPriority(VALID_KEY_2, 2);
-    // Tier 1 severely ahead of pace: projects to 3x (capped at 1.5) → prob 0.60
-    seedCapacity(km, VALID_KEY_1, [
-      { windowName: "unified-5h", util: 0.60, resetIn: FIVE_H_MS * 0.80 },
-    ]);
-    seedCapacity(km, VALID_KEY_2, [
-      { windowName: "unified-5h", util: 0.05, resetIn: FIVE_H_MS * 0.40 },
-    ]);
+    test("All Primary on cooldown → Secondary picked", () => {
+      const km = create();
+      const p = km.addKey(VALID_KEY_1, "p");
+      const n = km.addKey(VALID_KEY_2, "n-hot");
+      km.updateKeyPriority(VALID_KEY_1, 1);
+      setWindows(km, n, [{ name: "unified-7d", util: 0.80 }]);
+      km.recordRateLimit(p, 9999);
+      const pick = km.getNextAvailableKey();
+      expect(pick?.key).toBe(n.key);
+    });
 
-    let tier2Count = 0;
-    for (let i = 0; i < 1000; i++) {
-      const pick = km.getKeyForConversation(`conv-${i}:sess-${i * 7 + 3}`);
-      if (pick.priorityTier === 2) tier2Count++;
-      (km as unknown as { conversationAffinities: Map<string, unknown> })
-        .conversationAffinities.clear();
-    }
-    // At pace 3x → projection 3.0 → capped to 1.5 → >=1.2 → prob 0.60
-    const ratio = tier2Count / 1000;
-    expect(ratio).toBeGreaterThan(0.55);
-    expect(ratio).toBeLessThan(0.65);
-  });
+    test("All Primary disabled → Secondary picked", () => {
+      const km = create();
+      km.addKey(VALID_KEY_1, "p-disabled");
+      const n = km.addKey(VALID_KEY_2, "n-hot");
+      km.updateKeyPriority(VALID_KEY_1, 4);
+      setWindows(km, n, [{ name: "unified-7d", util: 0.80 }]);
+      const pick = km.getNextAvailableKey();
+      expect(pick?.key).toBe(n.key);
+    });
 
-  test("high peak but tier 2 below its reserve floor → stays on tier 1", () => {
-    const km = create();
-    km.addKey(VALID_KEY_1, "preferred-hot");
-    km.addKey(VALID_KEY_2, "normal-also-drained");
-    km.updateKeyPriority(VALID_KEY_1, 1);
-    km.updateKeyPriority(VALID_KEY_2, 2);
-    seedCapacity(km, VALID_KEY_1, [
-      { windowName: "unified-5h", util: 0.80, resetIn: FIVE_H_MS * 0.40 },
-    ]);
-    // Tier 2 at 80% util — headroom 20%, below 30% floor — NOT eligible.
-    seedCapacity(km, VALID_KEY_2, [
-      { windowName: "unified-5h", util: 0.80, resetIn: FIVE_H_MS * 0.40 },
-    ]);
+    test("All Primary outside allowedDays → Secondary picked", () => {
+      const km = create();
+      const p = km.addKey(VALID_KEY_1, "p-banned");
+      const n = km.addKey(VALID_KEY_2, "n-hot");
+      const today = new Date().getDay();
+      const otherDays = [0, 1, 2, 3, 4, 5, 6].filter((d) => d !== today);
+      km.updateKeyAllowedDays(p.key, otherDays);
+      setWindows(km, n, [{ name: "unified-7d", util: 0.80 }]);
+      const pick = km.getNextAvailableKey();
+      expect(pick?.key).toBe(n.key);
+    });
 
-    // All 200 picks should stay on tier 1 (tier 2 gated out).
-    for (let i = 0; i < 200; i++) {
-      const pick = km.getKeyForConversation(`conv-${i}:sess-${i}`);
-      expect(pick.priorityTier).toBe(1);
-    }
-  });
+    test("Primary + Secondary all on cooldown → Tertiary picked", () => {
+      const km = create();
+      const p = km.addKey(VALID_KEY_1, "p");
+      const n = km.addKey(VALID_KEY_2, "n-hot");
+      const f = km.addKey(VALID_KEY_3, "f-hot");
+      km.updateKeyPriority(VALID_KEY_1, 1);
+      km.updateKeyPriority(VALID_KEY_3, 3);
+      setWindows(km, n, [{ name: "unified-7d", util: 0.80 }]);
+      setWindows(km, f, [{ name: "unified-7d", util: 0.60 }]);
+      km.recordRateLimit(p, 9999);
+      km.recordRateLimit(n, 9999);
+      const pick = km.getNextAvailableKey();
+      expect(pick?.key).toBe(f.key);
+    });
 
-  test("cascade: tier 1 hot, tier 2 ineligible, tier 3 eligible → some spread to tier 3", () => {
-    const km = create();
-    km.addKey(VALID_KEY_1, "pref-hot");
-    km.addKey(VALID_KEY_2, "normal-drained");
-    km.addKey(VALID_KEY_3, "fallback-fresh");
-    km.updateKeyPriority(VALID_KEY_1, 1);
-    km.updateKeyPriority(VALID_KEY_2, 2);
-    km.updateKeyPriority(VALID_KEY_3, 3);
-    seedCapacity(km, VALID_KEY_1, [
-      { windowName: "unified-5h", util: 0.80, resetIn: FIVE_H_MS * 0.40 },
-    ]);
-    // Tier 2 below 30% floor
-    seedCapacity(km, VALID_KEY_2, [
-      { windowName: "unified-5h", util: 0.80, resetIn: FIVE_H_MS * 0.40 },
-    ]);
-    // Tier 3 fresh, passes 50% floor
-    seedCapacity(km, VALID_KEY_3, [
-      { windowName: "unified-5h", util: 0.05, resetIn: FIVE_H_MS * 0.40 },
-    ]);
+    test("All accounts on cooldown → null", () => {
+      const km = create();
+      const p = km.addKey(VALID_KEY_1, "p");
+      const n = km.addKey(VALID_KEY_2, "n");
+      km.recordRateLimit(p, 9999);
+      km.recordRateLimit(n, 9999);
+      expect(km.getNextAvailableKey()).toBeNull();
+    });
 
-    let tier3Count = 0;
-    for (let i = 0; i < 500; i++) {
-      const pick = km.getKeyForConversation(`conv-${i}:sess-${i * 11}`);
-      if (pick.priorityTier === 3) tier3Count++;
-      (km as unknown as { conversationAffinities: Map<string, unknown> })
-        .conversationAffinities.clear();
-    }
-    // Some (but not all) conversations spread all the way to tier 3.
-    expect(tier3Count).toBeGreaterThan(0);
-    expect(tier3Count).toBeLessThan(500);
-  });
-
-  test("spilledFromTier reports the preemptive shift", () => {
-    const km = create();
-    km.addKey(VALID_KEY_1, "pref");
-    km.addKey(VALID_KEY_2, "normal");
-    km.updateKeyPriority(VALID_KEY_1, 1);
-    km.updateKeyPriority(VALID_KEY_2, 2);
-    // Extreme tier 1 peak so most picks spread.
-    seedCapacity(km, VALID_KEY_1, [
-      { windowName: "unified-5h", util: 0.60, resetIn: FIVE_H_MS * 0.80 },
-    ]);
-    seedCapacity(km, VALID_KEY_2, [
-      { windowName: "unified-5h", util: 0.05, resetIn: FIVE_H_MS * 0.40 },
-    ]);
-
-    let foundSpill = false;
-    for (let i = 0; i < 100; i++) {
-      const pick = km.getKeyForConversation(`conv-${i}:sess-${i}`);
-      if (pick.priorityTier === 2) {
-        expect(pick.spilledFromTier).toBe(1);
-        foundSpill = true;
-      } else {
-        expect(pick.spilledFromTier).toBeNull();
+    test("Normal at 80% (Secondary) NOT picked while Preferred is in Primary pool", () => {
+      const km = create();
+      const p = km.addKey(VALID_KEY_1, "p");
+      const n = km.addKey(VALID_KEY_2, "n-hot");
+      km.updateKeyPriority(VALID_KEY_1, 1);
+      setWindows(km, n, [{ name: "unified-7d", util: 0.80 }]);
+      for (let i = 0; i < 5; i++) {
+        const pick = km.getNextAvailableKey()!;
+        expect(pick.key).toBe(p.key);
+        km.recordRequest(pick);
       }
-      (km as unknown as { conversationAffinities: Map<string, unknown> })
-        .conversationAffinities.clear();
-    }
-    expect(foundSpill).toBe(true);
+    });
+
+    test("Fallback at 60% (Tertiary) NOT picked while Normal at 70% sits in Primary", () => {
+      const km = create();
+      const n = km.addKey(VALID_KEY_1, "n-warm");
+      const f = km.addKey(VALID_KEY_2, "f-hot");
+      km.updateKeyPriority(VALID_KEY_2, 3);
+      setWindows(km, n, [{ name: "unified-7d", util: 0.70 }]);
+      setWindows(km, f, [{ name: "unified-7d", util: 0.60 }]);
+      for (let i = 0; i < 5; i++) {
+        const pick = km.getNextAvailableKey()!;
+        expect(pick.key).toBe(n.key);
+        km.recordRequest(pick);
+      }
+    });
   });
 
-  test("conversation affinity wins over Layer 2 — once assigned, stays put", () => {
-    const km = create();
-    km.addKey(VALID_KEY_1, "pref");
-    km.addKey(VALID_KEY_2, "normal");
-    km.updateKeyPriority(VALID_KEY_1, 1);
-    km.updateKeyPriority(VALID_KEY_2, 2);
-    // Low pace initially — no spread — assigns to tier 1.
-    seedCapacity(km, VALID_KEY_1, [
-      { windowName: "unified-5h", util: 0.10, resetIn: FIVE_H_MS * 0.80 },
-    ]);
-    seedCapacity(km, VALID_KEY_2, [
-      { windowName: "unified-5h", util: 0.05, resetIn: FIVE_H_MS * 0.40 },
-    ]);
+  // ── Bucket-of-3 rotation ────────────────────────────────────────────────
 
-    const conversationKey = "sticky-conv:sticky-sess";
-    const firstPick = km.getKeyForConversation(conversationKey);
-    const assignedKey = firstPick.entry!.key;
-    expect(firstPick.priorityTier).toBe(1);
+  describe("Bucket-of-3 rotation", () => {
+    test("Three fresh accounts: first 3 picks all on soonest-weekly-reset", () => {
+      const km = create();
+      const baseNow = Date.now();
+      const a = km.addKey(VALID_KEY_1, "a");
+      const b = km.addKey(VALID_KEY_2, "b");
+      const c = km.addKey(VALID_KEY_3, "c");
+      // a resets soonest, then b, then c
+      setWindows(km, a, [{ name: "unified-7d", util: 0.10, resetAt: baseNow + SEVEN_D / 4 }]);
+      setWindows(km, b, [{ name: "unified-7d", util: 0.10, resetAt: baseNow + SEVEN_D / 2 }]);
+      setWindows(km, c, [{ name: "unified-7d", util: 0.10, resetAt: baseNow + SEVEN_D * 0.75 }]);
 
-    // Now fake heavy pressure on tier 1.
-    seedCapacity(km, VALID_KEY_1, [
-      { windowName: "unified-5h", util: 0.60, resetIn: FIVE_H_MS * 0.80 },
-    ]);
+      const picks: string[] = [];
+      for (let i = 0; i < 9; i++) {
+        const pick = km.getKeyForConversation(`conv-${i}`);
+        picks.push(pick.entry!.key);
+        km.recordRequest(pick.entry!);
+      }
+      expect(picks.slice(0, 3)).toEqual([a.key, a.key, a.key]);
+      expect(picks.slice(3, 6)).toEqual([b.key, b.key, b.key]);
+      expect(picks.slice(6, 9)).toEqual([c.key, c.key, c.key]);
+    });
 
-    // Subsequent calls on the SAME conversation key stick with their assigned
-    // tier-1 key regardless of Layer 2 pressure.
-    for (let i = 0; i < 20; i++) {
-      const pick = km.getKeyForConversation(conversationKey);
-      expect(pick.entry!.key).toBe(assignedKey);
-      expect(pick.priorityTier).toBe(1);
-      expect(pick.routingDecision).toBe("conversation_affinity_hit");
-    }
+    test("After all reach 3 sessions, rotation wraps back to soonest-reset", () => {
+      const km = create();
+      const baseNow = Date.now();
+      const a = km.addKey(VALID_KEY_1, "a");
+      const b = km.addKey(VALID_KEY_2, "b");
+      setWindows(km, a, [{ name: "unified-7d", util: 0.10, resetAt: baseNow + SEVEN_D / 4 }]);
+      setWindows(km, b, [{ name: "unified-7d", util: 0.10, resetAt: baseNow + SEVEN_D / 2 }]);
+
+      for (let i = 0; i < 6; i++) {
+        const pick = km.getKeyForConversation(`conv-${i}`);
+        km.recordRequest(pick.entry!);
+      }
+      const seventh = km.getKeyForConversation("conv-7");
+      expect(seventh.entry?.key).toBe(a.key);
+    });
+
+    test("Mid-rotation cooldown: account drops out, rotation continues with remainder", () => {
+      const km = create();
+      const baseNow = Date.now();
+      const a = km.addKey(VALID_KEY_1, "a");
+      const b = km.addKey(VALID_KEY_2, "b");
+      setWindows(km, a, [{ name: "unified-7d", util: 0.10, resetAt: baseNow + SEVEN_D / 4 }]);
+      setWindows(km, b, [{ name: "unified-7d", util: 0.10, resetAt: baseNow + SEVEN_D / 2 }]);
+
+      // Two picks land on A, then A goes on cooldown
+      km.recordRequest(km.getKeyForConversation("conv-1").entry!);
+      km.recordRequest(km.getKeyForConversation("conv-2").entry!);
+      km.recordRateLimit(a, 9999);
+
+      // Next pick must go to B (A on cooldown)
+      const pick = km.getKeyForConversation("conv-3");
+      expect(pick.entry?.key).toBe(b.key);
+    });
+
+    test("Recent session count comes from a 15-minute window — older affinities don't count", () => {
+      const km = create();
+      const baseNow = Date.now();
+      const a = km.addKey(VALID_KEY_1, "a");
+      const b = km.addKey(VALID_KEY_2, "b");
+      setWindows(km, a, [{ name: "unified-7d", util: 0.10, resetAt: baseNow + SEVEN_D / 4 }]);
+      setWindows(km, b, [{ name: "unified-7d", util: 0.10, resetAt: baseNow + SEVEN_D / 2 }]);
+
+      // Inject 3 stale (>15min old) affinities for A directly
+      const staleTime = unixMs(baseNow - 20 * 60 * 1000);
+      const affinities = (km as unknown as { conversationAffinities: Map<string, {
+        conversationKey: string; key: string; sessionId: string | null; assignedAt: number; lastSeenAt: number;
+      }> }).conversationAffinities;
+      for (let i = 0; i < 3; i++) {
+        affinities.set(`stale-${i}`, {
+          conversationKey: `stale-${i}`,
+          key: a.key,
+          sessionId: null,
+          assignedAt: staleTime,
+          lastSeenAt: staleTime,
+        });
+      }
+
+      // Stale affinities don't count as "recent sessions" → A is still picked
+      const pick = km.getKeyForConversation("new-conv");
+      expect(pick.entry?.key).toBe(a.key);
+    });
+
+    test("Affinity hits keep a session 'recent' (lastSeenAt updates)", () => {
+      const km = create();
+      const baseNow = Date.now();
+      const a = km.addKey(VALID_KEY_1, "a");
+      const b = km.addKey(VALID_KEY_2, "b");
+      setWindows(km, a, [{ name: "unified-7d", util: 0.10, resetAt: baseNow + SEVEN_D / 4 }]);
+      setWindows(km, b, [{ name: "unified-7d", util: 0.10, resetAt: baseNow + SEVEN_D / 2 }]);
+
+      // Three conversations land on A
+      km.getKeyForConversation("conv-1");
+      km.getKeyForConversation("conv-2");
+      km.getKeyForConversation("conv-3");
+
+      // 4th NEW conversation should now go to B (A's bucket is full)
+      const fourth = km.getKeyForConversation("conv-4");
+      expect(fourth.entry?.key).toBe(b.key);
+
+      // Hitting affinity for conv-1 does not change the rotation
+      const hit = km.getKeyForConversation("conv-1");
+      expect(hit.entry?.key).toBe(a.key);
+      expect(hit.affinityHit).toBe(true);
+    });
   });
 
-  test("no projection data (unknown keys) → Layer 2 silent, Layer 1 behavior preserved", () => {
-    const km = create();
-    km.addKey(VALID_KEY_1, "pref-unknown");
-    km.addKey(VALID_KEY_2, "normal-unknown");
-    km.updateKeyPriority(VALID_KEY_1, 1);
-    km.updateKeyPriority(VALID_KEY_2, 2);
-    // No seedCapacity calls — both keys have empty capacity.windows.
+  // ── Sort order: secondary keys ──────────────────────────────────────────
 
-    // 100% of traffic to tier 1 because (a) Layer 2 can't project anything
-    // without data, (b) tier 1 floor=0 accepts the unknown key.
-    let tier1 = 0;
-    for (let i = 0; i < 100; i++) {
-      const pick = km.getKeyForConversation(`conv-${i}`);
-      if (pick.priorityTier === 1) tier1++;
-    }
-    expect(tier1).toBe(100);
+  describe("Sort order", () => {
+    test("Soonest weekly reset wins when bucket counts tied", () => {
+      const km = create();
+      const baseNow = Date.now();
+      const late = km.addKey(VALID_KEY_1, "late");
+      const soon = km.addKey(VALID_KEY_2, "soon");
+      setWindows(km, late, [{ name: "unified-7d", util: 0.10, resetAt: baseNow + SEVEN_D * 0.75 }]);
+      setWindows(km, soon, [{ name: "unified-7d", util: 0.10, resetAt: baseNow + SEVEN_D * 0.25 }]);
+      expect(km.getNextAvailableKey()?.key).toBe(soon.key);
+    });
+
+    test("Soonest 5h reset wins when buckets + weekly reset tied", () => {
+      const km = create();
+      const baseNow = Date.now();
+      const a = km.addKey(VALID_KEY_1, "a");
+      const b = km.addKey(VALID_KEY_2, "b");
+      // identical 7d resetAt
+      const sevenDReset = baseNow + SEVEN_D / 2;
+      setWindows(km, a, [
+        { name: "unified-7d", util: 0.10, resetAt: sevenDReset },
+        { name: "unified-5h", util: 0.10, resetAt: baseNow + FIVE_H * 0.75 },
+      ]);
+      setWindows(km, b, [
+        { name: "unified-7d", util: 0.10, resetAt: sevenDReset },
+        { name: "unified-5h", util: 0.10, resetAt: baseNow + FIVE_H * 0.25 },
+      ]);
+      expect(km.getNextAvailableKey()?.key).toBe(b.key);
+    });
+
+    test("Higher util wins when buckets and resets tied (drain hot accounts first)", () => {
+      const km = create();
+      const baseNow = Date.now();
+      const cool = km.addKey(VALID_KEY_1, "cool");
+      const hot = km.addKey(VALID_KEY_2, "hot");
+      const sevenDReset = baseNow + SEVEN_D / 2;
+      const fiveHReset = baseNow + FIVE_H / 2;
+      setWindows(km, cool, [
+        { name: "unified-7d", util: 0.10, resetAt: sevenDReset },
+        { name: "unified-5h", util: 0.10, resetAt: fiveHReset },
+      ]);
+      setWindows(km, hot, [
+        { name: "unified-7d", util: 0.40, resetAt: sevenDReset },
+        { name: "unified-5h", util: 0.40, resetAt: fiveHReset },
+      ]);
+      expect(km.getNextAvailableKey()?.key).toBe(hot.key);
+    });
+
+    test("MRU wins as a final tiebreak after util", () => {
+      const km = create();
+      const old = km.addKey(VALID_KEY_1, "old");
+      const recent = km.addKey(VALID_KEY_2, "recent");
+      km.recordRequest(recent);
+      expect(km.getNextAvailableKey()?.key).toBe(recent.key);
+    });
+
+    test("Alphabetical label is the absolute last tiebreak", () => {
+      const km = create();
+      // Two fresh keys, no telemetry, no usage — must be deterministic
+      km.addKey(VALID_KEY_1, "zzz");
+      km.addKey(VALID_KEY_2, "aaa");
+      // VALID_KEY_2 has label "aaa" < "zzz", so it wins the alphabetical tiebreak
+      expect(km.getNextAvailableKey()?.label).toBe("aaa");
+    });
   });
 
-  test("deterministic replay: running Layer 2 twice with same inputs = identical outcomes", () => {
-    // Use a fixture whose projected peak lands well inside a probability
-    // bucket (0.45 util at 50% elapsed → projected 0.9, in the 0.85-0.95
-    // range → prob 0.10). Values exactly at a bucket boundary can flip
-    // between KeyManager instances due to sub-millisecond time drift
-    // during setup — a real ambiguity in the math, not a bug, so we test
-    // stability in a region where the two sides of the decision agree.
-    const km1 = create();
-    km1.addKey(VALID_KEY_1, "pref");
-    km1.addKey(VALID_KEY_2, "normal");
-    km1.updateKeyPriority(VALID_KEY_1, 1);
-    km1.updateKeyPriority(VALID_KEY_2, 2);
-    seedCapacity(km1, VALID_KEY_1, [
-      { windowName: "unified-5h", util: 0.45, resetIn: FIVE_H_MS * 0.50 },
-    ]);
-    seedCapacity(km1, VALID_KEY_2, [
-      { windowName: "unified-5h", util: 0.05, resetIn: FIVE_H_MS * 0.50 },
-    ]);
+  // ── Unknown reset / unknown utilization ─────────────────────────────────
 
-    const tempDir2 = mkdtempSync(join(tmpdir(), "km-replay-"));
-    const km2 = new KeyManager(tempDir2);
-    managers.push(km2);
-    km2.addKey(VALID_KEY_1, "pref");
-    km2.addKey(VALID_KEY_2, "normal");
-    km2.updateKeyPriority(VALID_KEY_1, 1);
-    km2.updateKeyPriority(VALID_KEY_2, 2);
-    seedCapacity(km2, VALID_KEY_1, [
-      { windowName: "unified-5h", util: 0.45, resetIn: FIVE_H_MS * 0.50 },
-    ]);
-    seedCapacity(km2, VALID_KEY_2, [
-      { windowName: "unified-5h", util: 0.05, resetIn: FIVE_H_MS * 0.50 },
-    ]);
+  describe("Unknown reset / unknown utilization", () => {
+    test("Account with no unified-7d window sorts first (unknown weekly = 0 = soonest)", () => {
+      const km = create();
+      const baseNow = Date.now();
+      const known = km.addKey(VALID_KEY_1, "known");
+      const fresh = km.addKey(VALID_KEY_2, "fresh");
+      setWindows(km, known, [{ name: "unified-7d", util: 0.10, resetAt: baseNow + SEVEN_D / 2 }]);
+      // fresh has no windows at all
+      expect(km.getNextAvailableKey()?.key).toBe(fresh.key);
+    });
 
-    const outcomes1: number[] = [];
-    const outcomes2: number[] = [];
-    for (let i = 0; i < 50; i++) {
-      const key = `replay-${i}:sess`;
-      outcomes1.push(km1.getKeyForConversation(key).priorityTier!);
-      (km1 as unknown as { conversationAffinities: Map<string, unknown> })
-        .conversationAffinities.clear();
-      outcomes2.push(km2.getKeyForConversation(key).priorityTier!);
-      (km2 as unknown as { conversationAffinities: Map<string, unknown> })
-        .conversationAffinities.clear();
-    }
-    expect(outcomes1).toEqual(outcomes2);
-    rmSync(tempDir2, { recursive: true, force: true });
+    test("Account with null resetAt sorts first (eager probe)", () => {
+      const km = create();
+      const baseNow = Date.now();
+      const known = km.addKey(VALID_KEY_1, "known");
+      const unknown = km.addKey(VALID_KEY_2, "unknown");
+      setWindows(km, known, [{ name: "unified-7d", util: 0.10, resetAt: baseNow + SEVEN_D / 2 }]);
+      km.recordCapacityObservation(unknown, {
+        seenAt: unixMs(baseNow),
+        httpStatus: 200,
+        windows: [{ windowName: "unified-7d", status: "allowed", utilization: 0.10 }],
+      });
+      expect(km.getNextAvailableKey()?.key).toBe(unknown.key);
+    });
+
+    test("Account with no util data treated as 0% — Normal stays Primary", () => {
+      const km = create();
+      const entry = km.addKey(VALID_KEY_1, "n-noutil");
+      km.recordCapacityObservation(entry, {
+        seenAt: unixMs(Date.now()),
+        httpStatus: 200,
+        windows: [{ windowName: "unified-7d", status: "allowed", resetAt: unixMs(Date.now() + SEVEN_D / 2) }],
+      });
+      expect(callAssignPool(km, entry)).toBe("primary");
+    });
+  });
+
+  // ── Affinity vs pool demotion ───────────────────────────────────────────
+
+  describe("Affinity vs pool demotion", () => {
+    test("Affinity holds when account drifts into Secondary (still available)", () => {
+      const km = create();
+      const a = km.addKey(VALID_KEY_1, "a");
+      km.addKey(VALID_KEY_2, "b");
+
+      const first = km.getKeyForConversation("conv-1");
+      expect(first.entry?.key).toBe(a.key);
+
+      // Drift A above the 75% gate
+      setWindows(km, a, [{ name: "unified-7d", util: 0.80 }]);
+
+      const repeat = km.getKeyForConversation("conv-1");
+      expect(repeat.entry?.key).toBe(a.key);
+      expect(repeat.affinityHit).toBe(true);
+      expect(repeat.pool).toBe("secondary");
+    });
+
+    test("Affinity holds when account drifts into Tertiary", () => {
+      const km = create();
+      const a = km.addKey(VALID_KEY_1, "a");
+      km.updateKeyPriority(VALID_KEY_1, 3);
+      km.addKey(VALID_KEY_2, "b");
+
+      const first = km.getKeyForConversation("conv-1");
+      expect(first.entry?.key).toBe(a.key);
+
+      setWindows(km, a, [{ name: "unified-7d", util: 0.55 }]);
+
+      const repeat = km.getKeyForConversation("conv-1");
+      expect(repeat.entry?.key).toBe(a.key);
+      expect(repeat.affinityHit).toBe(true);
+      expect(repeat.pool).toBe("tertiary");
+    });
+
+    test("Affinity broken when account on cooldown → reassigned via cascade", () => {
+      const km = create();
+      const a = km.addKey(VALID_KEY_1, "a");
+      const b = km.addKey(VALID_KEY_2, "b");
+
+      km.getKeyForConversation("conv-1");
+      km.recordRateLimit(a, 9999);
+
+      const repeat = km.getKeyForConversation("conv-1");
+      expect(repeat.entry?.key).toBe(b.key);
+      expect(repeat.remapped).toBe(true);
+    });
+
+    test("Affinity broken when account disabled → reassigned", () => {
+      const km = create();
+      const a = km.addKey(VALID_KEY_1, "a");
+      const b = km.addKey(VALID_KEY_2, "b");
+
+      km.getKeyForConversation("conv-1");
+      km.updateKeyPriority(a.key, 4);
+
+      const repeat = km.getKeyForConversation("conv-1");
+      expect(repeat.entry?.key).toBe(b.key);
+      expect(repeat.remapped).toBe(true);
+    });
+
+    test("Affinity broken when account outside allowedDays → reassigned", () => {
+      const km = create();
+      const a = km.addKey(VALID_KEY_1, "a");
+      const b = km.addKey(VALID_KEY_2, "b");
+
+      km.getKeyForConversation("conv-1");
+      const today = new Date().getDay();
+      km.updateKeyAllowedDays(a.key, [0, 1, 2, 3, 4, 5, 6].filter((d) => d !== today));
+
+      const repeat = km.getKeyForConversation("conv-1");
+      expect(repeat.entry?.key).toBe(b.key);
+      expect(repeat.remapped).toBe(true);
+    });
+  });
+
+  // ── Filters preserved ────────────────────────────────────────────────────
+
+  describe("Filters (preserved behavior)", () => {
+    test("Disabled (priority 4) accounts never selected", () => {
+      const km = create();
+      km.addKey(VALID_KEY_1, "disabled");
+      const live = km.addKey(VALID_KEY_2, "live");
+      km.updateKeyPriority(VALID_KEY_1, 4);
+      for (let i = 0; i < 5; i++) {
+        const pick = km.getNextAvailableKey()!;
+        expect(pick.key).toBe(live.key);
+        km.recordRequest(pick);
+      }
+    });
+
+    test("excludedKeys parameter respected", () => {
+      const km = create();
+      const a = km.addKey(VALID_KEY_1, "a");
+      const b = km.addKey(VALID_KEY_2, "b");
+      const pick = km.getNextAvailableKey(new Set([a.key]));
+      expect(pick?.key).toBe(b.key);
+    });
+
+    test("excludedKeys returning empty fallback when all excluded", () => {
+      const km = create();
+      const a = km.addKey(VALID_KEY_1, "a");
+      const b = km.addKey(VALID_KEY_2, "b");
+      const pick = km.getNextAvailableKey(new Set([a.key, b.key]));
+      expect(pick).toBeNull();
+    });
+  });
+
+  // ── Selection result observability ──────────────────────────────────────
+
+  describe("Selection result fields", () => {
+    test("pool field reflects the chosen account's pool", () => {
+      const km = create();
+      const a = km.addKey(VALID_KEY_1, "p");
+      km.updateKeyPriority(VALID_KEY_1, 1);
+      const sel = km.getKeyForConversation("conv-1");
+      expect(sel.entry?.key).toBe(a.key);
+      expect(sel.pool).toBe("primary");
+    });
+
+    test("pool field is 'secondary' when Normal is demoted and chosen", () => {
+      const km = create();
+      const n = km.addKey(VALID_KEY_1, "n-hot");
+      setWindows(km, n, [{ name: "unified-7d", util: 0.80 }]);
+      const sel = km.getKeyForConversation("conv-1");
+      expect(sel.pool).toBe("secondary");
+    });
+
+    test("pool field is 'tertiary' when Fallback is demoted and chosen", () => {
+      const km = create();
+      const f = km.addKey(VALID_KEY_1, "f-hot");
+      km.updateKeyPriority(VALID_KEY_1, 3);
+      setWindows(km, f, [{ name: "unified-7d", util: 0.55 }]);
+      const sel = km.getKeyForConversation("conv-1");
+      expect(sel.pool).toBe("tertiary");
+    });
+
+    test("pool is null when no entry can be chosen", () => {
+      const km = create();
+      const k = km.addKey(VALID_KEY_1, "k");
+      km.recordRateLimit(k, 9999);
+      const sel = km.getKeyForConversation("conv-1");
+      expect(sel.entry).toBeNull();
+      expect(sel.pool).toBeNull();
+    });
+
+    test("worstHeadroom is the chosen key's headroom (1 - max util across 5h/7d)", () => {
+      const km = create();
+      const a = km.addKey(VALID_KEY_1, "a");
+      setWindows(km, a, [
+        { name: "unified-5h", util: 0.40 },
+        { name: "unified-7d", util: 0.30 },
+      ]);
+      const sel = km.getKeyForConversation(null);
+      expect(sel.entry?.key).toBe(a.key);
+      expect(sel.worstHeadroom).toBeCloseTo(0.60, 5);
+    });
+
+    test("priorityTier mirrors the chosen account's configured priority", () => {
+      const km = create();
+      km.addKey(VALID_KEY_1, "p");
+      const n = km.addKey(VALID_KEY_2, "n-hot");
+      km.updateKeyPriority(VALID_KEY_1, 1);
+      // Push n to Secondary so the Preferred wins by cascade
+      setWindows(km, n, [{ name: "unified-7d", util: 0.80 }]);
+      const sel = km.getKeyForConversation("conv-1");
+      expect(sel.priorityTier).toBe(1);
+    });
+
+    test("requestsByTier increments per recorded request, keyed by priority", () => {
+      const km = create();
+      const p = km.addKey(VALID_KEY_1, "p");
+      const n = km.addKey(VALID_KEY_2, "n");
+      km.updateKeyPriority(VALID_KEY_1, 1);
+      expect(km.getRequestsByTier()).toEqual({});
+      km.recordRequest(p);
+      km.recordRequest(p);
+      km.recordRequest(n);
+      expect(km.getRequestsByTier()).toEqual({ "1": 2, "2": 1 });
+    });
+  });
+
+  // ── End-to-end / compound scenarios ─────────────────────────────────────
+
+  describe("Compound scenarios", () => {
+    test("Mixed pool: Preferred, Normal-cool, Fallback-cool — all in Primary, sorted by reset", () => {
+      const km = create();
+      const baseNow = Date.now();
+      const p = km.addKey(VALID_KEY_1, "p");
+      const n = km.addKey(VALID_KEY_2, "n");
+      const f = km.addKey(VALID_KEY_3, "f");
+      km.updateKeyPriority(VALID_KEY_1, 1);
+      km.updateKeyPriority(VALID_KEY_3, 3);
+      // f has the soonest weekly reset
+      setWindows(km, p, [{ name: "unified-7d", util: 0.10, resetAt: baseNow + SEVEN_D * 0.75 }]);
+      setWindows(km, n, [{ name: "unified-7d", util: 0.10, resetAt: baseNow + SEVEN_D / 2 }]);
+      setWindows(km, f, [{ name: "unified-7d", util: 0.10, resetAt: baseNow + SEVEN_D / 4 }]);
+
+      // First 3 picks should all go to f (soonest reset, all in Primary, no rotation pressure)
+      for (let i = 0; i < 3; i++) {
+        const pick = km.getKeyForConversation(`conv-${i}`);
+        expect(pick.entry?.key).toBe(f.key);
+      }
+    });
+
+    test("Mixed pool: cooldown on Primary, Secondary takes over with bucket-of-3", () => {
+      const km = create();
+      const baseNow = Date.now();
+      const p = km.addKey(VALID_KEY_1, "p");
+      const n1 = km.addKey(VALID_KEY_2, "n1-hot");
+      const n2 = km.addKey(VALID_KEY_3, "n2-hot");
+      km.updateKeyPriority(VALID_KEY_1, 1);
+      setWindows(km, n1, [{ name: "unified-7d", util: 0.80, resetAt: baseNow + SEVEN_D / 4 }]);
+      setWindows(km, n2, [{ name: "unified-7d", util: 0.80, resetAt: baseNow + SEVEN_D / 2 }]);
+      km.recordRateLimit(p, 9999);
+
+      const picks: string[] = [];
+      for (let i = 0; i < 6; i++) {
+        const pick = km.getKeyForConversation(`conv-${i}`);
+        picks.push(pick.entry!.key);
+        km.recordRequest(pick.entry!);
+      }
+      expect(picks.slice(0, 3)).toEqual([n1.key, n1.key, n1.key]);
+      expect(picks.slice(3, 6)).toEqual([n2.key, n2.key, n2.key]);
+    });
+
+    test("Cascade transition: Primary becomes available again mid-stream → routing returns to Primary", () => {
+      const km = create();
+      const p = km.addKey(VALID_KEY_1, "p");
+      const n = km.addKey(VALID_KEY_2, "n-hot");
+      km.updateKeyPriority(VALID_KEY_1, 1);
+      // n must be Secondary so the cascade is meaningful
+      setWindows(km, n, [{ name: "unified-7d", util: 0.80 }]);
+      km.recordRateLimit(p, 1);
+      // First pick: Primary on cooldown → cascades to Secondary (n)
+      expect(km.getKeyForConversation("c1").entry?.key).toBe(n.key);
+      // Clear the cooldown
+      km.resetKeyCooldowns();
+      // Now a fresh pick should go back to Primary
+      expect(km.getKeyForConversation("c2").entry?.key).toBe(p.key);
+    });
+
+    test("Pool transition: Normal at 70% (Primary) → drift to 80% → next pick avoids it", () => {
+      const km = create();
+      const baseNow = Date.now();
+      const a = km.addKey(VALID_KEY_4, "n-warm");
+      const b = km.addKey(VALID_KEY_5, "n-cool");
+      // Equal priority (default 2). a has soonest reset → would pick first.
+      setWindows(km, a, [{ name: "unified-7d", util: 0.70, resetAt: baseNow + SEVEN_D / 4 }]);
+      setWindows(km, b, [{ name: "unified-7d", util: 0.10, resetAt: baseNow + SEVEN_D / 2 }]);
+      // a is in Primary now (70% < 75%) — wins on soonest-reset rule
+      expect(km.getNextAvailableKey()?.key).toBe(a.key);
+
+      // Drift a to 80% — now in Secondary, b becomes the only Primary
+      setWindows(km, a, [{ name: "unified-7d", util: 0.80, resetAt: baseNow + SEVEN_D / 4 }]);
+      expect(km.getNextAvailableKey()?.key).toBe(b.key);
+    });
+
+    test("All Primary excluded by allowedDays + cooldown combo → cascade still works", () => {
+      const km = create();
+      const today = new Date().getDay();
+      const banned = km.addKey(VALID_KEY_1, "p-banned");
+      const cooled = km.addKey(VALID_KEY_2, "p-cooled");
+      const n = km.addKey(VALID_KEY_3, "n-hot");
+      km.updateKeyPriority(VALID_KEY_1, 1);
+      km.updateKeyPriority(VALID_KEY_2, 1);
+      km.updateKeyAllowedDays(banned.key, [0, 1, 2, 3, 4, 5, 6].filter((d) => d !== today));
+      km.recordRateLimit(cooled, 9999);
+      setWindows(km, n, [{ name: "unified-7d", util: 0.80 }]);
+      expect(km.getNextAvailableKey()?.key).toBe(n.key);
+    });
+  });
+
+  // ── Additional edge cases (extra coverage) ─────────────────────────────
+
+  describe("Edge cases & coverage gaps", () => {
+    test("Normal: weekly < 75% but only that window present → Primary (5h treated as 0)", () => {
+      const km = create();
+      const entry = km.addKey(VALID_KEY_1, "n-w-only");
+      setWindows(km, entry, [{ name: "unified-7d", util: 0.74 }]);
+      expect(callAssignPool(km, entry)).toBe("primary");
+    });
+
+    test("Normal: 5h < 75% but only that window present → Primary", () => {
+      const km = create();
+      const entry = km.addKey(VALID_KEY_1, "n-5h-only");
+      setWindows(km, entry, [{ name: "unified-5h", util: 0.74 }]);
+      expect(callAssignPool(km, entry)).toBe("primary");
+    });
+
+    test("Normal: 80% weekly + 30% 5h → Secondary (weekly above gate decides)", () => {
+      const km = create();
+      const entry = km.addKey(VALID_KEY_1, "n-mixed");
+      setWindows(km, entry, [
+        { name: "unified-7d", util: 0.80 },
+        { name: "unified-5h", util: 0.30 },
+      ]);
+      expect(callAssignPool(km, entry)).toBe("secondary");
+    });
+
+    test("Normal: 30% weekly + 80% 5h → Secondary (5h above gate decides)", () => {
+      const km = create();
+      const entry = km.addKey(VALID_KEY_1, "n-mixed-rev");
+      setWindows(km, entry, [
+        { name: "unified-7d", util: 0.30 },
+        { name: "unified-5h", util: 0.80 },
+      ]);
+      expect(callAssignPool(km, entry)).toBe("secondary");
+    });
+
+    test("Fallback: 30% weekly + 60% 5h → Tertiary (5h above 50% decides)", () => {
+      const km = create();
+      const entry = km.addKey(VALID_KEY_1, "f-mixed");
+      km.updateKeyPriority(VALID_KEY_1, 3);
+      setWindows(km, entry, [
+        { name: "unified-7d", util: 0.30 },
+        { name: "unified-5h", util: 0.60 },
+      ]);
+      expect(callAssignPool(km, entry)).toBe("tertiary");
+    });
+
+    test("Near-reset on 5h window is ignored — Normal at 99% 5h near reset stays Primary", () => {
+      const km = create();
+      const entry = km.addKey(VALID_KEY_1, "n-5h-near");
+      const elapsed = FIVE_H * 0.97;
+      const resetIn = FIVE_H - elapsed;
+      setWindows(km, entry, [
+        { name: "unified-5h", util: 0.99, resetAt: Date.now() + resetIn },
+      ]);
+      expect(callAssignPool(km, entry)).toBe("primary");
+    });
+
+    test("Cascade: every account on cooldown across all pools → null", () => {
+      const km = create();
+      const p = km.addKey(VALID_KEY_1, "p");
+      const n = km.addKey(VALID_KEY_2, "n-hot");
+      const f = km.addKey(VALID_KEY_3, "f-hot");
+      km.updateKeyPriority(VALID_KEY_1, 1);
+      km.updateKeyPriority(VALID_KEY_3, 3);
+      setWindows(km, n, [{ name: "unified-7d", util: 0.80 }]);
+      setWindows(km, f, [{ name: "unified-7d", util: 0.60 }]);
+      km.recordRateLimit(p, 9999);
+      km.recordRateLimit(n, 9999);
+      km.recordRateLimit(f, 9999);
+      expect(km.getNextAvailableKey()).toBeNull();
+    });
+
+    test("Cascade with multiple Tertiary candidates: bucket-of-3 still applies", () => {
+      const km = create();
+      const baseNow = Date.now();
+      const f1 = km.addKey(VALID_KEY_1, "f1");
+      const f2 = km.addKey(VALID_KEY_2, "f2");
+      km.updateKeyPriority(VALID_KEY_1, 3);
+      km.updateKeyPriority(VALID_KEY_2, 3);
+      setWindows(km, f1, [{ name: "unified-7d", util: 0.55, resetAt: baseNow + SEVEN_D / 4 }]);
+      setWindows(km, f2, [{ name: "unified-7d", util: 0.55, resetAt: baseNow + SEVEN_D / 2 }]);
+      const picks: string[] = [];
+      for (let i = 0; i < 6; i++) {
+        const pick = km.getKeyForConversation(`c-${i}`);
+        picks.push(pick.entry!.key);
+        km.recordRequest(pick.entry!);
+      }
+      expect(picks.slice(0, 3)).toEqual([f1.key, f1.key, f1.key]);
+      expect(picks.slice(3, 6)).toEqual([f2.key, f2.key, f2.key]);
+    });
+
+    test("Recent session count survives reload (affinities are persisted)", () => {
+      const km1 = create();
+      km1.addKey(VALID_KEY_1, "a");
+      km1.addKey(VALID_KEY_2, "b");
+      // Two affinities pre-loaded onto a
+      km1.getKeyForConversation("c-1");
+      km1.getKeyForConversation("c-2");
+      km1.close();
+
+      const km2 = create();
+      // a now has 2 recent sessions, b has 0; both bucket 0; alphabetical → a
+      const third = km2.getKeyForConversation("c-3");
+      expect(third.entry?.key).toBe(VALID_KEY_1);
+      // Fourth lands on b (a fills to 3)
+      const fourth = km2.getKeyForConversation("c-4");
+      expect(fourth.entry?.key).toBe(VALID_KEY_2);
+    });
+
+    test("excludedKeys interacting with pool: all Primary excluded → drops to Secondary", () => {
+      const km = create();
+      const p = km.addKey(VALID_KEY_1, "p");
+      const n = km.addKey(VALID_KEY_2, "n-hot");
+      km.updateKeyPriority(VALID_KEY_1, 1);
+      setWindows(km, n, [{ name: "unified-7d", util: 0.80 }]);
+      const pick = km.getNextAvailableKey(new Set([p.key]));
+      expect(pick?.key).toBe(n.key);
+    });
+
+    test("Sort precedence: bucket beats weekly reset — A (3 sessions, soonest reset) loses to B (0 sessions)", () => {
+      const km = create();
+      const baseNow = Date.now();
+      const a = km.addKey(VALID_KEY_1, "a");
+      const b = km.addKey(VALID_KEY_2, "b");
+      // a has the soonest reset
+      setWindows(km, a, [{ name: "unified-7d", util: 0.10, resetAt: baseNow + SEVEN_D / 4 }]);
+      setWindows(km, b, [{ name: "unified-7d", util: 0.10, resetAt: baseNow + SEVEN_D / 2 }]);
+
+      // Three picks fill A's bucket
+      km.recordRequest(km.getKeyForConversation("c1").entry!);
+      km.recordRequest(km.getKeyForConversation("c2").entry!);
+      km.recordRequest(km.getKeyForConversation("c3").entry!);
+
+      // The 4th pick must skip A (bucket full) → goes to B even though A still resets sooner
+      const fourth = km.getKeyForConversation("c4");
+      expect(fourth.entry?.key).toBe(b.key);
+    });
+
+    test("Sort precedence: weekly beats 5h — A (later weekly, sooner 5h) loses to B", () => {
+      const km = create();
+      const baseNow = Date.now();
+      const a = km.addKey(VALID_KEY_1, "a");
+      const b = km.addKey(VALID_KEY_2, "b");
+      setWindows(km, a, [
+        { name: "unified-7d", util: 0.10, resetAt: baseNow + SEVEN_D * 0.75 },
+        { name: "unified-5h", util: 0.10, resetAt: baseNow + FIVE_H * 0.10 },
+      ]);
+      setWindows(km, b, [
+        { name: "unified-7d", util: 0.10, resetAt: baseNow + SEVEN_D * 0.25 },
+        { name: "unified-5h", util: 0.10, resetAt: baseNow + FIVE_H * 0.90 },
+      ]);
+      expect(km.getNextAvailableKey()?.key).toBe(b.key);
+    });
+
+    test("Sort precedence: 5h beats util — A (later 5h, hotter) loses to B", () => {
+      const km = create();
+      const baseNow = Date.now();
+      const a = km.addKey(VALID_KEY_1, "a");
+      const b = km.addKey(VALID_KEY_2, "b");
+      const sevenD = baseNow + SEVEN_D / 2;
+      setWindows(km, a, [
+        { name: "unified-7d", util: 0.10, resetAt: sevenD },
+        { name: "unified-5h", util: 0.40, resetAt: baseNow + FIVE_H * 0.75 },
+      ]);
+      setWindows(km, b, [
+        { name: "unified-7d", util: 0.10, resetAt: sevenD },
+        { name: "unified-5h", util: 0.10, resetAt: baseNow + FIVE_H * 0.25 },
+      ]);
+      expect(km.getNextAvailableKey()?.key).toBe(b.key);
+    });
+
+    test("Sort precedence: util beats MRU — older usage on hot account beats fresher use on cool account", () => {
+      const km = create();
+      const baseNow = Date.now();
+      const sevenD = baseNow + SEVEN_D / 2;
+      const fiveH = baseNow + FIVE_H / 2;
+      const cool = km.addKey(VALID_KEY_1, "cool");
+      const hot = km.addKey(VALID_KEY_2, "hot");
+      setWindows(km, cool, [
+        { name: "unified-7d", util: 0.10, resetAt: sevenD },
+        { name: "unified-5h", util: 0.10, resetAt: fiveH },
+      ]);
+      setWindows(km, hot, [
+        { name: "unified-7d", util: 0.40, resetAt: sevenD },
+        { name: "unified-5h", util: 0.40, resetAt: fiveH },
+      ]);
+      // cool was used most recently
+      km.recordRequest(cool);
+      // hot still wins (worstHeadroom 0.6 < 0.9)
+      expect(km.getNextAvailableKey()?.key).toBe(hot.key);
+    });
+
+    test("Bucket boundary: 3rd session still on same account, 4th rolls over", () => {
+      const km = create();
+      const baseNow = Date.now();
+      const a = km.addKey(VALID_KEY_1, "a");
+      const b = km.addKey(VALID_KEY_2, "b");
+      setWindows(km, a, [{ name: "unified-7d", util: 0.10, resetAt: baseNow + SEVEN_D / 4 }]);
+      setWindows(km, b, [{ name: "unified-7d", util: 0.10, resetAt: baseNow + SEVEN_D / 2 }]);
+      const picks: string[] = [];
+      for (let i = 0; i < 4; i++) {
+        const pick = km.getKeyForConversation(`c-${i}`);
+        picks.push(pick.entry!.key);
+        km.recordRequest(pick.entry!);
+      }
+      expect(picks).toEqual([a.key, a.key, a.key, b.key]);
+    });
+
+    test("Bucket math: 5 sessions = bucket 1 (floor 5/3); 6 sessions = bucket 2", () => {
+      const km = create();
+      const baseNow = Date.now();
+      const a = km.addKey(VALID_KEY_1, "a");
+      const b = km.addKey(VALID_KEY_2, "b");
+      setWindows(km, a, [{ name: "unified-7d", util: 0.10, resetAt: baseNow + SEVEN_D / 4 }]);
+      setWindows(km, b, [{ name: "unified-7d", util: 0.10, resetAt: baseNow + SEVEN_D / 2 }]);
+
+      // Inject 6 affinities for A and 5 for B directly
+      const affinities = (km as unknown as { conversationAffinities: Map<string, {
+        conversationKey: string; key: string; sessionId: string | null; assignedAt: number; lastSeenAt: number;
+      }> }).conversationAffinities;
+      for (let i = 0; i < 6; i++) {
+        affinities.set(`a-conv-${i}`, {
+          conversationKey: `a-conv-${i}`, key: a.key, sessionId: null,
+          assignedAt: unixMs(Date.now()), lastSeenAt: unixMs(Date.now()),
+        });
+      }
+      for (let i = 0; i < 5; i++) {
+        affinities.set(`b-conv-${i}`, {
+          conversationKey: `b-conv-${i}`, key: b.key, sessionId: null,
+          assignedAt: unixMs(Date.now()), lastSeenAt: unixMs(Date.now()),
+        });
+      }
+      // A bucket = 6/3 = 2; B bucket = 5/3 = 1; B wins on bucket
+      expect(km.getNextAvailableKey()?.key).toBe(b.key);
+    });
+
+    test("Past-reset window utilization is ignored by assignPool (window pruned by maintenance)", () => {
+      const km = create();
+      const entry = km.addKey(VALID_KEY_1, "n-past");
+      // util 90% but resetAt is in the past → window will be pruned
+      km.recordCapacityObservation(entry, {
+        seenAt: unixMs(Date.now() - 10_000),
+        httpStatus: 200,
+        windows: [{ windowName: "unified-7d", status: "allowed", utilization: 0.90, resetAt: unixMs(Date.now() - 1) }],
+      });
+      // After prunePastResetCapacityWindows the entry has no usable window → Primary
+      // (We exercise the user-visible behavior via getNextAvailableKey)
+      const pick = km.getNextAvailableKey();
+      expect(pick?.key).toBe(entry.key);
+    });
+
+    test("Affinity hit pool field reflects current pool placement", () => {
+      const km = create();
+      const a = km.addKey(VALID_KEY_1, "a");
+      km.addKey(VALID_KEY_2, "b");
+      km.getKeyForConversation("c1");
+      // Drift a into Secondary
+      setWindows(km, a, [{ name: "unified-7d", util: 0.80 }]);
+      const hit = km.getKeyForConversation("c1");
+      expect(hit.affinityHit).toBe(true);
+      expect(hit.pool).toBe("secondary");
+    });
+
+    test("global_sticky_fallback selection (null conversationKey) populates pool field", () => {
+      const km = create();
+      km.addKey(VALID_KEY_1, "a");
+      const sel = km.getKeyForConversation(null);
+      expect(sel.entry?.key).toBe(VALID_KEY_1);
+      expect(sel.pool).toBe("primary");
+      expect(sel.routingDecision).toBe("global_sticky_fallback");
+    });
+
+    test("Selection result entry/pool both null when fleet is empty", () => {
+      const km = create();
+      const sel = km.getKeyForConversation("c1");
+      expect(sel.entry).toBeNull();
+      expect(sel.pool).toBeNull();
+      expect(sel.priorityTier).toBeNull();
+      expect(sel.worstHeadroom).toBeNull();
+    });
   });
 });

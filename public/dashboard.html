@@ -795,6 +795,7 @@ function humanizeClaim(claim) {
 function humanizePriority(priority) {
   if (Number(priority) === 1) return 'Preferred';
   if (Number(priority) === 3) return 'Fallback';
+  if (Number(priority) === 4) return 'Disabled';
   return 'Normal';
 }
 function shortOrg(org) {
@@ -1501,6 +1502,7 @@ function renderKeysInner() {
             <option value="1"${pri === 1 ? ' selected' : ''}>Preferred</option>
             <option value="2"${pri === 2 ? ' selected' : ''}>Normal</option>
             <option value="3"${pri === 3 ? ' selected' : ''}>Fallback</option>
+            <option value="4"${pri === 4 ? ' selected' : ''}>Disabled</option>
           </select>
           <div class="day-picker" title="Days this key is eligible for routing">
             ${[['Su',0],['Mo',1],['Tu',2],['We',3],['Th',4],['Fr',5],['Sa',6]].map(([label, day]) => {

@@ -317,17 +317,21 @@ describe("Capacity admin payloads", () => {
       km.addKey(VALID_KEY, "cap-admin-a");
       km.addKey(VALID_KEY_2, "cap-admin-b");
 
+      // Bucket-of-3: first three sessions land on the alphabetically-first key,
+      // the fourth rolls over to the next account.
       expect(km.getKeyForConversation("user-1:session-a", "session-a").entry?.key).toBe(VALID_KEY);
-      expect(km.getKeyForConversation("user-1:session-b", "session-b").entry?.key).toBe(VALID_KEY_2);
+      expect(km.getKeyForConversation("user-1:session-b", "session-b").entry?.key).toBe(VALID_KEY);
+      expect(km.getKeyForConversation("user-1:session-c", "session-c").entry?.key).toBe(VALID_KEY);
+      expect(km.getKeyForConversation("user-1:session-d", "session-d").entry?.key).toBe(VALID_KEY_2);
 
       const res = await handleAdminRoute(makeReq("GET", "/admin/stats"), km, makeConfig(), st);
       const body = await jsonBody(res!) as {
         keys: Array<{ label: string; recentSessions15m: Array<{ sessionId: string }> }>;
       };
 
-      const keyed = new Map(body.keys.map((key) => [String(key.label), key.recentSessions15m.map((session) => session.sessionId)]));
-      expect(keyed.get("cap-admin-a")).toEqual(["session-a"]);
-      expect(keyed.get("cap-admin-b")).toEqual(["session-b"]);
+      const keyed = new Map(body.keys.map((key) => [String(key.label), key.recentSessions15m.map((session) => session.sessionId).sort()]));
+      expect(keyed.get("cap-admin-a")).toEqual(["session-a", "session-b", "session-c"]);
+      expect(keyed.get("cap-admin-b")).toEqual(["session-d"]);
     } finally {
       Date.now = originalNow;
     }
@@ -1228,6 +1232,17 @@ describe("POST /admin/keys/update", () => {
   test("returns 400 for invalid priority value", async () => {
     const res = await handleAdminRoute(makeReq("POST", "/admin/keys/update", { key: "sk-ant-api03-x", priority: 5 }), km, config, st)!;
     expect(res!.status).toBe(400);
+  });
+
+  test("accepts priority 4 (disabled) and excludes the key from rotation", async () => {
+    km.addKey("sk-ant-api03-disable-me-via-admin0", "to-disable");
+    const res = await handleAdminRoute(
+      makeReq("POST", "/admin/keys/update", { key: "sk-ant-api03-disable-me-via-admin0", priority: 4 }),
+      km, config, st,
+    )!;
+    expect(res!.status).toBe(200);
+    expect(km.listKeys().find(k => k.label === "to-disable")!.priority).toBe(4);
+    expect(km.getNextAvailableKey()).toBeNull();
   });
 
   test("updates both label and priority together", async () => {

@@ -99,7 +99,7 @@ export interface ApiKeyEntry {
   capacity: ApiKeyCapacityState;
   /** Key is rate-limited until this time. 0 = available now. */
   availableAt: UnixMs;
-  /** Selection priority: 1 = Preferred, 2 = Normal, 3 = Fallback. */
+  /** Selection priority: 1 = Preferred, 2 = Normal, 3 = Fallback, 4 = Disabled (excluded from routing). */
   priority: number;
   /** Days of the week this key may be used. 0=Sun … 6=Sat. Default: all days. */
   allowedDays: readonly number[];

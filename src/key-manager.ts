@@ -160,10 +160,11 @@ interface ConversationKeySelection {
   priorityTier: number | null;
   candidateCount: number;
   conversationCountForSelectedKey: number | null;
-  /** The tier that would have won under strict priority if it differs from
-   *  priorityTier. Only set when traffic spills into a lower tier because
-   *  higher tiers failed their reserve floor. */
-  spilledFromTier: number | null;
+  /** Pool that the selected entry belongs to right now. Reflects the per-account
+   *  gating: Preferred is always Primary; Normal drops to Secondary once either
+   *  window exceeds NORMAL_PRIMARY_UTIL_LIMIT; Fallback drops to Tertiary once
+   *  either exceeds FALLBACK_PRIMARY_UTIL_LIMIT. */
+  pool: Pool | null;
   /** Worst-window headroom (0..1) of the selected key at decision time. */
   worstHeadroom: number | null;
 }
@@ -180,19 +181,28 @@ function currentBucketKey(): string {
   return new Date().toISOString().slice(0, 13);
 }
 
+// Returns the resetAt of the named window for sorting purposes. Missing
+// windows or unknown reset times sort first so a fresh account gets probed
+// rather than parked indefinitely.
+function resetAtForSort(entry: ApiKeyEntry, windowName: string): number {
+  for (const window of entry.capacity.windows) {
+    if (window.windowName !== windowName) continue;
+    if (window.resetAt === null || window.resetAt === undefined) return 0;
+    return window.resetAt;
+  }
+  return 0;
+}
+
 const CONVERSATION_AFFINITY_TTL_MS = 60 * 60 * 1000;
 const RECENT_SESSION_WINDOW_MS = 15 * 60 * 1000;
 const PRIMARY_CAPACITY_WINDOW_NAMES = new Set(["unified", "unified-5h", "unified-7d"]);
 
-// Tier-reserve routing. Lower-priority tiers keep a headroom floor: the proxy
-// will NOT draw on them unless they have at least this much budget remaining.
-// Tier 1 (Preferred) has no reserve — it's the daily driver.
-// Tier 2 (Normal) keeps 30% headroom for emergencies.
-// Tier 3 (Fallback) keeps 50% headroom — the true reserve.
-// If no tier's keys meet their floor, selection falls through to strict
-// priority over all available keys (reserves are a planning signal, not a
-// hard gate — a key is only truly unavailable during rate-limit cooldown).
-const TIER_RESERVE_HEADROOM: Record<number, number> = { 1: 0, 2: 0.30, 3: 0.50 };
+// Sentinel priority for keys the user has paused. Disabled keys are retained
+// in storage (so settings, labels, and history survive) but are excluded from
+// routing, availability counts, and cooldown timing. Numerically higher than
+// any real tier so existing "sort by priority ascending" ordering puts them
+// at the bottom of the UI without extra branching.
+const DISABLED_PRIORITY = 4;
 
 // Window durations in ms. Used to compute elapsed fraction.
 const WINDOW_DURATION_MS: Record<string, number> = {
@@ -202,58 +212,22 @@ const WINDOW_DURATION_MS: Record<string, number> = {
 
 // Windows this close to their reset are ignored for headroom math — a key
 // with 36% utilization and 2 minutes until reset isn't really "used 36%",
-// it's about to refresh. Using it for reserve-gating would trap us.
+// it's about to refresh.
 const NEAR_RESET_ELAPSED_THRESHOLD = 0.95;
 
-// Layer 2 spread thresholds — pace-aware probabilistic routing. When the
-// chosen tier is projected to exceed budget (peak at or near 100%), route
-// SOME fraction of new conversations to the next eligible tier instead.
-// Layer 1 only spills when the preferred tier is in cooldown; Layer 2 spills
-// preemptively based on trajectory.
-//
-// Probability scales with projected peak. Deliberately non-linear: no spread
-// at all below 85% peak (noise territory), then a steep ramp, capped at 60%
-// so the preferred tier still takes the majority of traffic even in a crisis
-// — priority order is preserved as a soft preference, not a hard rule.
-const LAYER2_SPREAD_START_PEAK = 0.85;
-const LAYER2_MAX_SPREAD_PROBABILITY = 0.60;
+// Per-account pool gating thresholds. A Normal account stays in the Primary
+// pool while both its weekly and 5h utilization are under 75%; a Fallback
+// account stays in Primary while both are under 50%. Otherwise it drops to
+// Secondary (Normal) or Tertiary (Fallback) and only serves traffic when the
+// higher pools have no available account.
+const NORMAL_PRIMARY_UTIL_LIMIT = 0.75;
+const FALLBACK_PRIMARY_UTIL_LIMIT = 0.50;
 
-// Dead-zone thresholds for projection — same purpose as in pace.js. A key
-// that's 1% into its window with 5% utilization would project as "hits 500%"
-// which is pure noise. Require enough elapsed time and utilization for the
-// pace to carry real signal.
-const LAYER2_MIN_ELAPSED_FRACTION = 0.02;
-const LAYER2_MIN_ELAPSED_MS = 60 * 1000;
-const LAYER2_MIN_UTILIZATION = 0.01;
+// How many sessions one account claims before the rotation moves on. Sessions
+// are counted from the last RECENT_SESSION_WINDOW_MS of conversation activity.
+const SESSION_BUCKET_SIZE = 3;
 
-// Cap projection at 1.5 to keep the probability function bounded — beyond
-// "projecting to 150% of limit" the signal is just "definitely over" and
-// the extra precision doesn't change the routing decision.
-const LAYER2_PROJECTION_CAP = 1.5;
-
-export function spreadProbabilityFromPeak(peak: number): number {
-  if (peak < LAYER2_SPREAD_START_PEAK) return 0;
-  if (peak < 0.95) return 0.10;
-  if (peak < 1.00) return 0.30;
-  if (peak < 1.20) return 0.50;
-  return LAYER2_MAX_SPREAD_PROBABILITY;
-}
-
-// Deterministic hash of a conversation key into [0, 1). Same conversation
-// always resolves to the same value, so spread decisions are stable for a
-// given conversation — if a conversation's hash puts it in the "spread"
-// bucket, it reliably goes to tier 2 every time its affinity would be
-// re-evaluated, rather than flip-flopping.
-//
-// FNV-1a — fast, uniform enough for this purpose. Not a cryptographic hash.
-export function hashConversationKeyToUnit(key: string): number {
-  let h = 0x811c9dc5;
-  for (let i = 0; i < key.length; i++) {
-    h ^= key.charCodeAt(i);
-    h = Math.imul(h, 0x01000193);
-  }
-  return (h >>> 0) / 0x100000000;
-}
+type Pool = "primary" | "secondary" | "tertiary";
 
 export class KeyManager {
   private keys: ApiKeyEntry[] = [];
@@ -268,14 +242,10 @@ export class KeyManager {
   private readonly capacityTsAccumulator = new Map<string, CapacityBucketAccumulator>();
   // In-memory cumulative counter of requests routed to each priority tier.
   // Not persisted — resets on restart. Serves as live observability for the
-  // tier-reserve routing policy ("is traffic actually spilling to tier 2/3?").
+  // routing policy ("is traffic actually flowing through Normal/Fallback?").
   private readonly requestsByTier: Map<number, number> = new Map();
-  // RNG for Layer 2 spread decisions on the no-conversationKey path
-  // (global sticky fallback). Overridable for deterministic tests.
-  private rng: () => number = Math.random;
 
-  constructor(dataDir: string, opts?: { rng?: () => number }) {
-    if (opts?.rng) this.rng = opts.rng;
+  constructor(dataDir: string) {
     this.dbPath = process.env["DB_PATH"] ?? join(dataDir, "state.db");
     mkdirSync(dirname(this.dbPath), { recursive: true });
 
@@ -630,33 +600,19 @@ export class KeyManager {
     const currentDay = new Date().getDay();
     const available = this.keys.filter(
       (k) =>
-        k.availableAt <= currentTime
+        k.priority !== DISABLED_PRIORITY
+        && k.availableAt <= currentTime
         && k.allowedDays.includes(currentDay)
         && !excludedKeys?.has(k.key),
     );
     if (available.length === 0) return null;
 
-    const stickySort = (a: ApiKeyEntry, b: ApiKeyEntry): number => {
-      // Within a tier: prefer the most recently used (sticky reuse).
-      return (b.stats.lastUsedAt ?? 0) - (a.stats.lastUsedAt ?? 0);
-    };
-
-    const tiers = Array.from(new Set(available.map((k) => k.priority))).sort((a, b) => a - b);
-    // Walk tiers ascending; first tier with ≥1 key above its reserve floor wins.
-    for (const tier of tiers) {
-      const floor = TIER_RESERVE_HEADROOM[tier] ?? 0;
-      const eligible = available
-        .filter((k) => k.priority === tier && this.worstHeadroom(k, currentTime) >= floor)
-        .sort(stickySort);
-      if (eligible.length > 0) return eligible[0]!;
-    }
-    // Every tier gated by its reserve floor. Fall through to strict priority
-    // (reserves are a planning signal, not a hard gate on routing).
-    const fallbackPool = [...available].sort((a, b) => {
-      if (a.priority !== b.priority) return a.priority - b.priority;
-      return stickySort(a, b);
-    });
-    return fallbackPool[0] ?? null;
+    const sessionCounts = this.countRecentSessionsByKey(
+      unixMs(currentTime - RECENT_SESSION_WINDOW_MS),
+    );
+    const pool = this.pickActivePool(available, currentTime);
+    if (pool.length === 0) return null;
+    return [...pool].sort((a, b) => this.compareForSort(a, b, sessionCounts, currentTime))[0]!;
   }
 
   getKeyForConversation(conversationKey: string | null, sessionId?: string | null): ConversationKeySelection {
@@ -671,7 +627,7 @@ export class KeyManager {
         priorityTier: entry?.priority ?? null,
         candidateCount: entry === null ? 0 : this.countAvailableKeysAtPriority(entry.priority),
         conversationCountForSelectedKey: entry === null ? null : this.countConversationAffinitiesByKey().get(entry.key) ?? 0,
-        spilledFromTier: null,
+        pool: entry === null ? null : this.assignPool(entry, currentTime),
         worstHeadroom: entry === null ? null : this.worstHeadroom(entry, currentTime),
       };
     }
@@ -693,13 +649,13 @@ export class KeyManager {
           priorityTier: mappedEntry.priority,
           candidateCount: this.countAvailableKeysAtPriority(mappedEntry.priority),
           conversationCountForSelectedKey: this.countConversationAffinitiesByKey().get(mappedEntry.key) ?? 0,
-          spilledFromTier: null,
+          pool: this.assignPool(mappedEntry, currentTime),
           worstHeadroom: this.worstHeadroom(mappedEntry, currentTime),
         };
       }
     }
 
-    const fallback = this.selectLeastLoadedAvailableKey(conversationKey);
+    const fallback = this.selectLeastLoadedAvailableKey();
     if (fallback === null) {
       return {
         entry: null,
@@ -709,7 +665,7 @@ export class KeyManager {
         priorityTier: null,
         candidateCount: 0,
         conversationCountForSelectedKey: null,
-        spilledFromTier: null,
+        pool: null,
         worstHeadroom: null,
       };
     }
@@ -732,7 +688,7 @@ export class KeyManager {
       priorityTier: fallback.priorityTier,
       candidateCount: fallback.candidateCount,
       conversationCountForSelectedKey: (fallback.conversationCounts.get(fallback.entry.key) ?? 0) + (existing?.key === fallback.entry.key ? 0 : 1),
-      spilledFromTier: fallback.spilledFromTier,
+      pool: fallback.pool,
       worstHeadroom: fallback.worstHeadroom,
     };
   }
@@ -743,6 +699,7 @@ export class KeyManager {
 
     let earliest = Infinity;
     for (const k of this.keys) {
+      if (k.priority === DISABLED_PRIORITY) continue;
       if (k.allowedDays.includes(currentDay)) {
         earliest = Math.min(earliest, k.availableAt);
       } else {
@@ -755,7 +712,12 @@ export class KeyManager {
   availableCount(): number {
     const currentTime = now();
     const currentDay = new Date().getDay();
-    return this.keys.filter((k) => k.availableAt <= currentTime && k.allowedDays.includes(currentDay)).length;
+    return this.keys.filter(
+      (k) =>
+        k.priority !== DISABLED_PRIORITY
+        && k.availableAt <= currentTime
+        && k.allowedDays.includes(currentDay),
+    ).length;
   }
 
   totalCount(): number {
@@ -1134,7 +1096,9 @@ export class KeyManager {
         capacity: { ...k.capacity, windows: sanitizeCapacityWindows(k.capacity.windows, currentTime) },
         capacityHealth: this.getCapacityHealth(k),
         availableAt: k.availableAt,
-        isAvailable: k.availableAt <= currentTime && k.allowedDays.includes(currentDay),
+        isAvailable: k.priority !== DISABLED_PRIORITY
+          && k.availableAt <= currentTime
+          && k.allowedDays.includes(currentDay),
         priority: k.priority,
         allowedDays: k.allowedDays,
         recentErrors: recentErrs.get(k.label) ?? 0,
@@ -1501,7 +1465,9 @@ export class KeyManager {
   private isKeyAvailable(entry: ApiKeyEntry): boolean {
     const currentTime = now();
     const currentDay = new Date().getDay();
-    return entry.availableAt <= currentTime && entry.allowedDays.includes(currentDay);
+    return entry.priority !== DISABLED_PRIORITY
+      && entry.availableAt <= currentTime
+      && entry.allowedDays.includes(currentDay);
   }
 
   private countAvailableKeysAtPriority(priority: number): number {
@@ -1564,167 +1530,122 @@ export class KeyManager {
     return Math.max(0, 1 - highestUtilization);
   }
 
-  // Layer 2 projection: max projected-at-reset utilization across the tier's
-  // available keys. Linear projection from each key's current pace
-  // (util / elapsedFraction). Capped at LAYER2_PROJECTION_CAP to keep the
-  // probability curve bounded. Returns null when no key in the tier has
-  // enough data to project — in which case Layer 2 stays silent and Layer 1
-  // is the only force. This is the "tier 1 is unknown" safe default.
-  //
-  // Exposed via test-friendly public wrapper `_testTierProjectedPeak` below.
-  private tierProjectedPeak(tier: number, currentTime: UnixMs): number | null {
-    let peak: number | null = null;
-    for (const entry of this.keys) {
-      if (entry.priority !== tier) continue;
-      if (!this.isKeyAvailable(entry)) continue;
-      for (const window of entry.capacity.windows) {
-        if (window.windowName !== "unified-5h" && window.windowName !== "unified-7d") continue;
-        const duration = WINDOW_DURATION_MS[window.windowName];
-        if (duration === undefined) continue;
-        if (window.utilization === null || window.utilization === undefined) continue;
-        if (window.resetAt === null || window.resetAt === undefined) continue;
-        const elapsedMs = duration - (window.resetAt - currentTime);
-        if (elapsedMs <= 0) continue;
-        const elapsedFraction = elapsedMs / duration;
-        if (elapsedFraction < LAYER2_MIN_ELAPSED_FRACTION) continue;
-        if (elapsedMs < LAYER2_MIN_ELAPSED_MS) continue;
-        if (window.utilization < LAYER2_MIN_UTILIZATION) continue;
-        const projected = Math.min(LAYER2_PROJECTION_CAP, window.utilization / elapsedFraction);
-        if (peak === null || projected > peak) peak = projected;
+  // Per-account pool placement. Preferred accounts are always Primary; Normal
+  // and Fallback drop out of Primary once either of their two utilization
+  // windows crosses the gating threshold. Unknown utilization counts as 0%
+  // so freshly added keys aren't penalized.
+  private assignPool(entry: ApiKeyEntry, currentTime: UnixMs): Pool {
+    if (entry.priority === 1) return "primary";
+
+    let weeklyUtil = 0;
+    let fiveHourUtil = 0;
+    for (const window of entry.capacity.windows) {
+      if (window.windowName !== "unified-5h" && window.windowName !== "unified-7d") continue;
+      const duration = WINDOW_DURATION_MS[window.windowName];
+      if (duration === undefined) continue;
+      if (window.resetAt !== null && window.resetAt !== undefined) {
+        const elapsedFraction = (duration - (window.resetAt - currentTime)) / duration;
+        if (elapsedFraction >= NEAR_RESET_ELAPSED_THRESHOLD) continue;
       }
+      const util = window.utilization ?? 0;
+      if (window.windowName === "unified-7d" && util > weeklyUtil) weeklyUtil = util;
+      if (window.windowName === "unified-5h" && util > fiveHourUtil) fiveHourUtil = util;
     }
-    return peak;
-  }
 
-  // Decide whether this particular selection should spread to the next
-  // tier. Deterministic given a conversationKey (same conversation =
-  // consistent decision — avoids flap if a conversation re-evaluates).
-  // Random for the no-conversationKey path (proxied tools without an
-  // affinity hint).
-  private shouldSpread(conversationKey: string | null, probability: number): boolean {
-    if (probability <= 0) return false;
-    if (probability >= 1) return true;
-    if (conversationKey !== null && conversationKey !== "") {
-      return hashConversationKeyToUnit(conversationKey) < probability;
+    if (entry.priority === 2) {
+      return weeklyUtil < NORMAL_PRIMARY_UTIL_LIMIT && fiveHourUtil < NORMAL_PRIMARY_UTIL_LIMIT
+        ? "primary"
+        : "secondary";
     }
-    return this.rng() < probability;
+    // Fallback (priority 3) and any future lower tier follow the same rule.
+    return weeklyUtil < FALLBACK_PRIMARY_UTIL_LIMIT && fiveHourUtil < FALLBACK_PRIMARY_UTIL_LIMIT
+      ? "primary"
+      : "tertiary";
   }
 
-  // Public test hooks. Prefixed with underscore to signal "not part of the
-  // public API" while still being reachable from same-package tests. Mirrors
-  // the pattern already used in the test suite for accessing internals.
-  public _testTierProjectedPeak(tier: number, currentTime: UnixMs): number | null {
-    return this.tierProjectedPeak(tier, currentTime);
-  }
-  public _testShouldSpread(conversationKey: string | null, probability: number): boolean {
-    return this.shouldSpread(conversationKey, probability);
+  // Cascade: walk Primary → Secondary → Tertiary, returning the first
+  // non-empty pool. Caller is expected to have already filtered on
+  // `isKeyAvailable` (cooldown / disabled / allowedDays).
+  private pickActivePool(available: ApiKeyEntry[], currentTime: UnixMs): ApiKeyEntry[] {
+    const buckets: Record<Pool, ApiKeyEntry[]> = { primary: [], secondary: [], tertiary: [] };
+    for (const entry of available) {
+      buckets[this.assignPool(entry, currentTime)].push(entry);
+    }
+    if (buckets.primary.length > 0) return buckets.primary;
+    if (buckets.secondary.length > 0) return buckets.secondary;
+    return buckets.tertiary;
   }
 
-  private selectLeastLoadedAvailableKey(conversationKey: string | null = null): {
+  // Compound sort comparator for accounts inside the active pool. Primary
+  // signal is the rotation-of-3 bucket: the account that has fewest recent
+  // sessions modulo 3 wins, so each account claims SESSION_BUCKET_SIZE
+  // sessions before the rotation moves on. Secondary signals are reset
+  // timing (drain accounts whose budget is about to refresh) and current
+  // utilization (drain hot accounts toward their limit). Final tiebreak is
+  // sticky most-recently-used so a quiet workload doesn't hop unnecessarily.
+  private compareForSort(
+    a: ApiKeyEntry,
+    b: ApiKeyEntry,
+    sessionCounts: Map<ApiKey, number>,
+    currentTime: UnixMs,
+  ): number {
+    const bucketA = Math.floor((sessionCounts.get(a.key) ?? 0) / SESSION_BUCKET_SIZE);
+    const bucketB = Math.floor((sessionCounts.get(b.key) ?? 0) / SESSION_BUCKET_SIZE);
+    if (bucketA !== bucketB) return bucketA - bucketB;
+
+    const weeklyDiff = resetAtForSort(a, "unified-7d") - resetAtForSort(b, "unified-7d");
+    if (weeklyDiff !== 0) return weeklyDiff;
+
+    const fiveHourDiff = resetAtForSort(a, "unified-5h") - resetAtForSort(b, "unified-5h");
+    if (fiveHourDiff !== 0) return fiveHourDiff;
+
+    const headroomDiff = this.worstHeadroom(a, currentTime) - this.worstHeadroom(b, currentTime);
+    if (headroomDiff !== 0) return headroomDiff;
+
+    const lastUsedDiff = (b.stats.lastUsedAt ?? 0) - (a.stats.lastUsedAt ?? 0);
+    if (lastUsedDiff !== 0) return lastUsedDiff;
+
+    return a.label.localeCompare(b.label);
+  }
+
+  private countRecentSessionsByKey(cutoff: UnixMs): Map<ApiKey, number> {
+    const counts = new Map<ApiKey, number>();
+    for (const affinity of this.conversationAffinities.values()) {
+      if (affinity.lastSeenAt < cutoff) continue;
+      counts.set(affinity.key, (counts.get(affinity.key) ?? 0) + 1);
+    }
+    return counts;
+  }
+
+  private selectLeastLoadedAvailableKey(): {
     entry: ApiKeyEntry;
     priorityTier: number;
     candidateCount: number;
     conversationCounts: Map<ApiKey, number>;
-    /** The tier that would have won under strict priority, if it differs
-     *  from the tier actually chosen. Set when a tier was gated out by its
-     *  reserve floor OR when Layer 2 pace-awareness preemptively spilled
-     *  traffic to a lower tier. Useful for logs. */
-    spilledFromTier: number | null;
+    pool: Pool;
     /** Worst-window headroom of the selected key, for log observability. */
     worstHeadroom: number;
   } | null {
     const available = this.keys.filter((entry) => this.isKeyAvailable(entry));
     if (available.length === 0) return null;
 
-    const conversationCounts = this.countConversationAffinitiesByKey();
     const currentTime = now();
-    const tiers = Array.from(new Set(available.map((entry) => entry.priority))).sort((a, b) => a - b);
-    const strictBestTier = tiers[0]!;
+    const pool = this.pickActivePool(available, currentTime);
+    if (pool.length === 0) return null;
 
-    // Layer 1: walk tiers ascending, find the first tier with any key that
-    // clears its reserve floor. Keys below their tier's floor are held in
-    // reserve so we don't burn through the "backup" tiers casually.
-    const eligibleByTier = new Map<number, ApiKeyEntry[]>();
-    let chosenTier: number | null = null;
-    for (const tier of tiers) {
-      const floor = TIER_RESERVE_HEADROOM[tier] ?? 0;
-      const eligible = available.filter(
-        (entry) => entry.priority === tier && this.worstHeadroom(entry, currentTime) >= floor,
-      );
-      if (eligible.length === 0) continue;
-      eligibleByTier.set(tier, eligible);
-      if (chosenTier === null) chosenTier = tier;
-    }
-
-    if (chosenTier !== null) {
-      // Layer 2: if the chosen tier is projected to exceed its budget before
-      // the window resets, there's a chance we route this request to the
-      // next-eligible tier instead. Spread probability scales with projected
-      // peak — the closer the tier is to blowing past 100%, the more we lean
-      // on the backup tiers. Tier priority is still a SOFT preference:
-      // maximum spread is capped so the preferred tier keeps the majority.
-      const peak = this.tierProjectedPeak(chosenTier, currentTime);
-      if (peak !== null && peak >= LAYER2_SPREAD_START_PEAK) {
-        const probability = spreadProbabilityFromPeak(peak);
-        if (this.shouldSpread(conversationKey, probability)) {
-          for (const nextTier of tiers) {
-            if (nextTier <= chosenTier) continue;
-            const nextEligible = eligibleByTier.get(nextTier);
-            if (!nextEligible || nextEligible.length === 0) continue;
-            const nextCandidates = this.sortCandidatesForSelection(nextEligible, conversationCounts);
-            return {
-              entry: nextCandidates[0]!,
-              priorityTier: nextTier,
-              candidateCount: nextCandidates.length,
-              conversationCounts,
-              spilledFromTier: chosenTier,
-              worstHeadroom: this.worstHeadroom(nextCandidates[0]!, currentTime),
-            };
-          }
-          // No lower tier had eligible keys — fall through to the chosen tier.
-        }
-      }
-
-      const chosenEligible = eligibleByTier.get(chosenTier)!;
-      const candidates = this.sortCandidatesForSelection(chosenEligible, conversationCounts);
-      return {
-        entry: candidates[0]!,
-        priorityTier: chosenTier,
-        candidateCount: candidates.length,
-        conversationCounts,
-        spilledFromTier: chosenTier !== strictBestTier ? strictBestTier : null,
-        worstHeadroom: this.worstHeadroom(candidates[0]!, currentTime),
-      };
-    }
-
-    // Every tier was gated out by its reserve floor. Reserves are a planning
-    // signal, not a hard gate — fall through to strict priority over all
-    // available keys so we don't strand traffic when upstream capacity exists.
-    const floorFallbackEligible = available.filter((entry) => entry.priority === strictBestTier);
-    const candidates = this.sortCandidatesForSelection(floorFallbackEligible, conversationCounts);
+    const sessionCounts = this.countRecentSessionsByKey(
+      unixMs(currentTime - RECENT_SESSION_WINDOW_MS),
+    );
+    const sorted = [...pool].sort((a, b) => this.compareForSort(a, b, sessionCounts, currentTime));
+    const winner = sorted[0]!;
     return {
-      entry: candidates[0]!,
-      priorityTier: strictBestTier,
-      candidateCount: candidates.length,
-      conversationCounts,
-      spilledFromTier: null,
-      worstHeadroom: this.worstHeadroom(candidates[0]!, currentTime),
+      entry: winner,
+      priorityTier: winner.priority,
+      candidateCount: this.countAvailableKeysAtPriority(winner.priority),
+      conversationCounts: this.countConversationAffinitiesByKey(),
+      pool: this.assignPool(winner, currentTime),
+      worstHeadroom: this.worstHeadroom(winner, currentTime),
     };
-  }
-
-  private sortCandidatesForSelection(
-    pool: ApiKeyEntry[],
-    conversationCounts: Map<ApiKey, number>,
-  ): ApiKeyEntry[] {
-    return [...pool].sort((a, b) => {
-      const conversationDiff = (conversationCounts.get(a.key) ?? 0) - (conversationCounts.get(b.key) ?? 0);
-      if (conversationDiff !== 0) return conversationDiff;
-
-      const lastUsedDiff = (a.stats.lastUsedAt ?? 0) - (b.stats.lastUsedAt ?? 0);
-      if (lastUsedDiff !== 0) return lastUsedDiff;
-
-      return a.label.localeCompare(b.label);
-    });
   }
 
   // ── Persistence ─────────────────────────────────────────────────

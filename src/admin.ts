@@ -237,8 +237,8 @@ async function handleUpdateKey(
   if (hasLabel && body.label!.length === 0) {
     return json({ error: "'label' must not be empty" }, 400);
   }
-  if (hasPriority && (body.priority! < 1 || body.priority! > 3)) {
-    return json({ error: "'priority' must be 1, 2, or 3" }, 400);
+  if (hasPriority && (body.priority! < 1 || body.priority! > 4)) {
+    return json({ error: "'priority' must be 1, 2, 3, or 4" }, 400);
   }
   if (hasAllowedDays) {
     const days = body.allowedDays!;

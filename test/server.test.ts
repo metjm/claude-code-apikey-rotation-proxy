@@ -1664,8 +1664,11 @@ describe("Rate Limit Rotation End-to-End", () => {
     });
 
     proxy = startProxy({ dataDir, upstream: upstream.url });
-    proxy.km.addKey(FAKE_KEY_1, "limited-key");
-    proxy.km.addKey(FAKE_KEY_2, "good-key");
+    // Labels are picked so the new alphabetical-final tiebreak puts the
+    // limited key first — the rotation under test only fires when that key
+    // serves the initial request and returns 429.
+    proxy.km.addKey(FAKE_KEY_1, "a-limited-key");
+    proxy.km.addKey(FAKE_KEY_2, "z-good-key");
   });
 
   afterAll(() => {
@@ -1699,10 +1702,10 @@ describe("Rate Limit Rotation End-to-End", () => {
     const body = await stats.json();
 
     const limitedKey = body.keys.find(
-      (k: { label: string }) => k.label === "limited-key",
+      (k: { label: string }) => k.label === "a-limited-key",
     );
     const goodKey = body.keys.find(
-      (k: { label: string }) => k.label === "good-key",
+      (k: { label: string }) => k.label === "z-good-key",
     );
 
     expect(limitedKey).toBeDefined();
@@ -1730,7 +1733,7 @@ describe("Rate Limit Rotation End-to-End", () => {
     let stats = await fetch(`${proxy.url}/admin/stats`);
     let body = await stats.json();
     let limitedKey = body.keys.find(
-      (k: { label: string }) => k.label === "limited-key",
+      (k: { label: string }) => k.label === "a-limited-key",
     );
     expect(limitedKey).toBeDefined();
 
@@ -1748,7 +1751,7 @@ describe("Rate Limit Rotation End-to-End", () => {
       stats = await fetch(`${proxy.url}/admin/stats`);
       body = await stats.json();
       limitedKey = body.keys.find(
-        (k: { label: string }) => k.label === "limited-key",
+        (k: { label: string }) => k.label === "a-limited-key",
       );
       expect(limitedKey).toBeDefined();
     }
@@ -1766,7 +1769,7 @@ describe("Rate Limit Rotation End-to-End", () => {
     stats = await fetch(`${proxy.url}/admin/stats`);
     body = await stats.json();
     limitedKey = body.keys.find(
-      (k: { label: string }) => k.label === "limited-key",
+      (k: { label: string }) => k.label === "a-limited-key",
     );
     expect(limitedKey).toBeDefined();
     expect(limitedKey.isAvailable).toBe(true);

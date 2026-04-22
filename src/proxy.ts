@@ -130,7 +130,7 @@ type RoutingSelection = {
   readonly priorityTier: number | null;
   readonly candidateCount: number;
   readonly conversationCountForSelectedKey: number | null;
-  readonly spilledFromTier: number | null;
+  readonly pool: "primary" | "secondary" | "tertiary" | null;
   readonly worstHeadroom: number | null;
 };
 
@@ -276,7 +276,7 @@ export async function proxyRequest(
           priorityTier: preferredRetryKey.priority,
           candidateCount: 1,
           conversationCountForSelectedKey: null,
-          spilledFromTier: null,
+          pool: null,
           worstHeadroom: null,
         }
       : keyManager.getKeyForConversation(conversationKey, sessionId);
@@ -316,7 +316,7 @@ export async function proxyRequest(
       priorityTier: selection.priorityTier,
       candidateCount: selection.candidateCount,
       conversationCountForSelectedKey: selection.conversationCountForSelectedKey,
-      spilledFromTier: selection.spilledFromTier,
+      pool: selection.pool,
       worstHeadroom: selection.worstHeadroom,
       upstreamUrl,
       requestContentLength,
