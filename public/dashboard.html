@@ -223,63 +223,106 @@
 
   /* Fleet pressure — one horizontal gradient strip per window (5h, 7d).
      Color at each x position encodes projected fleet pressure at that
-     future moment. The state word on the left is the hero: one glance
-     tells you whether the fleet is fine or in trouble, no reading. */
+     future moment. Hover the strip for time + expected utilization. */
   .fleet-pressure {
-    display: flex; flex-direction: column; gap: 14px;
-    padding: 14px 16px;
+    display: flex; flex-direction: column; gap: 16px;
+    padding: 18px 18px;
     background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
     font-feature-settings: "tnum" 1, "zero" 1;
   }
   .fleet-pressure-row {
     display: grid;
-    grid-template-columns: 32px minmax(90px, auto) 1fr auto;
+    grid-template-columns: 36px auto 1fr auto;
     align-items: center;
-    gap: 4px 14px;
+    gap: 0 12px;
   }
   .fleet-pressure-label {
-    font-size: 11px; font-weight: 600; letter-spacing: 0.1em;
-    text-transform: uppercase; color: var(--text-dim);
+    display: inline-block;
+    padding: 3px 8px; border-radius: 4px;
+    background: var(--bg3); color: var(--text);
+    font-size: 10px; font-weight: 700; letter-spacing: 0.08em;
+    text-transform: uppercase; text-align: center;
+    border: 1px solid var(--border);
   }
   .fleet-pressure-state {
-    font-size: 18px; font-weight: 600; letter-spacing: 0.01em;
-    text-transform: uppercase; color: var(--text-dim);
-    transition: color 400ms ease-out;
+    display: inline-flex; align-items: center; justify-content: center;
+    min-width: 86px;
+    padding: 3px 12px; border-radius: 999px;
+    font-size: 11px; font-weight: 600; letter-spacing: 0.06em;
+    text-transform: uppercase;
+    transition: background 400ms ease-out, color 400ms ease-out, border-color 400ms ease-out;
+    background: rgba(63,185,80,0.12); color: var(--green);
+    border: 1px solid rgba(63,185,80,0.28);
   }
-  .fleet-pressure-state.tone-dim    { color: var(--green); }
-  .fleet-pressure-state.tone-yellow { color: var(--yellow); }
-  .fleet-pressure-state.tone-orange { color: #ffa657; }
-  .fleet-pressure-state.tone-red    { color: var(--red); }
+  .fleet-pressure-state.tone-dim    { background: rgba(63,185,80,0.12); color: var(--green);  border-color: rgba(63,185,80,0.28); }
+  .fleet-pressure-state.tone-yellow { background: rgba(210,153,34,0.14); color: var(--yellow); border-color: rgba(210,153,34,0.32); }
+  .fleet-pressure-state.tone-orange { background: rgba(255,166,87,0.14); color: #ffa657;       border-color: rgba(255,166,87,0.32); }
+  .fleet-pressure-state.tone-red    { background: rgba(248,81,73,0.14);  color: var(--red);    border-color: rgba(248,81,73,0.32); }
   .fleet-pressure-strip {
-    position: relative; height: 18px;
-    border-radius: 3px; background: var(--bg3);
+    position: relative; height: 22px;
+    border-radius: 4px; background: var(--bg3);
     overflow: hidden;
     min-width: 160px;
+    box-shadow: inset 0 0 0 1px rgba(255,255,255,0.03);
+    cursor: crosshair;
   }
   .fleet-pressure-strip-fill {
     position: absolute; inset: 0;
     transition: background 800ms ease-out;
   }
   .fleet-pressure-strip-now {
-    position: absolute; top: -2px; bottom: -2px; left: 0; width: 2px;
-    background: var(--text-bright); opacity: 0.8;
+    position: absolute; top: -3px; bottom: -3px; left: 0; width: 2px;
+    background: var(--text-bright); opacity: 0.85;
     border-radius: 1px;
     pointer-events: none;
+    box-shadow: 0 0 0 1px rgba(0,0,0,0.6);
   }
+  .fleet-pressure-strip-cursor {
+    position: absolute; top: -3px; bottom: -3px; width: 2px;
+    background: var(--text-bright); opacity: 0;
+    border-radius: 1px;
+    pointer-events: none;
+    transform: translateX(-1px);
+    transition: opacity 120ms ease-out;
+  }
+  .fleet-pressure-strip:hover .fleet-pressure-strip-cursor { opacity: 0.9; }
+  .fleet-pressure-tooltip {
+    position: absolute; bottom: calc(100% + 8px);
+    left: 0; transform: translateX(-50%);
+    padding: 6px 9px; border-radius: 4px;
+    background: var(--bg); border: 1px solid var(--border);
+    font-size: 11px; line-height: 1.4; color: var(--text);
+    white-space: nowrap;
+    pointer-events: none;
+    box-shadow: 0 4px 10px rgba(0,0,0,0.35);
+    opacity: 0;
+    transition: opacity 120ms ease-out;
+    z-index: 5;
+  }
+  .fleet-pressure-strip:hover .fleet-pressure-tooltip { opacity: 1; }
+  .fleet-pressure-tooltip-time { color: var(--text-dim); font-size: 10px; letter-spacing: 0.02em; }
+  .fleet-pressure-tooltip-util { font-weight: 600; font-size: 12px; margin-top: 1px; }
+  .fleet-pressure-tooltip-util.tone-dim    { color: var(--green); }
+  .fleet-pressure-tooltip-util.tone-yellow { color: var(--yellow); }
+  .fleet-pressure-tooltip-util.tone-orange { color: #ffa657; }
+  .fleet-pressure-tooltip-util.tone-red    { color: var(--red); }
+  .fleet-pressure-tooltip-factor { color: var(--text-dim); font-size: 10px; margin-top: 2px; }
   .fleet-pressure-caption {
     font-size: 11px; color: var(--text-dim); white-space: nowrap;
-  }
-  .fleet-pressure-caption b { color: var(--text); font-weight: 500; }
-  .fleet-pressure-horizon {
-    font-size: 10px; color: var(--text-dim); letter-spacing: 0.05em;
     text-align: right;
+  }
+  .fleet-pressure-caption-peak {
+    color: var(--text); font-weight: 500;
+  }
+  .fleet-pressure-caption-when {
+    color: var(--text-dim);
   }
   .fleet-pressure-empty {
     font-size: 11px; color: var(--text-dim); padding: 4px 0;
   }
   .fleet-pressure-learning {
-    display: inline-block; margin-left: 6px;
-    padding: 1px 5px; border-radius: 3px;
+    display: inline-block; margin-left: 8px;
+    padding: 1px 6px; border-radius: 999px;
     font-size: 10px; font-weight: 500;
     background: rgba(88,166,255,0.12); color: var(--blue);
     border: 1px solid rgba(88,166,255,0.25);
@@ -1252,16 +1295,17 @@ function renderFleetPressure() {
     return fleetPressureRow(name, summaryWindow, now);
   }).join('');
   el.innerHTML = rows;
+  installFleetPressureHover();
 }
 
 function fleetPressureRow(windowName, summaryWindow, now) {
   const gradient = window.PaceMath.computeFleetPressureGradient(keys, windowName, now, 60, seasonalFactors);
   const stateWord = window.PaceMath.pressureStateWord(gradient.currentTone);
   const shortName = windowName === 'unified-5h' ? '5h' : '7d';
-  const horizonLabel = windowName === 'unified-5h' ? '+5h' : '+7d';
+  const durationMs = windowName === 'unified-5h' ? 5 * 60 * 60 * 1000 : 7 * 24 * 60 * 60 * 1000;
   const maxPctRaw = gradient.maxPressureInWindow;
   const maxPct = maxPctRaw > 0 ? Math.round(maxPctRaw * 100) + '%' : '—';
-  const peakWhen = gradient.peakTimeMs ? fmtPeakTime(gradient.peakTimeMs, now) : null;
+  const peakWhen = gradient.peakTimeMs && maxPctRaw > 0.3 ? fmtPeakTime(gradient.peakTimeMs, now) : null;
   const learning = seasonalFactors !== null
     && typeof seasonalFactors.totalSamples === 'number'
     && seasonalFactors.totalSamples < LEARNING_SAMPLE_THRESHOLD;
@@ -1277,26 +1321,113 @@ function fleetPressureRow(windowName, summaryWindow, now) {
     stops = `linear-gradient(to right, ${stops})`;
   }
 
-  const captionPeak = peakWhen !== null && maxPctRaw > 0.3
-    ? `peak <b>${esc(maxPct)}</b> ${esc(peakWhen)}`
-    : `peak <b>${esc(maxPct)}</b>`;
+  const peakHtml = peakWhen !== null
+    ? `<span class="fleet-pressure-caption-peak">${esc(maxPct)}</span> <span class="fleet-pressure-caption-when">${esc(peakWhen)}</span>`
+    : `<span class="fleet-pressure-caption-peak">${esc(maxPct)}</span>`;
   const learningPill = learning
     ? ' <span class="fleet-pressure-learning" title="Fewer than 2 weeks of hourly history — seasonality is still being learned. Projection falls back to current pace.">Learning</span>'
     : '';
 
-  const title = `${friendlyWindowName(windowName)} — projected fleet pressure over the next ${shortName}. Color reflects fleet-mean utilization at each future moment: green = all accounts < 30%, red = fleet approaching its limit. Peak in window: ${maxPct}${peakWhen ? ' ' + peakWhen : ''}.`;
+  const title = `${friendlyWindowName(windowName)} — projected fleet pressure over the next ${shortName}. Hover to inspect a moment. Peak in window: ${maxPct}${peakWhen ? ' ' + peakWhen : ''}.`;
+
+  const samplesPayload = JSON.stringify(gradient.samples);
 
   return `
     <div class="fleet-pressure-row" title="${esc(title)}">
       <span class="fleet-pressure-label">${esc(shortName)}</span>
       <span class="fleet-pressure-state tone-${esc(gradient.currentTone)}">${esc(stateWord)}</span>
-      <div class="fleet-pressure-strip">
+      <div class="fleet-pressure-strip"
+           data-window="${esc(windowName)}"
+           data-start-ms="${now}"
+           data-duration-ms="${durationMs}"
+           data-samples='${samplesPayload}'>
         <div class="fleet-pressure-strip-fill" style="background: ${stops}"></div>
         <div class="fleet-pressure-strip-now"></div>
+        <div class="fleet-pressure-strip-cursor"></div>
+        <div class="fleet-pressure-tooltip">
+          <div class="fleet-pressure-tooltip-time"></div>
+          <div class="fleet-pressure-tooltip-util"></div>
+          <div class="fleet-pressure-tooltip-factor"></div>
+        </div>
       </div>
-      <span class="fleet-pressure-caption">${captionPeak} · ${esc(horizonLabel)}${learningPill}</span>
+      <span class="fleet-pressure-caption">peak ${peakHtml}${learningPill}</span>
     </div>
   `;
+}
+
+function installFleetPressureHover() {
+  const root = document.getElementById('fleet-pressure');
+  if (!root || root.dataset.hoverInstalled === '1') return;
+  root.dataset.hoverInstalled = '1';
+
+  const onMove = (evt) => {
+    const strip = evt.target.closest('.fleet-pressure-strip');
+    if (!strip || !root.contains(strip)) return;
+    const rect = strip.getBoundingClientRect();
+    const x = Math.max(0, Math.min(rect.width, evt.clientX - rect.left));
+    const frac = rect.width > 0 ? x / rect.width : 0;
+    updateFleetPressureHover(strip, frac, x);
+  };
+  root.addEventListener('mousemove', onMove);
+}
+
+function updateFleetPressureHover(strip, frac, xPx) {
+  const cursor = strip.querySelector('.fleet-pressure-strip-cursor');
+  const tooltip = strip.querySelector('.fleet-pressure-tooltip');
+  if (!cursor || !tooltip) return;
+
+  const startMs = Number(strip.dataset.startMs);
+  const durationMs = Number(strip.dataset.durationMs);
+  const windowName = strip.dataset.window;
+  let samples;
+  try { samples = JSON.parse(strip.dataset.samples || '[]'); } catch { samples = []; }
+
+  cursor.style.left = `${xPx}px`;
+
+  const t = startMs + frac * durationMs;
+  const timeLabel = fmtHoverTime(t, startMs);
+  const sample = samples.length > 0 ? nearestSample(samples, frac) : null;
+  const pct = sample ? Math.round(sample.pressure * 100) : 0;
+  const toneClass = sample ? `tone-${sample.tone}` : 'tone-dim';
+  const stateWord = sample ? window.PaceMath.pressureStateWord(sample.tone) : '—';
+  const factorLabel = fmtSeasonalFactorAt(t);
+
+  tooltip.style.left = `${xPx}px`;
+  const timeEl = tooltip.querySelector('.fleet-pressure-tooltip-time');
+  const utilEl = tooltip.querySelector('.fleet-pressure-tooltip-util');
+  const factorEl = tooltip.querySelector('.fleet-pressure-tooltip-factor');
+  if (timeEl) timeEl.textContent = timeLabel;
+  if (utilEl) {
+    utilEl.textContent = sample ? `${pct}% · ${stateWord}` : '—';
+    utilEl.className = `fleet-pressure-tooltip-util ${toneClass}`;
+  }
+  if (factorEl) factorEl.textContent = factorLabel;
+  void windowName;
+}
+
+function nearestSample(samples, frac) {
+  const idx = Math.max(0, Math.min(samples.length - 1, Math.round(frac * (samples.length - 1))));
+  return samples[idx];
+}
+
+function fmtHoverTime(tMs, nowMs) {
+  const delta = tMs - nowMs;
+  const d = new Date(tMs);
+  if (Math.abs(delta) < 60 * 1000) return 'now';
+  if (delta < 24 * 60 * 60 * 1000) {
+    return d.toLocaleString([], { weekday: 'short', hour: 'numeric', minute: '2-digit', hour12: true });
+  }
+  return d.toLocaleString([], { month: 'short', day: 'numeric', weekday: 'short', hour: 'numeric', hour12: true });
+}
+
+function fmtSeasonalFactorAt(tMs) {
+  if (!seasonalFactors || !seasonalFactors.slots) return '';
+  const factor = window.PaceMath.factorFor(seasonalFactors, tMs);
+  if (factor === 1) return 'typical hour';
+  const pct = factor > 1
+    ? `${(factor).toFixed(1)}× typical`
+    : `${Math.round(factor * 100)}% of typical`;
+  return pct;
 }
 
 function fmtPeakTime(peakTimeMs, nowMs) {

@@ -329,6 +329,65 @@ describe("Dashboard fleet-pressure gradient (real browser)", () => {
     }
   }, 60_000);
 
+  test("hovering a gradient strip reveals a tooltip with time + expected utilization", async () => {
+    const dataDir = makeTempDir();
+    const upstream = startMockUpstream();
+    const proxy = startProxy({ dataDir, upstream: upstream.url, adminToken: ADMIN_TOKEN });
+
+    try {
+      const e1 = proxy.km.addKey(VALID_KEY_1, "key-a");
+      const e2 = proxy.km.addKey(VALID_KEY_2, "key-b");
+      const e3 = proxy.km.addKey(VALID_KEY_3, "key-c");
+      seedSeasonalFactors(proxy.km);
+      seedCapacityWindows(proxy.km, [e1, e2, e3], [0.55, 0.6, 0.65]);
+
+      const page = await openDashboard(browser, proxy.url, ADMIN_TOKEN);
+      await page.waitForSelector("#fleet-pressure .fleet-pressure-strip", { timeout: 15_000 });
+
+      // Hover the middle of the 5h strip.
+      const strip = await page.$("#fleet-pressure .fleet-pressure-strip");
+      expect(strip).not.toBeNull();
+      const box = await strip!.boundingBox();
+      expect(box).not.toBeNull();
+      const centerX = box!.x + box!.width / 2;
+      const centerY = box!.y + box!.height / 2;
+      await page.mouse.move(centerX, centerY);
+
+      // Allow the mousemove handler to run and the tooltip to become visible.
+      await page.waitForFunction(
+        () => {
+          const tip = document.querySelector("#fleet-pressure .fleet-pressure-tooltip") as HTMLElement | null;
+          const utilEl = document.querySelector("#fleet-pressure .fleet-pressure-tooltip-util") as HTMLElement | null;
+          if (!tip || !utilEl) return false;
+          return window.getComputedStyle(tip).opacity === "1" && /\d+%/.test(utilEl.textContent ?? "");
+        },
+        { timeout: 5_000 },
+      );
+
+      const tipData = await page.evaluate(() => {
+        const time = document.querySelector("#fleet-pressure .fleet-pressure-tooltip-time")?.textContent?.trim() ?? "";
+        const util = document.querySelector("#fleet-pressure .fleet-pressure-tooltip-util")?.textContent?.trim() ?? "";
+        const utilClass = document.querySelector("#fleet-pressure .fleet-pressure-tooltip-util")?.className ?? "";
+        const factor = document.querySelector("#fleet-pressure .fleet-pressure-tooltip-factor")?.textContent?.trim() ?? "";
+        return { time, util, utilClass, factor };
+      });
+
+      // Tooltip fields populated.
+      expect(tipData.time.length).toBeGreaterThan(0);
+      expect(tipData.util).toMatch(/\d+%/);
+      // Tooltip util carries a tone class.
+      expect(tipData.utilClass).toMatch(/tone-(dim|yellow|orange|red)/);
+      // Seasonal factor line present (at least "typical hour" fallback for flat slots).
+      expect(tipData.factor.length).toBeGreaterThan(0);
+
+      await page.close();
+    } finally {
+      proxy.stop();
+      upstream.stop();
+      cleanupTempDir(dataDir);
+    }
+  }, 60_000);
+
   test("serves /admin/capacity/forecast with 168 slots and reflects Tuesday 2pm UTC spike", async () => {
     // Pure API assertion guarding the data contract the dashboard relies on.
     const dataDir = makeTempDir();
