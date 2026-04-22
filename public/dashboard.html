@@ -277,6 +277,14 @@
   .fleet-pressure-empty {
     font-size: 11px; color: var(--text-dim); padding: 4px 0;
   }
+  .fleet-pressure-learning {
+    display: inline-block; margin-left: 6px;
+    padding: 1px 5px; border-radius: 3px;
+    font-size: 10px; font-weight: 500;
+    background: rgba(88,166,255,0.12); color: var(--blue);
+    border: 1px solid rgba(88,166,255,0.25);
+    letter-spacing: 0.03em;
+  }
 
   /* Pace-demo banner */
   .pace-demo-banner {
@@ -651,6 +659,14 @@ let adminToken = sessionStorage.getItem('adminToken') || '';
 let keys = [];
 let tokens = [];
 let capacitySummary = null;
+// Seasonal request-volume factors (168 slots: dow × hour in UTC). Drives
+// the forecast gradient's seasonality-aware projection. Fetched from
+// /admin/capacity/forecast on init and refreshed every ~15 minutes.
+let seasonalFactors = null;
+// The dashboard is considered "still learning" until at least this many
+// hourly buckets have been seen — below that the factor table is too
+// sparse to trust and the projection falls back to pure-pace behavior.
+const LEARNING_SAMPLE_THRESHOLD = 24 * 7 * 2;
 let evtSource = null;
 const MAX_LOG = 200;
 const keyColorMap = {};
@@ -1239,15 +1255,17 @@ function renderFleetPressure() {
 }
 
 function fleetPressureRow(windowName, summaryWindow, now) {
-  const gradient = window.PaceMath.computeFleetPressureGradient(keys, windowName, now);
+  const gradient = window.PaceMath.computeFleetPressureGradient(keys, windowName, now, 60, seasonalFactors);
   const stateWord = window.PaceMath.pressureStateWord(gradient.currentTone);
   const shortName = windowName === 'unified-5h' ? '5h' : '7d';
   const horizonLabel = windowName === 'unified-5h' ? '+5h' : '+7d';
   const maxPctRaw = gradient.maxPressureInWindow;
   const maxPct = maxPctRaw > 0 ? Math.round(maxPctRaw * 100) + '%' : '—';
+  const peakWhen = gradient.peakTimeMs ? fmtPeakTime(gradient.peakTimeMs, now) : null;
+  const learning = seasonalFactors !== null
+    && typeof seasonalFactors.totalSamples === 'number'
+    && seasonalFactors.totalSamples < LEARNING_SAMPLE_THRESHOLD;
 
-  // Build CSS linear-gradient from the sample points. Each sample becomes
-  // a color stop; the browser interpolates between them smoothly.
   let stops;
   if (gradient.samples.length === 0) {
     stops = 'var(--bg3)';
@@ -1259,7 +1277,14 @@ function fleetPressureRow(windowName, summaryWindow, now) {
     stops = `linear-gradient(to right, ${stops})`;
   }
 
-  const title = `${friendlyWindowName(windowName)} — projected fleet pressure over the next ${shortName}. Worst-case key utilization at each future moment; color shifts dim→yellow→orange→red. Peak in window: ${maxPct}.`;
+  const captionPeak = peakWhen !== null && maxPctRaw > 0.3
+    ? `peak <b>${esc(maxPct)}</b> ${esc(peakWhen)}`
+    : `peak <b>${esc(maxPct)}</b>`;
+  const learningPill = learning
+    ? ' <span class="fleet-pressure-learning" title="Fewer than 2 weeks of hourly history — seasonality is still being learned. Projection falls back to current pace.">Learning</span>'
+    : '';
+
+  const title = `${friendlyWindowName(windowName)} — projected fleet pressure over the next ${shortName}. Color reflects fleet-mean utilization at each future moment: green = all accounts < 30%, red = fleet approaching its limit. Peak in window: ${maxPct}${peakWhen ? ' ' + peakWhen : ''}.`;
 
   return `
     <div class="fleet-pressure-row" title="${esc(title)}">
@@ -1269,9 +1294,21 @@ function fleetPressureRow(windowName, summaryWindow, now) {
         <div class="fleet-pressure-strip-fill" style="background: ${stops}"></div>
         <div class="fleet-pressure-strip-now"></div>
       </div>
-      <span class="fleet-pressure-caption">peak <b>${esc(maxPct)}</b> · ${esc(horizonLabel)}</span>
+      <span class="fleet-pressure-caption">${captionPeak} · ${esc(horizonLabel)}${learningPill}</span>
     </div>
   `;
+}
+
+function fmtPeakTime(peakTimeMs, nowMs) {
+  const deltaMs = peakTimeMs - nowMs;
+  if (deltaMs <= 60 * 1000) return 'now';
+  const d = new Date(peakTimeMs);
+  if (deltaMs < 24 * 60 * 60 * 1000) {
+    const label = d.toLocaleTimeString([], { hour: 'numeric', hour12: true });
+    return `around ${label}`;
+  }
+  const label = d.toLocaleString([], { weekday: 'short', hour: 'numeric', hour12: true });
+  return `around ${label}`;
 }
 
 function toneToColor(tone) {
@@ -1732,6 +1769,13 @@ async function refreshKeys() {
     capacitySummary = data.capacitySummary || capacitySummary;
     renderKeys();
     renderHeader();
+  } catch {}
+}
+
+async function refreshForecast() {
+  try {
+    seasonalFactors = await api('GET', '/admin/capacity/forecast');
+    renderCapacitySummary();
   } catch {}
 }
 
@@ -2322,16 +2366,20 @@ async function testWebhook(url) {
 // ── Init ───────────────────────────────────────────────────────
 let countdownInterval = null;
 let chartsRefreshInterval = null;
+let forecastRefreshInterval = null;
 function init() {
   connectSSE();
   refreshKeys();
   refreshTokens();
   loadCharts();
   refreshSchema();
+  refreshForecast();
   if (countdownInterval) clearInterval(countdownInterval);
   if (chartsRefreshInterval) clearInterval(chartsRefreshInterval);
+  if (forecastRefreshInterval) clearInterval(forecastRefreshInterval);
   countdownInterval = setInterval(() => { renderKeys(); renderHeader(); }, 1000);
   chartsRefreshInterval = setInterval(() => { loadCharts(); }, 30000);
+  forecastRefreshInterval = setInterval(() => { refreshForecast(); }, 15 * 60 * 1000);
 }
 </script>
 </body>

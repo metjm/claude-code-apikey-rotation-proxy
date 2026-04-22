@@ -342,31 +342,57 @@
     };
   }
 
-  // computeFleetPressureGradient: samples projected fleet pressure across
-  // a single window's horizon (5h or 7d, same length as the window itself).
+  // Thresholds for the fleet-saturation tone scale. Anchored so dim = "all
+  // accounts projected below 30% util" and red = "fleet mean projected at or
+  // above 70% (approaching the wall)". These are fleet-wide aggregates — a
+  // single hot account no longer paints the strip red on its own.
+  var PRESSURE_THRESHOLDS = {
+    coastingMax: 0.30,
+    steadyMax:   0.50,
+    watchMax:    0.70,
+  };
+
+  // Seasonal factor lookup. `table` is a SeasonalFactorTable ({ slots: [...] }).
+  // When absent, malformed, or the slot falls below the MIN_BASELINE_SAMPLES
+  // threshold (backend already stamps those as factor=1), we return 1.0 —
+  // the projection collapses to pure pace extrapolation in that case.
   //
-  // For each sample at future time T, we linearly project each key's
-  // utilization forward from its current pace (utilization / elapsed). If
-  // the key's resetAt falls between now and T, the projection resets to 0
-  // at that moment and resumes burning in the fresh cycle at the same
-  // rate. Fleet pressure at T is the MAX projected utilization across
-  // keys — the weakest link decides when the pool is in trouble.
+  // Exposed (via the API object) so callers/tests can reuse the same lookup.
+  function factorFor(table, tMs) {
+    if (!table || !table.slots || !table.slots.length) return 1;
+    var d = new Date(tMs);
+    if (Number.isNaN(d.getTime())) return 1;
+    var idx = d.getUTCDay() * 24 + d.getUTCHours();
+    var slot = table.slots[idx];
+    if (!slot || typeof slot.factor !== 'number' || !Number.isFinite(slot.factor)) return 1;
+    return slot.factor;
+  }
+
+  // computeFleetPressureGradient: samples projected fleet pressure across a
+  // single window's horizon (5h or 7d, same length as the window itself).
   //
-  // Dead-zone: a key in the first few minutes of its window has noisy
-  // pace and is excluded from projection. Unknown-headroom keys (no window
+  // For each sample at future time T we project each key's utilization forward
+  // by integrating its current burn rate modulated by the optional seasonality
+  // factor at each hour. When the key's resetAt falls between samples we
+  // zero the projection at the reset moment and resume burning into the fresh
+  // cycle. Fleet pressure at T is the MEAN projected utilization across the
+  // active fleet — on a saturation scale, 1.0 means "every account expected
+  // to be rate-limited", 0 means "everyone fresh".
+  //
+  // Dead-zone: a key in the first few minutes of its window has noisy pace
+  // and is excluded from projection. Unknown-headroom keys (no window
   // observed) contribute nothing — they're treated as "no data, no
-  // pressure to add" rather than optimistic full-budget.
+  // pressure to add".
   //
-  // Returns { samples: [{ position, pressure, tone }], currentTone, maxPressureInWindow }.
-  function computeFleetPressureGradient(keys, windowName, now, sampleCount) {
+  // Returns { samples, currentTone, maxPressureInWindow, peakTimeMs }.
+  function computeFleetPressureGradient(keys, windowName, now, sampleCount, seasonalFactors) {
     var duration = WINDOW_DURATION_MS[windowName];
-    if (!duration) return { samples: [], currentTone: 'dim', maxPressureInWindow: 0 };
+    if (!duration) return { samples: [], currentTone: 'dim', maxPressureInWindow: 0, peakTimeMs: null };
     var n = sampleCount && sampleCount > 0 ? Math.floor(sampleCount) : 60;
     var keysArr = Array.isArray(keys) ? keys : [];
     var nowMs = Number(now);
+    var table = seasonalFactors && seasonalFactors.slots ? seasonalFactors : null;
 
-    // Pre-compute per-key burn rates once. Burn rate = util per ms,
-    // derived from the current cycle's util / elapsed-ms.
     var active = [];
     for (var i = 0; i < keysArr.length; i++) {
       var k = keysArr[i];
@@ -378,55 +404,64 @@
       var util = Math.max(0, Math.min(1, Number(w.utilization)));
       var resetAt = Number(w.resetAt);
       var elapsedMs = duration - (resetAt - nowMs);
-      if (elapsedMs <= 0) continue; // hasn't started yet somehow
+      if (elapsedMs <= 0) continue;
 
       var elapsedFrac = elapsedMs / duration;
-      // Dead-zone: ignore keys too early in the window to have meaningful
-      // pace. Same thresholds as computeWindowPace.
       if (elapsedFrac < DEAD_ZONE.minElapsedFrac) continue;
       if (elapsedMs < DEAD_ZONE.minElapsedMs) continue;
       if (util < DEAD_ZONE.minUtilization) continue;
 
       active.push({
-        utilNow: util,
-        resetAt: resetAt,
+        projectedUtil: util,
+        nextResetAt: resetAt,
         burnPerMs: util / elapsedMs,
       });
     }
 
     var maxPressureInWindow = 0;
+    var peakTimeMs = null;
     var samples = [];
-    var horizonMs = duration;
+    var prevT = nowMs;
 
     for (var s = 0; s <= n; s++) {
       var position = s / n;
-      var t = nowMs + position * horizonMs;
-      var fleetPressure = 0;
+      var t = nowMs + position * duration;
+      var fleetSum = 0;
+      var fleetCount = 0;
 
       for (var j = 0; j < active.length; j++) {
         var a = active[j];
-        var sampleUtil;
-        if (t >= a.resetAt) {
-          // Post-reset: fresh cycle since a.resetAt. Carry forward the
-          // same burn rate into the new cycle.
-          var msIntoNewCycle = t - a.resetAt;
-          sampleUtil = a.burnPerMs * msIntoNewCycle;
-        } else {
-          // Still in current cycle.
-          var msElapsedAtT = duration - (a.resetAt - t);
-          sampleUtil = a.burnPerMs * msElapsedAtT;
+        var cursor = prevT;
+        // Walk through any reset boundaries that fall in (cursor, t].
+        while (a.nextResetAt <= t && a.nextResetAt > cursor) {
+          // Pre-reset growth discarded — the reset zeroes util at that moment.
+          a.projectedUtil = 0;
+          cursor = a.nextResetAt;
+          a.nextResetAt += duration;
         }
-        if (sampleUtil > 1) sampleUtil = 1;
-        if (sampleUtil < 0) sampleUtil = 0;
-        if (sampleUtil > fleetPressure) fleetPressure = sampleUtil;
+        if (cursor < t) {
+          var dt = t - cursor;
+          var mid = cursor + dt / 2;
+          var factor = factorFor(table, mid);
+          a.projectedUtil += a.burnPerMs * dt * factor;
+          if (a.projectedUtil > 1) a.projectedUtil = 1;
+          if (a.projectedUtil < 0) a.projectedUtil = 0;
+        }
+        fleetSum += a.projectedUtil;
+        fleetCount++;
       }
 
-      if (fleetPressure > maxPressureInWindow) maxPressureInWindow = fleetPressure;
+      var fleetPressure = fleetCount > 0 ? fleetSum / fleetCount : 0;
+      if (fleetPressure > maxPressureInWindow) {
+        maxPressureInWindow = fleetPressure;
+        peakTimeMs = t;
+      }
       samples.push({
         position: position,
         pressure: fleetPressure,
         tone: pressureTone(fleetPressure),
       });
+      prevT = t;
     }
 
     var currentTone = samples.length > 0 ? samples[0].tone : 'dim';
@@ -434,17 +469,18 @@
       samples: samples,
       currentTone: currentTone,
       maxPressureInWindow: maxPressureInWindow,
+      peakTimeMs: peakTimeMs,
     };
   }
 
-  // Fleet pressure → one-word state. Distinct from the individual-key
-  // `paceFromTone` buckets; this one lives on the pool aggregate and
-  // uses fleet-wide thresholds that feel right on a gradient strip.
+  // Fleet saturation → one-word state. Anchored so "dim" is the "everyone
+  // coasting" regime and "red" is the "fleet approaching saturation" regime,
+  // matching the PRESSURE_THRESHOLDS above.
   function pressureTone(pressure) {
-    if (pressure < 0.5)  return 'dim';    // coasting — lots of headroom
-    if (pressure < 0.7)  return 'yellow'; // steady — still comfortable
-    if (pressure < 0.85) return 'orange'; // watch — close to the line
-    return 'red';                          // tight — will hit the limit
+    if (pressure < PRESSURE_THRESHOLDS.coastingMax) return 'dim';
+    if (pressure < PRESSURE_THRESHOLDS.steadyMax)   return 'yellow';
+    if (pressure < PRESSURE_THRESHOLDS.watchMax)    return 'orange';
+    return 'red';
   }
 
   function pressureStateWord(tone) {
@@ -539,10 +575,12 @@
     WINDOW_DURATION_MS: WINDOW_DURATION_MS,
     TONE_RANK: TONE_RANK,
     PACE_THRESHOLDS: PACE_THRESHOLDS,
+    PRESSURE_THRESHOLDS: PRESSURE_THRESHOLDS,
     DEAD_ZONE: DEAD_ZONE,
     computeWindowPace: computeWindowPace,
     computePoolAggregate: computePoolAggregate,
     computeFleetPressureGradient: computeFleetPressureGradient,
+    factorFor: factorFor,
     pressureTone: pressureTone,
     pressureStateWord: pressureStateWord,
     sortKeysForDisplay: sortKeysForDisplay,

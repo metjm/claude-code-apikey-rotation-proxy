@@ -308,6 +308,27 @@ export interface CapacityTimeseriesBucket {
   readonly maxUtilization: number | null;
 }
 
+// ── Seasonal request factors (traffic pattern by day-of-week × hour) ─────
+
+/** One entry in a 168-slot table (dow × hour). `factor` is the request
+ *  volume in this slot relative to the mean across all observed slots — 1.0
+ *  means "average hour", 2.0 means "twice as busy as average", 0.2 means
+ *  "quiet". Slots with fewer than MIN_BASELINE_SAMPLES_PER_SLOT observations
+ *  are returned with factor = 1 (treated as "no signal"). */
+export interface SeasonalFactorSlot {
+  readonly dow: number;
+  readonly hour: number;
+  readonly factor: number;
+  readonly samples: number;
+}
+
+export interface SeasonalFactorTable {
+  readonly weeks: number;
+  readonly generatedAt: UnixMs;
+  readonly totalSamples: number;
+  readonly slots: readonly SeasonalFactorSlot[];
+}
+
 // ── Logging ───────────────────────────────────────────────────────
 
 export type LogLevel = "info" | "warn" | "error" | "debug";

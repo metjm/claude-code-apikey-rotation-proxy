@@ -19,6 +19,8 @@ import {
   type ProxyToken,
   type ProxyTokenEntry,
   type ProxyTokenStats,
+  type SeasonalFactorSlot,
+  type SeasonalFactorTable,
   type StoredState,
   type TimeseriesBucket,
   type TimeseriesQuery,
@@ -193,6 +195,18 @@ function resetAtForSort(entry: ApiKeyEntry, windowName: string): number {
   return 0;
 }
 
+// Parse a stats_timeseries bucket key ("YYYY-MM-DDTHH") into a (dow, hour)
+// slot. Buckets are generated in UTC (see currentBucketKey), so the
+// day-of-week and hour returned are also UTC. Returns null on malformed
+// input — the caller treats that slot as "no data".
+function parseBucketToSlot(bucket: string): { dow: number; hour: number } | null {
+  if (typeof bucket !== "string" || bucket.length < 13) return null;
+  const date = new Date(bucket + ":00:00.000Z");
+  const time = date.getTime();
+  if (Number.isNaN(time)) return null;
+  return { dow: date.getUTCDay(), hour: date.getUTCHours() };
+}
+
 const CONVERSATION_AFFINITY_TTL_MS = 60 * 60 * 1000;
 const RECENT_SESSION_WINDOW_MS = 15 * 60 * 1000;
 const PRIMARY_CAPACITY_WINDOW_NAMES = new Set(["unified", "unified-5h", "unified-7d"]);
@@ -226,6 +240,15 @@ const FALLBACK_PRIMARY_UTIL_LIMIT = 0.50;
 // How many sessions one account claims before the rotation moves on. Sessions
 // are counted from the last RECENT_SESSION_WINDOW_MS of conversation activity.
 const SESSION_BUCKET_SIZE = 3;
+
+// Seasonal factor table: how many weeks back, how few observations collapse a
+// slot to a "no signal" factor of 1, and how far we let a busy/quiet slot
+// stretch the projection. Clamp keeps a single anomalous week from dominating.
+const SEASONAL_DEFAULT_WEEKS = 4;
+const SEASONAL_MIN_SAMPLES_PER_SLOT = 3;
+const SEASONAL_FACTOR_CLAMP_MIN = 0.1;
+const SEASONAL_FACTOR_CLAMP_MAX = 5.0;
+const SEASONAL_SLOT_COUNT = 7 * 24;
 
 type Pool = "primary" | "secondary" | "tertiary";
 
@@ -1434,6 +1457,65 @@ export class KeyManager {
       avgUtilization: row.utilization_samples > 0 ? row.utilization_sum / row.utilization_samples : null,
       maxUtilization: row.utilization_samples > 0 ? row.utilization_max : null,
     }));
+  }
+
+  /** Seasonal request-volume factor table — one entry per (dow, hour) slot
+   *  describing how busy that slot has historically been relative to the
+   *  fleet average. A factor of 1.0 means "typical", 2.0 means "twice as
+   *  busy", 0.2 means "quiet". Slots with too few observations collapse to
+   *  1.0. Used by the dashboard forecast widget to project future pressure.
+   *  Buckets are in UTC — the caller is responsible for any local-time
+   *  presentation. */
+  computeSeasonalRequestFactors(weeks: number = SEASONAL_DEFAULT_WEEKS): SeasonalFactorTable {
+    const cutoffMs = Date.now() - weeks * 7 * 24 * 60 * 60 * 1000;
+    const cutoff = new Date(cutoffMs).toISOString().slice(0, 13);
+    const rows = this.db.query(
+      "SELECT bucket, SUM(requests) AS requests FROM stats_timeseries " +
+      "WHERE bucket >= ? AND key_label = '__all__' AND user_label = '__all__' " +
+      "GROUP BY bucket"
+    ).all(cutoff) as Array<{ bucket: string; requests: number }>;
+
+    const totals: number[] = new Array(SEASONAL_SLOT_COUNT).fill(0);
+    const counts: number[] = new Array(SEASONAL_SLOT_COUNT).fill(0);
+    let grandTotal = 0;
+    let grandCount = 0;
+
+    for (const row of rows) {
+      const slot = parseBucketToSlot(row.bucket);
+      if (slot === null) continue;
+      const idx = slot.dow * 24 + slot.hour;
+      const requests = Number(row.requests) || 0;
+      totals[idx] = (totals[idx] ?? 0) + requests;
+      counts[idx] = (counts[idx] ?? 0) + 1;
+      grandTotal += requests;
+      grandCount += 1;
+    }
+
+    const meanPerHour = grandCount > 0 ? grandTotal / grandCount : 0;
+    const slots: SeasonalFactorSlot[] = new Array(SEASONAL_SLOT_COUNT);
+    for (let dow = 0; dow < 7; dow++) {
+      for (let hour = 0; hour < 24; hour++) {
+        const idx = dow * 24 + hour;
+        const slotCount = counts[idx] ?? 0;
+        const slotTotal = totals[idx] ?? 0;
+        let factor = 1;
+        if (slotCount >= SEASONAL_MIN_SAMPLES_PER_SLOT && meanPerHour > 0) {
+          const avg = slotTotal / slotCount;
+          factor = Math.min(
+            SEASONAL_FACTOR_CLAMP_MAX,
+            Math.max(SEASONAL_FACTOR_CLAMP_MIN, avg / meanPerHour),
+          );
+        }
+        slots[idx] = { dow, hour, factor, samples: slotCount };
+      }
+    }
+
+    return {
+      weeks,
+      generatedAt: unixMs(Date.now()),
+      totalSamples: grandCount,
+      slots,
+    };
   }
 
   private cleanupOldTimeseries(): void {

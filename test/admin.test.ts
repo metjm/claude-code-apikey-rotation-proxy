@@ -2195,3 +2195,51 @@ describe("POST /admin/keys/update — allowedDays", () => {
     expect(body.allowedDays).toEqual([1, 3, 5]);
   });
 });
+
+describe("GET /admin/capacity/forecast", () => {
+  test("returns the full 168-slot seasonal factor table", async () => {
+    const req = makeReq("GET", "/admin/capacity/forecast");
+    const res = await handleAdminRoute(req, km, makeConfig(), st);
+    expect(res!.status).toBe(200);
+    const body = (await jsonBody(res!)) as {
+      weeks: number;
+      generatedAt: number;
+      totalSamples: number;
+      slots: Array<{ dow: number; hour: number; factor: number; samples: number }>;
+    };
+    expect(body.weeks).toBe(4);
+    expect(body.slots).toHaveLength(168);
+    expect(body.totalSamples).toBe(0);
+    for (const slot of body.slots) {
+      expect(slot.factor).toBe(1);
+      expect(slot.samples).toBe(0);
+    }
+  });
+
+  test("respects the weeks query parameter", async () => {
+    const req = makeReq("GET", "/admin/capacity/forecast?weeks=2");
+    const res = await handleAdminRoute(req, km, makeConfig(), st);
+    expect(res!.status).toBe(200);
+    const body = (await jsonBody(res!)) as { weeks: number };
+    expect(body.weeks).toBe(2);
+  });
+
+  test("clamps the weeks parameter to the 1..4 range", async () => {
+    const req = makeReq("GET", "/admin/capacity/forecast?weeks=999");
+    const res = await handleAdminRoute(req, km, makeConfig(), st);
+    const body = (await jsonBody(res!)) as { weeks: number };
+    expect(body.weeks).toBe(4);
+
+    const reqZero = makeReq("GET", "/admin/capacity/forecast?weeks=0");
+    const resZero = await handleAdminRoute(reqZero, km, makeConfig(), st);
+    const bodyZero = (await jsonBody(resZero!)) as { weeks: number };
+    expect(bodyZero.weeks).toBe(1);
+  });
+
+  test("bogus weeks param falls back to default", async () => {
+    const req = makeReq("GET", "/admin/capacity/forecast?weeks=not-a-number");
+    const res = await handleAdminRoute(req, km, makeConfig(), st);
+    const body = (await jsonBody(res!)) as { weeks: number };
+    expect(body.weeks).toBe(4);
+  });
+});

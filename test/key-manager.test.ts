@@ -2756,3 +2756,213 @@ describe("Pool-based routing", () => {
     });
   });
 });
+
+// ── Seasonal request factors ───────────────────────────────────────────────
+
+describe("Seasonal request factors", () => {
+  function insertBucket(
+    km: KeyManager,
+    bucketIsoHour: string,
+    requests: number,
+  ): void {
+    const db = (km as unknown as { db: Database }).db;
+    db.run(
+      "INSERT INTO stats_timeseries (bucket, key_label, user_label, requests) VALUES (?, '__all__', '__all__', ?)",
+      [bucketIsoHour, requests],
+    );
+  }
+
+  /** Build a bucket string in UTC at weeksAgo full weeks offset, at the
+   *  given day-of-week (0=Sun..6=Sat UTC) and hour (0..23 UTC). */
+  function bucketAt(weeksAgo: number, dow: number, hour: number): string {
+    const reference = new Date();
+    // Anchor to start of current UTC week (Sunday 00:00)
+    const sundayUtc = new Date(Date.UTC(
+      reference.getUTCFullYear(),
+      reference.getUTCMonth(),
+      reference.getUTCDate() - reference.getUTCDay(),
+      0, 0, 0, 0,
+    ));
+    const target = new Date(sundayUtc.getTime() - weeksAgo * 7 * 24 * 60 * 60 * 1000);
+    target.setUTCDate(target.getUTCDate() + dow);
+    target.setUTCHours(hour, 0, 0, 0);
+    return target.toISOString().slice(0, 13);
+  }
+
+  test("empty db → every slot returns factor 1 with 0 samples", () => {
+    const km = create();
+    const table = km.computeSeasonalRequestFactors();
+    expect(table.slots).toHaveLength(7 * 24);
+    expect(table.totalSamples).toBe(0);
+    for (const slot of table.slots) {
+      expect(slot.factor).toBe(1);
+      expect(slot.samples).toBe(0);
+    }
+  });
+
+  test("totalSamples counts observed buckets, not requests", () => {
+    const km = create();
+    insertBucket(km, bucketAt(1, 2, 14), 100);
+    insertBucket(km, bucketAt(2, 2, 14), 100);
+    insertBucket(km, bucketAt(3, 2, 14), 100);
+    const table = km.computeSeasonalRequestFactors();
+    expect(table.totalSamples).toBe(3);
+  });
+
+  test("thin slot (< MIN_BASELINE_SAMPLES_PER_SLOT) → factor stays 1", () => {
+    const km = create();
+    // Just two observations in this slot — below the 3-sample threshold
+    insertBucket(km, bucketAt(1, 3, 10), 999);
+    insertBucket(km, bucketAt(2, 3, 10), 999);
+    const table = km.computeSeasonalRequestFactors();
+    const slot = table.slots.find((s) => s.dow === 3 && s.hour === 10)!;
+    expect(slot.samples).toBe(2);
+    expect(slot.factor).toBe(1);
+  });
+
+  test("uniform hourly traffic over 4 weeks → every populated slot factor ≈ 1", () => {
+    const km = create();
+    // Fill every (dow, hour) slot with 3 weeks of 10 requests — each slot
+    // has identical history, so every factor should be 1.0.
+    for (let dow = 0; dow < 7; dow++) {
+      for (let hour = 0; hour < 24; hour++) {
+        for (let week = 1; week <= 3; week++) {
+          insertBucket(km, bucketAt(week, dow, hour), 10);
+        }
+      }
+    }
+    const table = km.computeSeasonalRequestFactors();
+    for (const slot of table.slots) {
+      expect(slot.samples).toBe(3);
+      expect(slot.factor).toBeCloseTo(1, 5);
+    }
+  });
+
+  test("single hot slot drives its factor above 1 while quiet slots compress below", () => {
+    const km = create();
+    // 3 weeks of 1-req baseline in every slot, but Tuesday 2pm UTC gets
+    // 100 requests each week — should show a large factor for that slot.
+    for (let dow = 0; dow < 7; dow++) {
+      for (let hour = 0; hour < 24; hour++) {
+        for (let week = 1; week <= 3; week++) {
+          const requests = (dow === 2 && hour === 14) ? 100 : 1;
+          insertBucket(km, bucketAt(week, dow, hour), requests);
+        }
+      }
+    }
+    const table = km.computeSeasonalRequestFactors();
+    const hot = table.slots.find((s) => s.dow === 2 && s.hour === 14)!;
+    const cool = table.slots.find((s) => s.dow === 0 && s.hour === 3)!;
+    // With the 5.0 clamp, the hot slot saturates to 5.0; quiet slots stay well below 1
+    expect(hot.factor).toBeGreaterThan(4.5);
+    expect(cool.factor).toBeLessThan(1);
+  });
+
+  test("factors are clamped to [0.1, 5.0]", () => {
+    const km = create();
+    // 1 request in every slot baseline + one slot with 10000 → would yield
+    // a factor well over 100× without the clamp.
+    for (let dow = 0; dow < 7; dow++) {
+      for (let hour = 0; hour < 24; hour++) {
+        for (let week = 1; week <= 3; week++) {
+          const requests = (dow === 2 && hour === 14) ? 10_000 : 1;
+          insertBucket(km, bucketAt(week, dow, hour), requests);
+        }
+      }
+    }
+    const table = km.computeSeasonalRequestFactors();
+    const hot = table.slots.find((s) => s.dow === 2 && s.hour === 14)!;
+    expect(hot.factor).toBeLessThanOrEqual(5.0);
+    for (const slot of table.slots) {
+      if (slot.samples > 0) {
+        expect(slot.factor).toBeGreaterThanOrEqual(0.1);
+        expect(slot.factor).toBeLessThanOrEqual(5.0);
+      }
+    }
+  });
+
+  test("weeks argument limits the retrospective window", () => {
+    const km = create();
+    // Heavy traffic ONLY in week 5 (beyond default 4-week window) across
+    // three distinct slots so we don't collide on the unique bucket PK
+    insertBucket(km, bucketAt(5, 1, 9), 1000);
+    insertBucket(km, bucketAt(5, 1, 10), 1000);
+    insertBucket(km, bucketAt(5, 1, 11), 1000);
+    // With the default of 4 weeks, this data is ignored
+    const tableDefault = km.computeSeasonalRequestFactors();
+    expect(tableDefault.totalSamples).toBe(0);
+    // With weeks=6 it comes into scope
+    const tableWide = km.computeSeasonalRequestFactors(6);
+    expect(tableWide.totalSamples).toBe(3);
+  });
+
+  test("respects weeks=1 — only last week of buckets factored in", () => {
+    const km = create();
+    // Week 1 (in scope) is uniform-busy; week 3 (out of scope) is spiked
+    for (let dow = 0; dow < 7; dow++) {
+      for (let hour = 0; hour < 24; hour++) {
+        insertBucket(km, bucketAt(1, dow, hour), 10);
+      }
+    }
+    insertBucket(km, bucketAt(3, 2, 14), 100_000);
+    const table = km.computeSeasonalRequestFactors(1);
+    const hot = table.slots.find((s) => s.dow === 2 && s.hour === 14)!;
+    expect(hot.factor).toBeCloseTo(1, 5);
+  });
+
+  test("zero requests in most slots with a non-zero outlier → outlier hot, rest clamped to min", () => {
+    const km = create();
+    // Week 1..3 of 0-request hours everywhere EXCEPT Tuesday 2pm
+    for (let dow = 0; dow < 7; dow++) {
+      for (let hour = 0; hour < 24; hour++) {
+        for (let week = 1; week <= 3; week++) {
+          const requests = (dow === 2 && hour === 14) ? 10 : 0;
+          insertBucket(km, bucketAt(week, dow, hour), requests);
+        }
+      }
+    }
+    const table = km.computeSeasonalRequestFactors();
+    const hot = table.slots.find((s) => s.dow === 2 && s.hour === 14)!;
+    expect(hot.factor).toBeGreaterThan(1);
+    // Quiet slots (0 requests vs small mean) clamp down to 0.1
+    const quiet = table.slots.find((s) => s.dow === 0 && s.hour === 3)!;
+    expect(quiet.factor).toBe(0.1);
+  });
+
+  test("parseBucketToSlot handles the range correctly via method behavior", () => {
+    const km = create();
+    // Insert one bucket per (dow, hour) at least 3 times and verify every
+    // slot index is reachable
+    for (let dow = 0; dow < 7; dow++) {
+      for (let hour = 0; hour < 24; hour++) {
+        for (let week = 1; week <= 3; week++) {
+          insertBucket(km, bucketAt(week, dow, hour), dow * 24 + hour);
+        }
+      }
+    }
+    const table = km.computeSeasonalRequestFactors();
+    // Every slot should have 3 samples
+    for (const slot of table.slots) {
+      expect(slot.samples).toBe(3);
+    }
+    // Slot factors should follow the dow*24+hour pattern monotonically
+    const first = table.slots[0]!;
+    const last = table.slots[table.slots.length - 1]!;
+    expect(last.factor).toBeGreaterThan(first.factor);
+  });
+
+  test("malformed bucket string is skipped silently", () => {
+    const km = create();
+    const db = (km as unknown as { db: Database }).db;
+    db.run(
+      "INSERT INTO stats_timeseries (bucket, key_label, user_label, requests) VALUES ('garbage', '__all__', '__all__', 100)",
+    );
+    insertBucket(km, bucketAt(1, 0, 0), 10);
+    insertBucket(km, bucketAt(2, 0, 0), 10);
+    insertBucket(km, bucketAt(3, 0, 0), 10);
+    const table = km.computeSeasonalRequestFactors();
+    // Malformed row ignored; the well-formed slot still counts
+    const slot = table.slots.find((s) => s.dow === 0 && s.hour === 0)!;
+    expect(slot.samples).toBe(3);
+  });
+});

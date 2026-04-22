@@ -57,6 +57,10 @@ const routes: ReadonlyMap<string, ReadonlyMap<string, RouteHandler>> = new Map([
     new Map<string, RouteHandler>([["GET", handleCapacityTimeseries]]),
   ],
   [
+    "/admin/capacity/forecast",
+    new Map<string, RouteHandler>([["GET", handleCapacityForecast]]),
+  ],
+  [
     "/admin/health",
     new Map<string, RouteHandler>([["GET", handleHealth]]),
   ],
@@ -454,6 +458,19 @@ function handleCapacityTimeseries(
     ...(keyLabel !== undefined ? { keyLabel } : {}),
   });
   return json({ resolution, buckets });
+}
+
+function handleCapacityForecast(
+  req: Request,
+  keyManager: KeyManager,
+): Response {
+  const url = new URL(req.url);
+  const weeksParam = url.searchParams.get("weeks");
+  const parsed = weeksParam !== null ? Number(weeksParam) : Number.NaN;
+  const table = Number.isFinite(parsed)
+    ? keyManager.computeSeasonalRequestFactors(Math.max(1, Math.min(parsed, 4)))
+    : keyManager.computeSeasonalRequestFactors();
+  return json(table);
 }
 
 function handleEvents(

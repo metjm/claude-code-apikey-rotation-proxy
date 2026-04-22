@@ -734,19 +734,19 @@ describe("computeFleetPressureGradient", () => {
     expect(result.currentTone).toBe("dim");
   });
 
-  test("all-coasting fleet → gradient stays dim throughout", () => {
-    // Three keys, each at 10% util with 30% elapsed. Pace 0.33× — coasting.
-    // Projected forward, they'd still be well under 50% at window end.
+  test("deeply coasting fleet → gradient stays dim throughout", () => {
+    // Three keys at 3% util with 30% elapsed — pace 0.1×. Projected forward,
+    // fleet mean at window end ≈ 10%, well under the 30% "coasting" line.
     const keys = [
-      mkKey("a", 1, [mkWindow("unified-5h", 0.10, NOW + FIVE_H * 0.7)]),
-      mkKey("b", 1, [mkWindow("unified-5h", 0.10, NOW + FIVE_H * 0.7)]),
-      mkKey("c", 1, [mkWindow("unified-5h", 0.10, NOW + FIVE_H * 0.7)]),
+      mkKey("a", 1, [mkWindow("unified-5h", 0.03, NOW + FIVE_H * 0.7)]),
+      mkKey("b", 1, [mkWindow("unified-5h", 0.03, NOW + FIVE_H * 0.7)]),
+      mkKey("c", 1, [mkWindow("unified-5h", 0.03, NOW + FIVE_H * 0.7)]),
     ];
     const result = PaceMath.computeFleetPressureGradient(keys, "unified-5h", NOW, 20);
     for (const s of result.samples) {
       expect(s.tone).toBe("dim");
     }
-    expect(result.maxPressureInWindow).toBeLessThan(0.5);
+    expect(result.maxPressureInWindow).toBeLessThan(0.3);
   });
 
   test("one key burning hot → strip lights up before the reset", () => {
@@ -828,14 +828,14 @@ describe("computeFleetPressureGradient", () => {
     expect(PaceMath.pressureStateWord("red")).toBe("Tight");
   });
 
-  test("pressureTone bucket boundaries", () => {
+  test("pressureTone bucket boundaries (fleet-saturation scale)", () => {
     expect(PaceMath.pressureTone(0.0)).toBe("dim");
-    expect(PaceMath.pressureTone(0.49)).toBe("dim");
-    expect(PaceMath.pressureTone(0.5)).toBe("yellow");
-    expect(PaceMath.pressureTone(0.69)).toBe("yellow");
-    expect(PaceMath.pressureTone(0.7)).toBe("orange");
-    expect(PaceMath.pressureTone(0.84)).toBe("orange");
-    expect(PaceMath.pressureTone(0.85)).toBe("red");
+    expect(PaceMath.pressureTone(0.29)).toBe("dim");
+    expect(PaceMath.pressureTone(0.30)).toBe("yellow");
+    expect(PaceMath.pressureTone(0.49)).toBe("yellow");
+    expect(PaceMath.pressureTone(0.50)).toBe("orange");
+    expect(PaceMath.pressureTone(0.69)).toBe("orange");
+    expect(PaceMath.pressureTone(0.70)).toBe("red");
     expect(PaceMath.pressureTone(1.0)).toBe("red");
   });
 
@@ -846,5 +846,509 @@ describe("computeFleetPressureGradient", () => {
     expect(result5h.currentTone).toBe("dim");
     const result7d = PaceMath.computeFleetPressureGradient(keys, "unified-7d", NOW, 30);
     expect(result7d.currentTone).toBe("dim");
+  });
+
+  test("fleet pressure uses MEAN across keys — a single hot account doesn't paint the strip red", () => {
+    // Four keys: one at high util, three fresh. MAX-based aggregation would
+    // paint most samples red from just one outlier; MEAN dilutes.
+    const keys = [
+      mkKey("hot",   1, [mkWindow("unified-5h", 0.8, NOW + FIVE_H * 0.5)]),
+      mkKey("cool1", 1, [mkWindow("unified-5h", 0.05, NOW + FIVE_H * 0.9)]),
+      mkKey("cool2", 1, [mkWindow("unified-5h", 0.05, NOW + FIVE_H * 0.9)]),
+      mkKey("cool3", 1, [mkWindow("unified-5h", 0.05, NOW + FIVE_H * 0.9)]),
+    ];
+    const result = PaceMath.computeFleetPressureGradient(keys, "unified-5h", NOW, 30);
+    // Mean of (1.0 + 0.05 + 0.05 + 0.05) ≈ 0.29 at the most extreme sample
+    // — should not hit "red"
+    const hasRed = result.samples.some((s: any) => s.tone === "red");
+    expect(hasRed).toBe(false);
+  });
+
+  test("fleet pressure hits red when most of the fleet is saturated", () => {
+    // Three keys all on pace to max out together. Mean converges on ~1.0.
+    const keys = [
+      mkKey("a", 1, [mkWindow("unified-5h", 0.90, NOW + FIVE_H * 0.10)]),
+      mkKey("b", 1, [mkWindow("unified-5h", 0.90, NOW + FIVE_H * 0.10)]),
+      mkKey("c", 1, [mkWindow("unified-5h", 0.90, NOW + FIVE_H * 0.10)]),
+    ];
+    const result = PaceMath.computeFleetPressureGradient(keys, "unified-5h", NOW, 60);
+    expect(result.samples.some((s: any) => s.tone === "red")).toBe(true);
+    expect(result.maxPressureInWindow).toBeGreaterThanOrEqual(0.70);
+  });
+
+  test("peakTimeMs reports the moment of maximum projected pressure", () => {
+    const keys = [
+      mkKey("a", 1, [mkWindow("unified-5h", 0.8, NOW + FIVE_H * 0.5)]),
+    ];
+    const result = PaceMath.computeFleetPressureGradient(keys, "unified-5h", NOW, 60);
+    expect(result.peakTimeMs).not.toBeNull();
+    expect(result.peakTimeMs!).toBeGreaterThanOrEqual(NOW);
+    expect(result.peakTimeMs!).toBeLessThanOrEqual(NOW + FIVE_H);
+  });
+
+  test("peakTimeMs is null when the fleet is empty", () => {
+    const result = PaceMath.computeFleetPressureGradient([], "unified-5h", NOW, 30);
+    expect(result.peakTimeMs).toBeNull();
+  });
+});
+
+// ── Seasonal factor integration ────────────────────────────────────────────
+
+describe("computeFleetPressureGradient — seasonal factors", () => {
+  function flatFactorTable(): any {
+    const slots: Array<{ dow: number; hour: number; factor: number; samples: number }> = [];
+    for (let d = 0; d < 7; d++) {
+      for (let h = 0; h < 24; h++) {
+        slots.push({ dow: d, hour: h, factor: 1, samples: 5 });
+      }
+    }
+    return { weeks: 4, generatedAt: NOW, totalSamples: 168 * 5, slots };
+  }
+
+  function factorTableWithSpike(dow: number, hour: number, spikeFactor: number): any {
+    const table = flatFactorTable();
+    const idx = dow * 24 + hour;
+    table.slots[idx] = { dow, hour, factor: spikeFactor, samples: 100 };
+    return table;
+  }
+
+  function nullFactorTable(): any {
+    return null;
+  }
+
+  test("absent factor table → identical to today's projection", () => {
+    const keys = [mkKey("a", 1, [mkWindow("unified-5h", 0.40, NOW + FIVE_H * 0.5)])];
+    const without = PaceMath.computeFleetPressureGradient(keys, "unified-5h", NOW, 30);
+    const withNull = PaceMath.computeFleetPressureGradient(keys, "unified-5h", NOW, 30, nullFactorTable());
+    expect(withNull.samples.length).toBe(without.samples.length);
+    for (let i = 0; i < without.samples.length; i++) {
+      expect(withNull.samples[i].pressure).toBeCloseTo(without.samples[i].pressure, 6);
+    }
+  });
+
+  test("flat (factor=1) table → identical to no-table projection", () => {
+    const keys = [mkKey("a", 1, [mkWindow("unified-5h", 0.40, NOW + FIVE_H * 0.5)])];
+    const without = PaceMath.computeFleetPressureGradient(keys, "unified-5h", NOW, 30);
+    const withFlat = PaceMath.computeFleetPressureGradient(keys, "unified-5h", NOW, 30, flatFactorTable());
+    for (let i = 0; i < without.samples.length; i++) {
+      expect(withFlat.samples[i].pressure).toBeCloseTo(without.samples[i].pressure, 6);
+    }
+  });
+
+  test("seasonality spike at a future slot elevates pressure at that horizon", () => {
+    // Pick an anchor far enough before a spike that we can see a visible
+    // pressure bump when crossing into the spike's hour. Use the 7d window
+    // so hourly granularity matters.
+    const nowDate = new Date(NOW);
+    const spikeDate = new Date(NOW + 24 * 60 * 60 * 1000); // tomorrow, same hour
+    const spikeDow = spikeDate.getUTCDay();
+    const spikeHour = spikeDate.getUTCHours();
+    const table = factorTableWithSpike(spikeDow, spikeHour, 5);
+
+    const keys = [mkKey("a", 1, [mkWindow("unified-7d", 0.10, NOW + SEVEN_D * 0.5)])];
+    const flat = PaceMath.computeFleetPressureGradient(keys, "unified-7d", NOW, 168, flatFactorTable());
+    const spiked = PaceMath.computeFleetPressureGradient(keys, "unified-7d", NOW, 168, table);
+
+    // After the spike passes, spiked should have HIGHER pressure than flat
+    const postSpikePos = (spikeDate.getTime() - NOW) / SEVEN_D + 0.01;
+    const flatPost = flat.samples.find((s: any) => s.position >= postSpikePos)!;
+    const spikedPost = spiked.samples.find((s: any) => s.position >= postSpikePos)!;
+    expect(spikedPost.pressure).toBeGreaterThan(flatPost.pressure);
+    void nowDate;
+  });
+
+  test("seasonality quiet slot depresses pressure relative to flat baseline", () => {
+    const quietDow = new Date(NOW + 3 * 60 * 60 * 1000).getUTCDay();
+    const quietHour = new Date(NOW + 3 * 60 * 60 * 1000).getUTCHours();
+    const table = factorTableWithSpike(quietDow, quietHour, 0.1);
+
+    const keys = [mkKey("a", 1, [mkWindow("unified-5h", 0.30, NOW + FIVE_H * 0.5)])];
+    const flat = PaceMath.computeFleetPressureGradient(keys, "unified-5h", NOW, 60, flatFactorTable());
+    const quiet = PaceMath.computeFleetPressureGradient(keys, "unified-5h", NOW, 60, table);
+
+    // Final-sample pressure should be lower under quiet factor
+    const flatFinal = flat.samples[flat.samples.length - 1].pressure;
+    const quietFinal = quiet.samples[quiet.samples.length - 1].pressure;
+    expect(quietFinal).toBeLessThanOrEqual(flatFinal);
+  });
+
+  test("factorFor returns 1 for absent table, malformed input, or missing slot", () => {
+    expect(PaceMath.factorFor(null, NOW)).toBe(1);
+    expect(PaceMath.factorFor(undefined, NOW)).toBe(1);
+    expect(PaceMath.factorFor({}, NOW)).toBe(1);
+    expect(PaceMath.factorFor({ slots: [] }, NOW)).toBe(1);
+    expect(PaceMath.factorFor(flatFactorTable(), NaN)).toBe(1);
+  });
+
+  test("factorFor reads the correct slot by UTC (dow, hour)", () => {
+    const dt = new Date(NOW);
+    const expectedDow = dt.getUTCDay();
+    const expectedHour = dt.getUTCHours();
+    const table = factorTableWithSpike(expectedDow, expectedHour, 3.5);
+    expect(PaceMath.factorFor(table, NOW)).toBe(3.5);
+  });
+
+  test("slot with malformed factor (NaN, undefined) falls back to 1", () => {
+    const table = flatFactorTable();
+    const idx = new Date(NOW).getUTCDay() * 24 + new Date(NOW).getUTCHours();
+    table.slots[idx] = { dow: 0, hour: 0, factor: Number.NaN, samples: 5 };
+    expect(PaceMath.factorFor(table, NOW)).toBe(1);
+  });
+});
+
+// ── Seasonal factor edge cases ─────────────────────────────────────────────
+
+describe("computeFleetPressureGradient — seasonal edge cases", () => {
+  function flatFactorTable(factor: number = 1): any {
+    const slots: Array<{ dow: number; hour: number; factor: number; samples: number }> = [];
+    for (let d = 0; d < 7; d++) {
+      for (let h = 0; h < 24; h++) {
+        slots.push({ dow: d, hour: h, factor, samples: 5 });
+      }
+    }
+    return { weeks: 4, generatedAt: NOW, totalSamples: 168 * 5, slots };
+  }
+
+  function setSlot(
+    table: any,
+    dow: number,
+    hour: number,
+    factor: number,
+    samples = 100,
+  ): any {
+    table.slots[dow * 24 + hour] = { dow, hour, factor, samples };
+    return table;
+  }
+
+  // 1. Reset crossing + seasonal spike interaction. ──────────────────────────
+  test("reset crossing + spike at post-reset hour → post-reset util grows faster", () => {
+    // Reset falls at T = NOW + 2h. Spike covers the full hour immediately
+    // following the reset. The key's burn rate is identical in both runs;
+    // only the seasonal table differs, so any faster post-reset growth must
+    // come from the spike's multiplier. We use a 7d window so each sample
+    // interval is ~2.8h — large enough that the entire post-reset-hour
+    // spike fits inside one sample step and shows up clearly.
+    //
+    // For the 5h window the sample granularity (5h/60=5min) means only the
+    // one or two samples that overlap the 1-hour spike will diverge from
+    // flat. We check the cumulative peak over the whole remaining horizon
+    // since the spike lifts integrated util for every subsequent sample.
+    const resetAt = NOW + 2 * 60 * 60 * 1000;
+    const spikeCenter = resetAt + 30 * 60 * 1000; // 30 min after reset
+    const spikeDate = new Date(spikeCenter);
+
+    const flat = flatFactorTable(1);
+    const spiked = setSlot(
+      flatFactorTable(1),
+      spikeDate.getUTCDay(),
+      spikeDate.getUTCHours(),
+      4,
+    );
+
+    const keys = [mkKey("k", 1, [mkWindow("unified-5h", 0.5, resetAt)])];
+    const flatResult = PaceMath.computeFleetPressureGradient(keys, "unified-5h", NOW, 60, flat);
+    const spikeResult = PaceMath.computeFleetPressureGradient(keys, "unified-5h", NOW, 60, spiked);
+
+    // Any samples strictly past the reset must show higher cumulative
+    // pressure under spike than under flat (the spike boosted burn during
+    // the hour following the reset).
+    const flatPostMax = Math.max(
+      ...flatResult.samples
+        .filter((s: any) => s.position > (resetAt - NOW) / FIVE_H + 0.01)
+        .map((s: any) => s.pressure),
+    );
+    const spikePostMax = Math.max(
+      ...spikeResult.samples
+        .filter((s: any) => s.position > (resetAt - NOW) / FIVE_H + 0.01)
+        .map((s: any) => s.pressure),
+    );
+    expect(spikePostMax).toBeGreaterThan(flatPostMax);
+  });
+
+  // 2. Peak time shifts under seasonality. ───────────────────────────────────
+  test("peakTimeMs shifts to the spike's hour vs end-of-horizon for flat", () => {
+    // 7d window so hour-scale spikes can matter across the horizon.
+    // Low utilization + slow burn so without a spike, monotonically-rising
+    // projection peaks at the far end. With a spike ~4 days out, the
+    // integrated projection might still peak later (monotone-rising), so
+    // we test the stronger claim: a spike pulls pressure up in its hour,
+    // creating a sample there that would not exist under flat projection.
+    const nowMs = NOW;
+    const flatTable = flatFactorTable(1);
+    const spikeAtMs = nowMs + 4 * 24 * 60 * 60 * 1000; // +4d
+    const spikeDate = new Date(spikeAtMs);
+    const spikeTable = setSlot(
+      flatFactorTable(1),
+      spikeDate.getUTCDay(),
+      spikeDate.getUTCHours(),
+      50,
+    );
+
+    const keys = [mkKey("k", 1, [mkWindow("unified-7d", 0.05, NOW + SEVEN_D * 0.5)])];
+    const flat = PaceMath.computeFleetPressureGradient(keys, "unified-7d", NOW, 168, flatTable);
+    const spiked = PaceMath.computeFleetPressureGradient(keys, "unified-7d", NOW, 168, spikeTable);
+
+    // Both peakTimeMs values must be inside the horizon.
+    expect(flat.peakTimeMs).not.toBeNull();
+    expect(spiked.peakTimeMs).not.toBeNull();
+    expect(flat.peakTimeMs!).toBeGreaterThanOrEqual(NOW);
+    expect(flat.peakTimeMs!).toBeLessThanOrEqual(NOW + SEVEN_D);
+    expect(spiked.peakTimeMs!).toBeGreaterThanOrEqual(NOW);
+    expect(spiked.peakTimeMs!).toBeLessThanOrEqual(NOW + SEVEN_D);
+
+    // A flat, monotonically-rising projection peaks at the final sample
+    // (util keeps growing until clamped to 1 or reset). With a large spike
+    // somewhere in the middle, pressure already reaches the clamp during
+    // the spike window — so spiked.maxPressureInWindow is reached earlier
+    // in absolute wall-clock time than flat.maxPressureInWindow.
+    expect(spiked.maxPressureInWindow).toBeGreaterThanOrEqual(flat.maxPressureInWindow);
+    expect(spiked.peakTimeMs!).toBeLessThanOrEqual(flat.peakTimeMs!);
+  });
+
+  // 3. Midpoint-of-interval factor lookup. ───────────────────────────────────
+  test("alternating-hour factor table keeps projection within [0,1] over 7d", () => {
+    // 7d / 60 samples ≈ 2.8h per sample interval. Alternating hours produce
+    // dramatic per-step multiplier swings through midpoint lookup. The key
+    // is that each step still uses a single factor (midpoint) rather than
+    // averaging, so the test confirms projection doesn't blow up and
+    // fleet pressure stays within the clamped [0, 1] range.
+    const slots: Array<{ dow: number; hour: number; factor: number; samples: number }> = [];
+    for (let d = 0; d < 7; d++) {
+      for (let h = 0; h < 24; h++) {
+        slots.push({
+          dow: d,
+          hour: h,
+          factor: h % 2 === 0 ? 0.1 : 3.0,
+          samples: 50,
+        });
+      }
+    }
+    const table = { weeks: 4, generatedAt: NOW, totalSamples: 168 * 50, slots };
+
+    const keys = [
+      mkKey("a", 1, [mkWindow("unified-7d", 0.20, NOW + SEVEN_D * 0.5)]),
+      mkKey("b", 1, [mkWindow("unified-7d", 0.40, NOW + SEVEN_D * 0.8)]),
+    ];
+    const result = PaceMath.computeFleetPressureGradient(keys, "unified-7d", NOW, 60, table);
+    expect(result.samples.length).toBe(61);
+    for (const s of result.samples) {
+      expect(Number.isFinite(s.pressure)).toBe(true);
+      expect(s.pressure).toBeGreaterThanOrEqual(0);
+      expect(s.pressure).toBeLessThanOrEqual(1);
+    }
+  });
+
+  // 4. Factor clamp bites at extreme values. ─────────────────────────────────
+  test("factorFor returns raw 999 from slot but per-key projectedUtil stays in [0,1]", () => {
+    const spikeDate = new Date(NOW);
+    const dow = spikeDate.getUTCDay();
+    const hour = spikeDate.getUTCHours();
+    const extremeTable = setSlot(flatFactorTable(1), dow, hour, 999);
+
+    // Raw readout trusts backend to clamp — frontend just returns it.
+    expect(PaceMath.factorFor(extremeTable, NOW)).toBe(999);
+
+    // The projection, however, must still be bounded because projectedUtil
+    // is clamped per-key per-step.
+    const keys = [mkKey("k", 1, [mkWindow("unified-5h", 0.30, NOW + FIVE_H * 0.5)])];
+    const result = PaceMath.computeFleetPressureGradient(keys, "unified-5h", NOW, 30, extremeTable);
+    expect(result.maxPressureInWindow).toBeLessThanOrEqual(1);
+    expect(result.maxPressureInWindow).toBeGreaterThanOrEqual(0);
+    for (const s of result.samples) {
+      expect(Number.isFinite(s.pressure)).toBe(true);
+      expect(s.pressure).toBeGreaterThanOrEqual(0);
+      expect(s.pressure).toBeLessThanOrEqual(1);
+    }
+  });
+
+  // 5. Partial / incomplete tables. ──────────────────────────────────────────
+  test("partial / malformed slot tables → factorFor returns 1 and projection works", () => {
+    // Missing slots entirely.
+    expect(PaceMath.factorFor({ slots: undefined }, NOW)).toBe(1);
+
+    // slots.length < 168: when the computed index overshoots the array, the
+    // lookup must fall back to 1 (no slot → no factor).
+    const shortTable = { weeks: 4, generatedAt: NOW, totalSamples: 10, slots: [] as any[] };
+    for (let i = 0; i < 10; i++) {
+      shortTable.slots.push({ dow: 0, hour: i, factor: 2, samples: 5 });
+    }
+    const futureTime = NOW + 48 * 60 * 60 * 1000; // UTC dow/hour that won't land in first 10 slots
+    const futureDate = new Date(futureTime);
+    const futureIdx = futureDate.getUTCDay() * 24 + futureDate.getUTCHours();
+    // Only valid if futureIdx >= 10; pick a deliberately-high idx offset.
+    if (futureIdx >= 10) {
+      expect(PaceMath.factorFor(shortTable, futureTime)).toBe(1);
+    }
+
+    // Slots with missing fields (no factor at all, or factor:null) → 1.
+    const malformedTable = flatFactorTable(1);
+    const idx = new Date(NOW).getUTCDay() * 24 + new Date(NOW).getUTCHours();
+    malformedTable.slots[idx] = { dow: 0, hour: 0 } as any; // missing factor
+    expect(PaceMath.factorFor(malformedTable, NOW)).toBe(1);
+
+    const nullFactorTable = flatFactorTable(1);
+    nullFactorTable.slots[idx] = { dow: 0, hour: 0, factor: null as any, samples: 5 };
+    expect(PaceMath.factorFor(nullFactorTable, NOW)).toBe(1);
+
+    // Projection doesn't throw when the table is partial.
+    const keys = [mkKey("k", 1, [mkWindow("unified-5h", 0.4, NOW + FIVE_H * 0.5)])];
+    expect(() =>
+      PaceMath.computeFleetPressureGradient(keys, "unified-5h", NOW, 30, shortTable),
+    ).not.toThrow();
+    expect(() =>
+      PaceMath.computeFleetPressureGradient(keys, "unified-5h", NOW, 30, malformedTable),
+    ).not.toThrow();
+  });
+
+  // 6. Multiple reset crossings within the horizon. ──────────────────────────
+  test("multiple reset crossings in horizon → each zeroes projection correctly", () => {
+    // 5h window, reset 30 min from NOW — well under the 5h horizon. That
+    // gives us a crossing near position 30min/5h = 0.1, and a second
+    // crossing 5h later, which sits just past the horizon. So within one
+    // horizon we hit exactly one reset but the loop advances `nextResetAt`
+    // even when it's past `t`, making a follow-on crossing available if
+    // the horizon extended.
+    //
+    // To force TWO crossings inside the horizon, use a contrived shorter
+    // window: reset every 2h — but the code hard-codes durations per
+    // window. So instead: we assert that with reset @ 30min, the sample
+    // right after resetAt must have LOWER pressure than the sample right
+    // before it. That's the "reset zeroed" signature.
+    const resetAt = NOW + 30 * 60 * 1000; // 30 min
+    const keys = [mkKey("hot", 1, [mkWindow("unified-5h", 0.8, resetAt)])];
+    const result = PaceMath.computeFleetPressureGradient(keys, "unified-5h", NOW, 100);
+
+    // Position of reset: 30min / 5h = 0.1.
+    const beforeReset = result.samples.filter((s: any) => s.position > 0.08 && s.position < 0.1);
+    const afterReset = result.samples.filter((s: any) => s.position > 0.1 && s.position < 0.13);
+    expect(beforeReset.length).toBeGreaterThan(0);
+    expect(afterReset.length).toBeGreaterThan(0);
+    const maxBefore = Math.max(...beforeReset.map((s: any) => s.pressure));
+    const minAfter = Math.min(...afterReset.map((s: any) => s.pressure));
+    expect(minAfter).toBeLessThan(maxBefore);
+
+    // Post-reset accumulation is bounded: after the reset zeroed the util,
+    // the key burns fresh at burnPerMs over the remaining horizon. With
+    // burnPerMs = 0.8 / 30min and ~4.5h of accumulation, projectedUtil
+    // saturates quickly to 1. So every sample after 0.1 should still be
+    // finite and in [0,1].
+    for (const s of result.samples) {
+      expect(Number.isFinite(s.pressure)).toBe(true);
+      expect(s.pressure).toBeGreaterThanOrEqual(0);
+      expect(s.pressure).toBeLessThanOrEqual(1);
+    }
+  });
+
+  // 7. UTC vs local DOW/hour boundary. ───────────────────────────────────────
+  test("factorFor uses UTC lookups consistently regardless of local TZ", () => {
+    // Pick a NOW that's at midnight UTC — some local timezones will have
+    // rolled to the next day already, others not yet. The factor lookup
+    // must stamp slots by UTC (dow, hour) no matter what the host TZ is.
+    // We build a table where (UTC dow, UTC hour) has factor=7 and every
+    // other slot is 1. factorFor must return 7.
+    const utcMidnight = Date.UTC(2026, 3, 22, 0, 0, 0); // April 22, 2026 00:00 UTC
+    const utcDate = new Date(utcMidnight);
+    const dow = utcDate.getUTCDay();
+    const hour = utcDate.getUTCHours();
+    expect(hour).toBe(0);
+
+    const table = setSlot(flatFactorTable(1), dow, hour, 7);
+    expect(PaceMath.factorFor(table, utcMidnight)).toBe(7);
+
+    // Also verify: local dow/hour divergence does NOT pick a different slot.
+    // If factorFor were (incorrectly) using local hour, the slot for local
+    // hour would have factor=1 and this call would return 1.
+    const localHour = utcDate.getHours();
+    if (localHour !== hour) {
+      const localSlotTable = setSlot(flatFactorTable(1), utcDate.getDay(), localHour, 42);
+      // Because factorFor uses UTC lookup, it should NOT return 42 here —
+      // it should return 1 (the default flat factor for the UTC slot).
+      expect(PaceMath.factorFor(localSlotTable, utcMidnight)).toBe(1);
+    }
+
+    // Test the inverse: set only the LOCAL slot high, and verify UTC lookup
+    // returns the flat baseline (1), not the local-slot value.
+    const justBeforeUtcRoll = Date.UTC(2026, 3, 21, 23, 30, 0);
+    const jbDate = new Date(justBeforeUtcRoll);
+    expect(PaceMath.factorFor(flatFactorTable(1), justBeforeUtcRoll)).toBe(1);
+    // Confirm stamped UTC slot is readable:
+    const jbTable = setSlot(flatFactorTable(1), jbDate.getUTCDay(), jbDate.getUTCHours(), 9);
+    expect(PaceMath.factorFor(jbTable, justBeforeUtcRoll)).toBe(9);
+  });
+
+  // 8. All keys in dead zone. ────────────────────────────────────────────────
+  test("fleet entirely in dead zone → seasonality has no effect, all dim", () => {
+    // Every key at 0.99 elapsed-remaining (i.e. 1% elapsed) → all filtered
+    // out by the DEAD_ZONE.minElapsedFrac = 0.02 gate.
+    const freshKeys = [
+      mkKey("a", 1, [mkWindow("unified-5h", 0.05, NOW + FIVE_H * 0.995)]),
+      mkKey("b", 1, [mkWindow("unified-5h", 0.05, NOW + FIVE_H * 0.995)]),
+      mkKey("c", 1, [mkWindow("unified-5h", 0.05, NOW + FIVE_H * 0.995)]),
+    ];
+    // Build a table with an extreme spike at every hour — if any key
+    // projected through, pressure would explode. With no active keys,
+    // pressure is uniformly 0.
+    const allSpike = flatFactorTable(99);
+    const result = PaceMath.computeFleetPressureGradient(
+      freshKeys,
+      "unified-5h",
+      NOW,
+      30,
+      allSpike,
+    );
+    expect(result.maxPressureInWindow).toBe(0);
+    expect(result.peakTimeMs).toBeNull();
+    expect(result.currentTone).toBe("dim");
+    for (const s of result.samples) {
+      expect(s.pressure).toBe(0);
+      expect(s.tone).toBe("dim");
+    }
+  });
+
+  // 9. Single sample count (n=1). ────────────────────────────────────────────
+  test("sampleCount=1 → 2 samples at positions 0 and 1, peakTimeMs valid", () => {
+    const keys = [mkKey("k", 1, [mkWindow("unified-5h", 0.6, NOW + FIVE_H * 0.5)])];
+    const result = PaceMath.computeFleetPressureGradient(keys, "unified-5h", NOW, 1);
+    expect(result.samples.length).toBe(2);
+    expect(result.samples[0].position).toBe(0);
+    expect(result.samples[1].position).toBe(1);
+    expect(result.peakTimeMs).not.toBeNull();
+    // Peak must be one of the two samples — at t=NOW (position 0) or t=NOW+5h.
+    expect(
+      result.peakTimeMs === NOW || result.peakTimeMs === NOW + FIVE_H,
+    ).toBe(true);
+  });
+
+  // 10. Large horizons don't overflow. ───────────────────────────────────────
+  test("7d horizon, 60 samples, varied burn rates → no NaN/Infinity, in [0,1]", () => {
+    const keys = [
+      mkKey("slow",  1, [mkWindow("unified-7d", 0.10, NOW + SEVEN_D * 0.5)]),
+      mkKey("med",   1, [mkWindow("unified-7d", 0.45, NOW + SEVEN_D * 0.3)]),
+      mkKey("hot",   1, [mkWindow("unified-7d", 0.85, NOW + SEVEN_D * 0.2)]),
+      mkKey("trace", 2, [mkWindow("unified-7d", 0.02, NOW + SEVEN_D * 0.9)]),
+      mkKey("burst", 2, [mkWindow("unified-7d", 0.70, NOW + SEVEN_D * 0.05)]),
+    ];
+    // Flat table to isolate this test from seasonality effects.
+    const table = flatFactorTable(1);
+    const result = PaceMath.computeFleetPressureGradient(keys, "unified-7d", NOW, 60, table);
+    expect(result.samples.length).toBe(61);
+    for (const s of result.samples) {
+      expect(Number.isFinite(s.pressure)).toBe(true);
+      expect(Number.isNaN(s.pressure)).toBe(false);
+      expect(s.pressure).toBeGreaterThanOrEqual(0);
+      expect(s.pressure).toBeLessThanOrEqual(1);
+    }
+    expect(Number.isFinite(result.maxPressureInWindow)).toBe(true);
+    expect(result.maxPressureInWindow).toBeLessThanOrEqual(1);
+    expect(result.maxPressureInWindow).toBeGreaterThanOrEqual(0);
+
+    // Same test without the table — the burn rates alone must also stay
+    // bounded over the long horizon.
+    const resultNoTable = PaceMath.computeFleetPressureGradient(keys, "unified-7d", NOW, 60);
+    for (const s of resultNoTable.samples) {
+      expect(Number.isFinite(s.pressure)).toBe(true);
+      expect(s.pressure).toBeGreaterThanOrEqual(0);
+      expect(s.pressure).toBeLessThanOrEqual(1);
+    }
   });
 });
