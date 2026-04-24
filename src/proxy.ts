@@ -124,7 +124,8 @@ type RoutingSelection = {
     | "global_sticky_fallback"
     | "conversation_affinity_hit"
     | "conversation_new_assignment"
-    | "conversation_affinity_remapped";
+    | "conversation_affinity_remapped"
+    | "conversation_affinity_cooldown_passthrough";
   readonly affinityHit: boolean;
   readonly remapped: boolean;
   readonly priorityTier: number | null;
@@ -132,6 +133,7 @@ type RoutingSelection = {
   readonly conversationCountForSelectedKey: number | null;
   readonly pool: "primary" | "secondary" | "tertiary" | null;
   readonly worstHeadroom: number | null;
+  readonly cooldownRemainingMs: number | null;
 };
 
 type StreamStartFailureReason =
@@ -278,12 +280,19 @@ export async function proxyRequest(
           conversationCountForSelectedKey: null,
           pool: null,
           worstHeadroom: null,
+          cooldownRemainingMs: null,
         }
       : keyManager.getKeyForConversation(conversationKey, sessionId);
     const entry: ApiKeyEntry | null = selection.entry;
     preferredRetryKey = null;
 
     if (entry === null) {
+      // Pinned key briefly cooling — hand the client a 429 with retry-after
+      // matching the remaining cooldown, so it retries on the same key once
+      // it's back. Preserves prompt cache on huge affinity-pinned contexts.
+      if (selection.routingDecision === "conversation_affinity_cooldown_passthrough") {
+        return affinityCooldownPassthroughResult(selection.cooldownRemainingMs ?? 0);
+      }
       if (lastStreamStartFailure !== null && !sawRateLimit) {
         if (proxyUser) keyManager.recordTokenError(proxyUser);
         return firstChunkFailureResult(lastStreamStartFailure, config.firstChunkTimeoutMs);
@@ -631,6 +640,13 @@ export function resetProxyDebugStateForTests(): void {
 function allExhaustedResult(keyManager: KeyManager): ProxyResult {
   if (keyManager.totalCount() === 0) return { kind: "no_keys" };
   return { kind: "all_exhausted", earliestAvailableAt: keyManager.getEarliestAvailableAt() };
+}
+
+function affinityCooldownPassthroughResult(cooldownRemainingMs: number): ProxyResult {
+  return {
+    kind: "affinity_cooldown_passthrough",
+    retryAfterSecs: Math.max(1, Math.ceil(cooldownRemainingMs / 1000)),
+  };
 }
 
 function isKeyAvailableNow(entry: ApiKeyEntry): boolean {

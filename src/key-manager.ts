@@ -156,12 +156,21 @@ interface ConversationAffinityEntry {
 
 interface ConversationKeySelection {
   entry: ApiKeyEntry | null;
-  routingDecision: "global_sticky_fallback" | "conversation_affinity_hit" | "conversation_new_assignment" | "conversation_affinity_remapped";
+  routingDecision:
+    | "global_sticky_fallback"
+    | "conversation_affinity_hit"
+    | "conversation_new_assignment"
+    | "conversation_affinity_remapped"
+    | "conversation_affinity_cooldown_passthrough";
   affinityHit: boolean;
   remapped: boolean;
   priorityTier: number | null;
   candidateCount: number;
   conversationCountForSelectedKey: number | null;
+  /** When routingDecision is `conversation_affinity_cooldown_passthrough`, the
+   *  remaining cooldown in ms on the pinned key. The proxy uses this to build
+   *  a synthetic 429 with a matching retry-after. Null on all other decisions. */
+  cooldownRemainingMs: number | null;
   /** Pool that the selected entry belongs to right now. Reflects the per-account
    *  gating: Preferred is always Primary; Normal drops to Secondary once either
    *  window exceeds NORMAL_PRIMARY_UTIL_LIMIT; Fallback drops to Tertiary once
@@ -291,6 +300,14 @@ const SESSION_BUCKET_SIZE = 3;
 // How long routing decision records are kept in the DB. Hourly cleanup drops
 // anything older — the data is only useful for recent forensics.
 const ROUTING_DECISION_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+
+// When a session's pinned key is on a cooldown shorter than this, the
+// proxy returns a 429 to the client (with retry-after matching the remaining
+// cooldown) instead of remapping to another key. Preserves the prompt cache:
+// the client retries on the same key once it's back, rather than re-seeding
+// a huge prompt on a different key. Long cooldowns still trigger a full
+// remap — staying on a dead key for 5h would starve the session.
+const SHORT_COOLDOWN_PASSTHROUGH_MS = 5 * 60 * 1000;
 
 // Seasonal factor table: how many weeks back, how few observations collapse a
 // slot to a "no signal" factor of 1, and how far we let a busy/quiet slot
@@ -729,6 +746,7 @@ export class KeyManager {
         conversationCountForSelectedKey: entry === null ? null : this.countConversationAffinitiesByKey().get(entry.key) ?? 0,
         pool: entry === null ? null : this.assignPool(entry, currentTime),
         worstHeadroom: entry === null ? null : this.worstHeadroom(entry, currentTime),
+        cooldownRemainingMs: null,
       };
     }
 
@@ -751,6 +769,27 @@ export class KeyManager {
           conversationCountForSelectedKey: this.countConversationAffinitiesByKey().get(mappedEntry.key) ?? 0,
           pool: this.assignPool(mappedEntry, currentTime),
           worstHeadroom: this.worstHeadroom(mappedEntry, currentTime),
+          cooldownRemainingMs: null,
+        };
+      }
+      // Short-cooldown passthrough: the pinned key is briefly rate-limited.
+      // Rather than remapping to a different key (which would force a fresh
+      // prompt cache seed — expensive for big contexts), signal the proxy to
+      // hand a 429 back to the client with the remaining cooldown as
+      // retry-after. The client retries on the same pinned key once it's back.
+      if (mappedEntry !== null && this.isOnShortCooldown(mappedEntry, currentTime)) {
+        this.scheduleSave();
+        return {
+          entry: null,
+          routingDecision: "conversation_affinity_cooldown_passthrough",
+          affinityHit: false,
+          remapped: false,
+          priorityTier: mappedEntry.priority,
+          candidateCount: this.countAvailableKeysAtPriority(mappedEntry.priority),
+          conversationCountForSelectedKey: this.countConversationAffinitiesByKey().get(mappedEntry.key) ?? 0,
+          pool: this.assignPool(mappedEntry, currentTime),
+          worstHeadroom: this.worstHeadroom(mappedEntry, currentTime),
+          cooldownRemainingMs: Math.max(0, mappedEntry.availableAt - currentTime),
         };
       }
     }
@@ -767,6 +806,7 @@ export class KeyManager {
         conversationCountForSelectedKey: null,
         pool: null,
         worstHeadroom: null,
+        cooldownRemainingMs: null,
       };
     }
 
@@ -790,6 +830,7 @@ export class KeyManager {
       conversationCountForSelectedKey: (fallback.conversationCounts.get(fallback.entry.key) ?? 0) + (existing?.key === fallback.entry.key ? 0 : 1),
       pool: fallback.pool,
       worstHeadroom: fallback.worstHeadroom,
+      cooldownRemainingMs: null,
     };
   }
 
@@ -1737,6 +1778,16 @@ export class KeyManager {
     return entry.priority !== DISABLED_PRIORITY
       && entry.availableAt <= currentTime
       && entry.allowedDays.includes(currentDay);
+  }
+
+  // True iff the only thing keeping this key unavailable is a short availableAt
+  // cooldown. Disabled keys or keys outside their allowedDays return false —
+  // those are not "briefly cooling" conditions and should trigger a full remap.
+  private isOnShortCooldown(entry: ApiKeyEntry, currentTime: UnixMs): boolean {
+    if (entry.priority === DISABLED_PRIORITY) return false;
+    if (!entry.allowedDays.includes(new Date(currentTime).getDay())) return false;
+    const remaining = entry.availableAt - currentTime;
+    return remaining > 0 && remaining <= SHORT_COOLDOWN_PASSTHROUGH_MS;
   }
 
   private countAvailableKeysAtPriority(priority: number): number {

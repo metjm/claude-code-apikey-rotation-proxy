@@ -3180,3 +3180,174 @@ describe("Routing Decision Logging", () => {
     expect(rows[1]!.conversationCountForSelected).toBe(1);
   });
 });
+
+// ── Short-Cooldown Affinity Passthrough ────────────────────────────────────
+
+describe("Short-Cooldown Affinity Passthrough", () => {
+  function rawEntries(km: KeyManager): ApiKeyEntry[] {
+    return (km as unknown as { keys: ApiKeyEntry[] }).keys;
+  }
+  function findEntry(km: KeyManager, label: string): ApiKeyEntry {
+    return rawEntries(km).find((k) => k.label === label)!;
+  }
+
+  test("short cooldown on pinned key → null entry + passthrough + cooldown ms", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "alpha");
+    km.addKey(VALID_KEY_2, "beta");
+
+    const first = km.getKeyForConversation("conv-pt", "sess");
+    const pinnedLabel = first.entry!.label;
+
+    // 90s cooldown on the pinned key — below the 5-min threshold.
+    km.recordRateLimit(findEntry(km, pinnedLabel), 90);
+
+    const second = km.getKeyForConversation("conv-pt", "sess");
+    expect(second.entry).toBeNull();
+    expect(second.routingDecision).toBe("conversation_affinity_cooldown_passthrough");
+    expect(second.affinityHit).toBe(false);
+    expect(second.remapped).toBe(false);
+    expect(second.cooldownRemainingMs).not.toBeNull();
+    expect(second.cooldownRemainingMs!).toBeGreaterThan(85 * 1000);
+    expect(second.cooldownRemainingMs!).toBeLessThanOrEqual(90 * 1000);
+  });
+
+  test("passthrough does NOT overwrite the affinity — pinned key stays pinned", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "alpha");
+    km.addKey(VALID_KEY_2, "beta");
+
+    const first = km.getKeyForConversation("conv-stay", "sess");
+    const pinned = findEntry(km, first.entry!.label);
+    km.recordRateLimit(pinned, 60);
+    km.getKeyForConversation("conv-stay", "sess"); // passthrough
+
+    const affinities = (km as unknown as {
+      conversationAffinities: Map<string, { key: string }>;
+    }).conversationAffinities;
+    expect(affinities.get("conv-stay")!.key).toBe(pinned.key);
+  });
+
+  test("after the cooldown elapses, the next call is an affinity hit on the same key", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "alpha");
+    km.addKey(VALID_KEY_2, "beta");
+
+    const first = km.getKeyForConversation("conv-return", "sess");
+    const pinned = findEntry(km, first.entry!.label);
+    km.recordRateLimit(pinned, 60);
+    expect(km.getKeyForConversation("conv-return", "sess").routingDecision)
+      .toBe("conversation_affinity_cooldown_passthrough");
+
+    // Simulate time passing — clear the cooldown.
+    (pinned as unknown as { availableAt: number }).availableAt = 0;
+
+    const back = km.getKeyForConversation("conv-return", "sess");
+    expect(back.routingDecision).toBe("conversation_affinity_hit");
+    expect(back.entry!.label).toBe(pinned.label);
+  });
+
+  test("long cooldown (30 min) on pinned key → remap, overwrite affinity", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "alpha");
+    km.addKey(VALID_KEY_2, "beta");
+
+    const first = km.getKeyForConversation("conv-remap-long", "sess");
+    const pinnedLabel = first.entry!.label;
+    km.recordRateLimit(findEntry(km, pinnedLabel), 30 * 60);
+
+    const second = km.getKeyForConversation("conv-remap-long", "sess");
+    expect(second.routingDecision).toBe("conversation_affinity_remapped");
+    expect(second.remapped).toBe(true);
+    expect(second.entry!.label).not.toBe(pinnedLabel);
+
+    const affinities = (km as unknown as {
+      conversationAffinities: Map<string, { key: string }>;
+    }).conversationAffinities;
+    expect(affinities.get("conv-remap-long")!.key).toBe(second.entry!.key);
+  });
+
+  test("solo fleet + short cooldown → passthrough (not remap-to-null)", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "alpha");
+    km.getKeyForConversation("conv-solo", "sess");
+    km.recordRateLimit(findEntry(km, "alpha"), 90);
+
+    const second = km.getKeyForConversation("conv-solo", "sess");
+    expect(second.entry).toBeNull();
+    expect(second.routingDecision).toBe("conversation_affinity_cooldown_passthrough");
+    expect(second.cooldownRemainingMs).not.toBeNull();
+  });
+
+  test("passthrough decision persists to routing_decisions", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "alpha");
+    km.addKey(VALID_KEY_2, "beta");
+
+    const first = km.getKeyForConversation("conv-log-pt", "sess");
+    km.recordRateLimit(findEntry(km, first.entry!.label), 60);
+    km.getKeyForConversation("conv-log-pt", "sess");
+
+    const rows = km.getRecentRoutingDecisions();
+    expect(rows[0]!.routingDecision).toBe("conversation_affinity_cooldown_passthrough");
+    expect(rows[0]!.chosenKeyLabel).toBeNull();
+    expect(rows[0]!.affinityHit).toBe(false);
+    expect(rows[0]!.remapped).toBe(false);
+  });
+
+  test("cooldown at exactly the 5-min threshold still triggers passthrough", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "alpha");
+    km.addKey(VALID_KEY_2, "beta");
+
+    const first = km.getKeyForConversation("conv-edge", "sess");
+    km.recordRateLimit(findEntry(km, first.entry!.label), 300);
+    const second = km.getKeyForConversation("conv-edge", "sess");
+    expect(second.routingDecision).toBe("conversation_affinity_cooldown_passthrough");
+  });
+
+  test("cooldown one second past threshold triggers a remap", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "alpha");
+    km.addKey(VALID_KEY_2, "beta");
+
+    const first = km.getKeyForConversation("conv-past-edge", "sess");
+    km.recordRateLimit(findEntry(km, first.entry!.label), 301);
+    const second = km.getKeyForConversation("conv-past-edge", "sess");
+    expect(second.routingDecision).toBe("conversation_affinity_remapped");
+  });
+
+  test("disabled pinned key → remap (not passthrough) even with availableAt in past", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "alpha");
+    km.addKey(VALID_KEY_2, "beta");
+
+    const first = km.getKeyForConversation("conv-disabled-pin", "sess");
+    const pinnedLabel = first.entry!.label;
+    km.updateKeyPriority(
+      pinnedLabel === "alpha" ? VALID_KEY_1 : VALID_KEY_2,
+      4, // DISABLED_PRIORITY
+    );
+
+    const second = km.getKeyForConversation("conv-disabled-pin", "sess");
+    expect(second.routingDecision).toBe("conversation_affinity_remapped");
+    expect(second.entry!.label).not.toBe(pinnedLabel);
+  });
+
+  test("cooldownRemainingMs is null on all non-passthrough decisions", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "alpha");
+    km.addKey(VALID_KEY_2, "beta");
+
+    const newAssign = km.getKeyForConversation("conv-c", "sess");
+    expect(newAssign.cooldownRemainingMs).toBeNull();
+
+    const hit = km.getKeyForConversation("conv-c", "sess");
+    expect(hit.routingDecision).toBe("conversation_affinity_hit");
+    expect(hit.cooldownRemainingMs).toBeNull();
+
+    const sticky = km.getKeyForConversation(null, null);
+    expect(sticky.routingDecision).toBe("global_sticky_fallback");
+    expect(sticky.cooldownRemainingMs).toBeNull();
+  });
+});

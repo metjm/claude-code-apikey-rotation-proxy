@@ -186,6 +186,13 @@ function startServer(): void {
           return errorResponse(429, "Rate limited", {
             "retry-after": String(result.retryAfterSecs),
           });
+
+        case "affinity_cooldown_passthrough":
+          return errorResponse(
+            429,
+            `Pinned account briefly rate-limited. Retry in ${result.retryAfterSecs}s to stay on the same key and preserve prompt cache.`,
+            { "retry-after": String(result.retryAfterSecs) },
+          );
       }
     },
 

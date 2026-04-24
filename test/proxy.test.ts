@@ -2962,9 +2962,11 @@ describe("Day-restricted keys", () => {
       if (key === FAKE_KEY_A) {
         sessionAAttempts++;
         if (sessionAAttempts === 1) {
+          // Long cooldown (> 5-min threshold) triggers the full remap path.
+          // Short cooldowns now return affinity_cooldown_passthrough instead.
           return new Response("rate limited", {
             status: 429,
-            headers: { "retry-after": "30" },
+            headers: { "retry-after": "1800" },
           });
         }
       }
@@ -3031,5 +3033,79 @@ describe("Day-restricted keys", () => {
       mock.stop();
       cleanup();
     }
+  });
+});
+
+describe("Affinity cooldown passthrough", () => {
+  test("short cooldown on pinned key → returns affinity_cooldown_passthrough (not a remap)", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    km.addKey(FAKE_KEY_B, "key-b");
+
+    let fakeKeyBCalled = false;
+    const mock = upstream((req) => {
+      const key = req.headers.get("x-api-key");
+      if (key === FAKE_KEY_B) fakeKeyBCalled = true;
+      // First call from whoever is pinned: 429 with retry-after 60s (short).
+      return new Response("rate limited", {
+        status: 429,
+        headers: { "retry-after": "60" },
+      });
+    });
+
+    const config = makeConfig(mock.url);
+    const req = makeRequest("/v1/messages", {
+      method: "POST",
+      headers: { "x-claude-code-session-id": "sess-passthrough" },
+      body: JSON.stringify({ model: "m", messages: [] }),
+    });
+
+    // First call pins the session to whichever key is picked, gets 429 from
+    // upstream. Retry loop re-queries getKeyForConversation, which now sees
+    // the pinned key on a 60s cooldown and returns the passthrough decision
+    // instead of remapping to FAKE_KEY_B.
+    const result = await proxyRequest(req, km, config, st);
+
+    expect(result.kind).toBe("affinity_cooldown_passthrough");
+    if (result.kind === "affinity_cooldown_passthrough") {
+      expect(result.retryAfterSecs).toBeGreaterThanOrEqual(55);
+      expect(result.retryAfterSecs).toBeLessThanOrEqual(60);
+    }
+    // FAKE_KEY_B must never be consulted during this request.
+    expect(fakeKeyBCalled).toBe(false);
+  });
+
+  test("long cooldown (>5 min) on pinned key → remaps to other key as before", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    km.addKey(FAKE_KEY_B, "key-b");
+
+    let fakeKeyBCalled = false;
+    const mock = upstream((req) => {
+      const key = req.headers.get("x-api-key");
+      if (key === FAKE_KEY_B) {
+        fakeKeyBCalled = true;
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      // Pinned key returns 429 with a 30-minute cooldown — past the threshold.
+      return new Response("rate limited", {
+        status: 429,
+        headers: { "retry-after": "1800" },
+      });
+    });
+
+    const config = makeConfig(mock.url);
+    const req = makeRequest("/v1/messages", {
+      method: "POST",
+      headers: { "x-claude-code-session-id": "sess-long" },
+      body: JSON.stringify({ model: "m", messages: [] }),
+    });
+    const result = await proxyRequest(req, km, config, st);
+
+    expect(result.kind).toBe("success");
+    expect(fakeKeyBCalled).toBe(true);
   });
 });
