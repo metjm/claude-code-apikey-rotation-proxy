@@ -173,8 +173,9 @@ interface ConversationKeySelection {
   cooldownRemainingMs: number | null;
   /** Pool that the selected entry belongs to right now. Reflects the per-account
    *  gating: Preferred is always Primary; Normal drops to Secondary once either
-   *  window exceeds NORMAL_PRIMARY_UTIL_LIMIT; Fallback drops to Tertiary once
-   *  either exceeds FALLBACK_PRIMARY_UTIL_LIMIT. */
+   *  window exceeds NORMAL_PRIMARY_UTIL_LIMIT; Fallback stays in Tertiary
+   *  unless its 7d window is near reset, in which case it moves to Primary so
+   *  the remaining budget is drained before rollover. */
   pool: Pool | null;
   /** Worst-window headroom (0..1) of the selected key at decision time. */
   worstHeadroom: number | null;
@@ -285,13 +286,13 @@ const WINDOW_DURATION_MS: Record<string, number> = {
 // it's about to refresh.
 const NEAR_RESET_ELAPSED_THRESHOLD = 0.95;
 
-// Per-account pool gating thresholds. A Normal account stays in the Primary
-// pool while both its weekly and 5h utilization are under 75%; a Fallback
-// account stays in Primary while both are under 50%. Otherwise it drops to
-// Secondary (Normal) or Tertiary (Fallback) and only serves traffic when the
-// higher pools have no available account.
+// Per-account pool gating threshold for Normal tier. A Normal account stays
+// in Primary while both its weekly and 5h utilization are under 75%;
+// otherwise it drops to Secondary and only serves traffic when Primary is
+// exhausted. Fallback has a different rule (see assignPool): it's Tertiary
+// unless its 7d window is near reset, so it acts as a true last resort
+// rather than a first-to-drain when hot.
 const NORMAL_PRIMARY_UTIL_LIMIT = 0.75;
-const FALLBACK_PRIMARY_UTIL_LIMIT = 0.50;
 
 // How many sessions one account claims before the rotation moves on. Sessions
 // are counted from the last RECENT_SESSION_WINDOW_MS of conversation activity.
@@ -1850,37 +1851,51 @@ export class KeyManager {
     return Math.max(0, 1 - highestUtilization);
   }
 
-  // Per-account pool placement. Preferred accounts are always Primary; Normal
-  // and Fallback drop out of Primary once either of their two utilization
-  // windows crosses the gating threshold. Unknown utilization counts as 0%
-  // so freshly added keys aren't penalized.
+  // Per-account pool placement.
+  //
+  // - Preferred (priority 1) is always Primary.
+  // - Normal (priority 2) is Primary while both windows are below the gating
+  //   threshold; once either crosses, it drops to Secondary.
+  // - Fallback (priority 3+) defaults to Tertiary — it's a last-resort tier
+  //   and should only serve traffic when Primary and Secondary are both
+  //   exhausted. The one exception: if its 7d window is about to reset
+  //   (NEAR_RESET_ELAPSED_THRESHOLD), we promote it to Primary so the
+  //   remaining budget drains instead of being wasted by the rollover.
+  //
+  // Unknown utilization counts as 0% so freshly added keys aren't penalized.
   private assignPool(entry: ApiKeyEntry, currentTime: UnixMs): Pool {
     if (entry.priority === 1) return "primary";
 
-    let weeklyUtil = 0;
-    let fiveHourUtil = 0;
-    for (const window of entry.capacity.windows) {
-      if (window.windowName !== "unified-5h" && window.windowName !== "unified-7d") continue;
-      const duration = WINDOW_DURATION_MS[window.windowName];
-      if (duration === undefined) continue;
-      if (window.resetAt !== null && window.resetAt !== undefined) {
-        const elapsedFraction = (duration - (window.resetAt - currentTime)) / duration;
-        if (elapsedFraction >= NEAR_RESET_ELAPSED_THRESHOLD) continue;
-      }
-      const util = window.utilization ?? 0;
-      if (window.windowName === "unified-7d" && util > weeklyUtil) weeklyUtil = util;
-      if (window.windowName === "unified-5h" && util > fiveHourUtil) fiveHourUtil = util;
-    }
-
     if (entry.priority === 2) {
+      let weeklyUtil = 0;
+      let fiveHourUtil = 0;
+      for (const window of entry.capacity.windows) {
+        if (window.windowName !== "unified-5h" && window.windowName !== "unified-7d") continue;
+        const duration = WINDOW_DURATION_MS[window.windowName];
+        if (duration === undefined) continue;
+        if (window.resetAt !== null && window.resetAt !== undefined) {
+          const elapsedFraction = (duration - (window.resetAt - currentTime)) / duration;
+          if (elapsedFraction >= NEAR_RESET_ELAPSED_THRESHOLD) continue;
+        }
+        const util = window.utilization ?? 0;
+        if (window.windowName === "unified-7d" && util > weeklyUtil) weeklyUtil = util;
+        if (window.windowName === "unified-5h" && util > fiveHourUtil) fiveHourUtil = util;
+      }
       return weeklyUtil < NORMAL_PRIMARY_UTIL_LIMIT && fiveHourUtil < NORMAL_PRIMARY_UTIL_LIMIT
         ? "primary"
         : "secondary";
     }
-    // Fallback (priority 3) and any future lower tier follow the same rule.
-    return weeklyUtil < FALLBACK_PRIMARY_UTIL_LIMIT && fiveHourUtil < FALLBACK_PRIMARY_UTIL_LIMIT
-      ? "primary"
-      : "tertiary";
+
+    // Fallback (priority 3+): tertiary unless the 7d window is near reset.
+    for (const window of entry.capacity.windows) {
+      if (window.windowName !== "unified-7d") continue;
+      if (window.resetAt === null || window.resetAt === undefined) continue;
+      const duration = WINDOW_DURATION_MS["unified-7d"];
+      if (duration === undefined) continue;
+      const elapsedFraction = (duration - (window.resetAt - currentTime)) / duration;
+      if (elapsedFraction >= NEAR_RESET_ELAPSED_THRESHOLD) return "primary";
+    }
+    return "tertiary";
   }
 
   // Cascade: walk Primary → Secondary → Tertiary, returning the first

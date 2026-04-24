@@ -1809,53 +1809,55 @@ describe("Pool-based routing", () => {
       expect(callAssignPool(km, entry)).toBe("primary");
     });
 
-    test("Fallback at 49/49 → Primary (just under 50%)", () => {
+    test("Fallback at low util (49/49) → Tertiary (util doesn't promote Fallback)", () => {
       const km = create();
-      const entry = km.addKey(VALID_KEY_1, "f-edge");
+      const entry = km.addKey(VALID_KEY_1, "f-lowutil");
       km.updateKeyPriority(VALID_KEY_1, 3);
       setWindows(km, entry, [
         { name: "unified-5h", util: 0.49 },
         { name: "unified-7d", util: 0.49 },
       ]);
-      expect(callAssignPool(km, entry)).toBe("primary");
+      expect(callAssignPool(km, entry)).toBe("tertiary");
     });
 
-    test("Fallback at exactly 50% weekly → Tertiary", () => {
+    test("Fallback at high util → Tertiary", () => {
       const km = create();
-      const entry = km.addKey(VALID_KEY_1, "f-w50");
+      const entry = km.addKey(VALID_KEY_1, "f-hot");
       km.updateKeyPriority(VALID_KEY_1, 3);
       setWindows(km, entry, [
-        { name: "unified-7d", util: 0.50 },
+        { name: "unified-5h", util: 0.90 },
+        { name: "unified-7d", util: 0.90 },
       ]);
       expect(callAssignPool(km, entry)).toBe("tertiary");
     });
 
-    test("Fallback at exactly 50% 5h → Tertiary", () => {
-      const km = create();
-      const entry = km.addKey(VALID_KEY_1, "f-5h50");
-      km.updateKeyPriority(VALID_KEY_1, 3);
-      setWindows(km, entry, [
-        { name: "unified-5h", util: 0.50 },
-      ]);
-      expect(callAssignPool(km, entry)).toBe("tertiary");
-    });
-
-    test("Fallback at 50% on both → Tertiary", () => {
-      const km = create();
-      const entry = km.addKey(VALID_KEY_1, "f-both50");
-      km.updateKeyPriority(VALID_KEY_1, 3);
-      setWindows(km, entry, [
-        { name: "unified-5h", util: 0.50 },
-        { name: "unified-7d", util: 0.50 },
-      ]);
-      expect(callAssignPool(km, entry)).toBe("tertiary");
-    });
-
-    test("Fallback with no capacity windows → Primary (unknown = 0)", () => {
+    test("Fallback with no capacity windows → Tertiary (default last-resort)", () => {
       const km = create();
       const entry = km.addKey(VALID_KEY_1, "f-fresh");
       km.updateKeyPriority(VALID_KEY_1, 3);
+      expect(callAssignPool(km, entry)).toBe("tertiary");
+    });
+
+    test("Fallback with 7d near reset (>=95% elapsed) → Primary (drain before rollover)", () => {
+      const km = create();
+      const entry = km.addKey(VALID_KEY_1, "f-near-reset");
+      km.updateKeyPriority(VALID_KEY_1, 3);
+      const elapsed = SEVEN_D * 0.96;
+      const resetIn = SEVEN_D - elapsed;
+      setWindows(km, entry, [
+        { name: "unified-7d", util: 0.80, resetAt: Date.now() + resetIn },
+      ]);
       expect(callAssignPool(km, entry)).toBe("primary");
+    });
+
+    test("Fallback with 7d far from reset stays Tertiary (no promotion)", () => {
+      const km = create();
+      const entry = km.addKey(VALID_KEY_1, "f-far");
+      km.updateKeyPriority(VALID_KEY_1, 3);
+      setWindows(km, entry, [
+        { name: "unified-7d", util: 0.90, resetAt: Date.now() + SEVEN_D / 2 },
+      ]);
+      expect(callAssignPool(km, entry)).toBe("tertiary");
     });
 
     test("Near-reset window (>=95% elapsed) is ignored — Normal at 90% near reset stays Primary", () => {
@@ -2217,16 +2219,17 @@ describe("Pool-based routing", () => {
       expect(repeat.pool).toBe("secondary");
     });
 
-    test("Affinity holds when account drifts into Tertiary", () => {
+    test("Affinity holds on a Fallback-pinned key even though its pool is Tertiary", () => {
+      // With the Fallback-is-tertiary rule, the only way a Fallback key gets
+      // pinned via a new assignment is when Primary/Secondary are exhausted.
+      // Once pinned, subsequent requests should still be affinity hits even
+      // though the pool stays Tertiary.
       const km = create();
       const a = km.addKey(VALID_KEY_1, "a");
       km.updateKeyPriority(VALID_KEY_1, 3);
-      km.addKey(VALID_KEY_2, "b");
 
       const first = km.getKeyForConversation("conv-1");
       expect(first.entry?.key).toBe(a.key);
-
-      setWindows(km, a, [{ name: "unified-7d", util: 0.55 }]);
 
       const repeat = km.getKeyForConversation("conv-1");
       expect(repeat.entry?.key).toBe(a.key);
@@ -2327,7 +2330,7 @@ describe("Pool-based routing", () => {
       expect(sel.pool).toBe("secondary");
     });
 
-    test("pool field is 'tertiary' when Fallback is demoted and chosen", () => {
+    test("pool field is 'tertiary' when a Fallback key is chosen", () => {
       const km = create();
       const f = km.addKey(VALID_KEY_1, "f-hot");
       km.updateKeyPriority(VALID_KEY_1, 3);
@@ -2384,7 +2387,7 @@ describe("Pool-based routing", () => {
   // ── End-to-end / compound scenarios ─────────────────────────────────────
 
   describe("Compound scenarios", () => {
-    test("Mixed pool: Preferred, Normal-cool, Fallback-cool — all in Primary, sorted by reset", () => {
+    test("Mixed pool: Preferred and Normal in Primary; Fallback stays Tertiary → Fallback never picked while Primary has options", () => {
       const km = create();
       const baseNow = Date.now();
       const p = km.addKey(VALID_KEY_1, "p");
@@ -2392,12 +2395,37 @@ describe("Pool-based routing", () => {
       const f = km.addKey(VALID_KEY_3, "f");
       km.updateKeyPriority(VALID_KEY_1, 1);
       km.updateKeyPriority(VALID_KEY_3, 3);
-      // f has the soonest weekly reset
+      // f has the soonest weekly reset, but Fallback-as-tertiary means that
+      // doesn't promote it into Primary. Primary (p, n) should be drained first.
       setWindows(km, p, [{ name: "unified-7d", util: 0.10, resetAt: baseNow + SEVEN_D * 0.75 }]);
       setWindows(km, n, [{ name: "unified-7d", util: 0.10, resetAt: baseNow + SEVEN_D / 2 }]);
       setWindows(km, f, [{ name: "unified-7d", util: 0.10, resetAt: baseNow + SEVEN_D / 4 }]);
 
-      // First 3 picks should all go to f (soonest reset, all in Primary, no rotation pressure)
+      const picks = new Set<string>();
+      for (let i = 0; i < 6; i++) {
+        const pick = km.getKeyForConversation(`conv-${i}`);
+        picks.add(pick.entry!.key);
+        km.recordRequest(pick.entry!);
+      }
+      expect(picks.has(f.key)).toBe(false); // Fallback never touched
+      expect(picks.has(p.key)).toBe(true);
+      expect(picks.has(n.key)).toBe(true);
+    });
+
+    test("Mixed pool: Fallback with 7d near reset IS promoted into Primary and wins reset-soonest sort", () => {
+      const km = create();
+      const baseNow = Date.now();
+      const p = km.addKey(VALID_KEY_1, "p");
+      const n = km.addKey(VALID_KEY_2, "n");
+      const f = km.addKey(VALID_KEY_3, "f");
+      km.updateKeyPriority(VALID_KEY_1, 1);
+      km.updateKeyPriority(VALID_KEY_3, 3);
+      // f is near-reset → promoted to Primary and has the soonest reset → wins the sort.
+      const elapsed = SEVEN_D * 0.96;
+      setWindows(km, p, [{ name: "unified-7d", util: 0.10, resetAt: baseNow + SEVEN_D * 0.75 }]);
+      setWindows(km, n, [{ name: "unified-7d", util: 0.10, resetAt: baseNow + SEVEN_D / 2 }]);
+      setWindows(km, f, [{ name: "unified-7d", util: 0.80, resetAt: baseNow + (SEVEN_D - elapsed) }]);
+
       for (let i = 0; i < 3; i++) {
         const pick = km.getKeyForConversation(`conv-${i}`);
         expect(pick.entry?.key).toBe(f.key);
