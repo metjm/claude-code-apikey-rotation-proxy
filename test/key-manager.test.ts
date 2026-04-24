@@ -2966,3 +2966,217 @@ describe("Seasonal request factors", () => {
     expect(slot.samples).toBe(3);
   });
 });
+
+// ── Routing Decision Logging ────────────────────────────────────────────────
+
+describe("Routing Decision Logging", () => {
+  test("new assignment persists a row with selection + candidates snapshot", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "alpha");
+    km.addKey(VALID_KEY_2, "beta");
+
+    const sel = km.getKeyForConversation("conv-1", "session-abc");
+    expect(sel.entry).not.toBeNull();
+
+    const rows = km.getRecentRoutingDecisions();
+    expect(rows.length).toBe(1);
+    const row = rows[0]!;
+    expect(row.conversationKey).toBe("conv-1");
+    expect(row.sessionId).toBe("session-abc");
+    expect(row.chosenKeyLabel).toBe(sel.entry!.label);
+    expect(row.routingDecision).toBe("conversation_new_assignment");
+    expect(row.affinityHit).toBe(false);
+    expect(row.remapped).toBe(false);
+    expect(row.priorityTier).toBe(sel.priorityTier);
+    expect(row.pool).toBe(sel.pool);
+    expect(row.candidateCount).toBe(sel.candidateCount);
+    expect(row.worstHeadroom).toBe(sel.worstHeadroom);
+    expect(row.conversationCountForSelected).toBe(sel.conversationCountForSelectedKey);
+    expect(row.candidates.length).toBe(2);
+    const labels = row.candidates.map((c) => c.label).sort();
+    expect(labels).toEqual(["alpha", "beta"]);
+    for (const c of row.candidates) {
+      expect(c.available).toBe(true);
+      expect(c.pool).toBe("primary");
+      expect(c.priority).toBe(2); // default Normal
+      expect(typeof c.sessionBucket).toBe("number");
+      expect(typeof c.recentSessions).toBe("number");
+    }
+  });
+
+  test("affinity hit is recorded after a new assignment; newest first", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "alpha");
+    km.getKeyForConversation("conv-2", "session-x");
+    km.getKeyForConversation("conv-2", "session-x");
+
+    const rows = km.getRecentRoutingDecisions();
+    expect(rows.length).toBe(2);
+    expect(rows[0]!.routingDecision).toBe("conversation_affinity_hit");
+    expect(rows[0]!.affinityHit).toBe(true);
+    expect(rows[1]!.routingDecision).toBe("conversation_new_assignment");
+    expect(rows[1]!.affinityHit).toBe(false);
+    // Newest-first ordering on decidedAt
+    expect(rows[0]!.decidedAt).toBeGreaterThanOrEqual(rows[1]!.decidedAt);
+  });
+
+  test("affinity remap fires when mapped key goes on cooldown", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "alpha");
+    km.addKey(VALID_KEY_2, "beta");
+
+    // First call pins conv to whichever key the selector picks first.
+    const first = km.getKeyForConversation("conv-remap", "sess");
+    expect(first.entry).not.toBeNull();
+    const firstLabel = first.entry!.label;
+
+    // Force the pinned key onto a long cooldown so the affinity can't be honored.
+    const rawEntries = (km as unknown as { keys: ApiKeyEntry[] }).keys;
+    const pinned = rawEntries.find((k) => k.label === firstLabel)!;
+    km.recordRateLimit(pinned, 9_999);
+
+    km.getKeyForConversation("conv-remap", "sess");
+
+    const rows = km.getRecentRoutingDecisions();
+    expect(rows[0]!.routingDecision).toBe("conversation_affinity_remapped");
+    expect(rows[0]!.remapped).toBe(true);
+    expect(rows[0]!.chosenKeyLabel).not.toBe(firstLabel);
+    // The cooldown'd key should be visible in the candidates snapshot as unavailable
+    const cooled = rows[0]!.candidates.find((c) => c.label === firstLabel)!;
+    expect(cooled.available).toBe(false);
+    expect(cooled.availableAt).toBeGreaterThan(Date.now());
+  });
+
+  test("global_sticky_fallback (null conversationKey) is recorded", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "alpha");
+    km.getKeyForConversation(null, null);
+    const rows = km.getRecentRoutingDecisions();
+    expect(rows.length).toBe(1);
+    expect(rows[0]!.routingDecision).toBe("global_sticky_fallback");
+    expect(rows[0]!.conversationKey).toBeNull();
+    expect(rows[0]!.sessionId).toBeNull();
+  });
+
+  test("no keys available still persists a row with null chosen key + empty candidates", () => {
+    const km = create();
+    km.getKeyForConversation("conv-empty", "session-y");
+    const rows = km.getRecentRoutingDecisions();
+    expect(rows.length).toBe(1);
+    expect(rows[0]!.chosenKeyLabel).toBeNull();
+    expect(rows[0]!.priorityTier).toBeNull();
+    expect(rows[0]!.pool).toBeNull();
+    expect(rows[0]!.candidates.length).toBe(0);
+  });
+
+  test("candidate snapshot reflects pool, priority, and utilization", () => {
+    const km = create();
+    const alpha = km.addKey(VALID_KEY_1, "alpha");
+    km.addKey(VALID_KEY_2, "beta");
+    // Put alpha on Fallback tier with 7d util = 72% → should land in tertiary
+    km.updateKeyPriority(VALID_KEY_1, 3);
+    km.recordCapacityObservation(alpha, {
+      seenAt: unixMs(Date.now()),
+      httpStatus: 200,
+      windows: [{
+        windowName: "unified-7d",
+        status: "allowed",
+        utilization: 0.72,
+        resetAt: unixMs(Date.now() + 6 * 24 * 60 * 60 * 1000),
+      }],
+    });
+
+    km.getKeyForConversation("conv-pool", "s");
+    const row = km.getRecentRoutingDecisions()[0]!;
+    const alphaSnap = row.candidates.find((c) => c.label === "alpha")!;
+    const betaSnap = row.candidates.find((c) => c.label === "beta")!;
+    expect(alphaSnap.priority).toBe(3);
+    expect(alphaSnap.pool).toBe("tertiary");
+    expect(alphaSnap.util7d).toBeCloseTo(0.72);
+    expect(alphaSnap.reset7d).not.toBeNull();
+    expect(betaSnap.pool).toBe("primary");
+    // Beta (Normal, no observations) should be the winner because alpha is in tertiary
+    expect(row.chosenKeyLabel).toBe("beta");
+  });
+
+  test("candidate snapshot excludes disabled keys", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "alpha");
+    km.addKey(VALID_KEY_2, "beta");
+    km.updateKeyPriority(VALID_KEY_2, 4); // Disabled sentinel
+
+    km.getKeyForConversation("conv-disabled", "s");
+    const row = km.getRecentRoutingDecisions()[0]!;
+    const labels = row.candidates.map((c) => c.label);
+    expect(labels).toContain("alpha");
+    expect(labels).not.toContain("beta");
+  });
+
+  test("candidate snapshot tracks sessionBucket from recent conversations", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "alpha");
+    // 4 distinct conversations — 4 recent sessions on the only key.
+    for (let i = 0; i < 4; i++) km.getKeyForConversation(`conv-sess-${i}`, `s-${i}`);
+    const row = km.getRecentRoutingDecisions()[0]!;
+    const alphaSnap = row.candidates.find((c) => c.label === "alpha")!;
+    expect(alphaSnap.recentSessions).toBeGreaterThanOrEqual(4);
+    expect(alphaSnap.sessionBucket).toBe(Math.floor(alphaSnap.recentSessions / 3));
+  });
+
+  test("getRecentRoutingDecisions honors limit and returns newest first", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "alpha");
+    for (let i = 0; i < 5; i++) km.getKeyForConversation(`c-${i}`, `s-${i}`);
+    const limited = km.getRecentRoutingDecisions(3);
+    expect(limited.length).toBe(3);
+    // decidedAt monotonically non-increasing
+    for (let i = 1; i < limited.length; i++) {
+      expect(limited[i - 1]!.decidedAt).toBeGreaterThanOrEqual(limited[i]!.decidedAt);
+    }
+  });
+
+  test("cleanupOldRoutingDecisions drops only rows past retention, keeps fresh ones", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "alpha");
+    km.getKeyForConversation("c-old", "s-old");
+    km.getKeyForConversation("c-fresh", "s-fresh");
+    const db = (km as unknown as { db: Database }).db;
+    const eightDaysAgo = Date.now() - 8 * 24 * 60 * 60 * 1000;
+    const sixDaysAgo = Date.now() - 6 * 24 * 60 * 60 * 1000;
+    db.run(
+      "UPDATE routing_decisions SET decided_at = ? WHERE conversation_key = 'c-old'",
+      [eightDaysAgo],
+    );
+    db.run(
+      "UPDATE routing_decisions SET decided_at = ? WHERE conversation_key = 'c-fresh'",
+      [sixDaysAgo],
+    );
+    (km as unknown as { cleanupOldRoutingDecisions: () => void }).cleanupOldRoutingDecisions();
+    const remaining = km.getRecentRoutingDecisions();
+    expect(remaining.length).toBe(1);
+    expect(remaining[0]!.conversationKey).toBe("c-fresh");
+  });
+
+  test("routing_decisions schema and index are created on init", () => {
+    create();
+    const db = new Database(join(tempDir, "state.db"), { readonly: true });
+    const tables = db.query("SELECT name FROM sqlite_master WHERE type='table'").all() as { name: string }[];
+    expect(tables.map((t) => t.name)).toContain("routing_decisions");
+    const indexes = db.query("SELECT name FROM sqlite_master WHERE type='index'").all() as { name: string }[];
+    expect(indexes.map((i) => i.name)).toContain("idx_routing_decisions_decided_at");
+    db.close();
+  });
+
+  test("conversationCountForSelected tracks affinities on the chosen key", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "alpha");
+    km.getKeyForConversation("conv-A", "sA");
+    km.getKeyForConversation("conv-B", "sB");
+    const rows = km.getRecentRoutingDecisions();
+    // Newest first: conv-B is index 0, conv-A is index 1.
+    expect(rows[0]!.conversationKey).toBe("conv-B");
+    expect(rows[0]!.conversationCountForSelected).toBe(2);
+    expect(rows[1]!.conversationKey).toBe("conv-A");
+    expect(rows[1]!.conversationCountForSelected).toBe(1);
+  });
+});

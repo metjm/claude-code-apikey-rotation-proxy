@@ -171,6 +171,53 @@ interface ConversationKeySelection {
   worstHeadroom: number | null;
 }
 
+export interface RoutingCandidateSnapshot {
+  label: string;
+  priority: number;
+  pool: Pool;
+  available: boolean;
+  availableAt: number;
+  util5h: number | null;
+  util7d: number | null;
+  reset5h: number | null;
+  reset7d: number | null;
+  recentSessions: number;
+  sessionBucket: number;
+  worstHeadroom: number;
+}
+
+export interface RoutingDecisionRecord {
+  decidedAt: number;
+  conversationKey: string | null;
+  sessionId: string | null;
+  chosenKeyLabel: string | null;
+  routingDecision: string;
+  priorityTier: number | null;
+  pool: string | null;
+  candidateCount: number | null;
+  affinityHit: boolean;
+  remapped: boolean;
+  conversationCountForSelected: number | null;
+  worstHeadroom: number | null;
+  candidates: RoutingCandidateSnapshot[];
+}
+
+interface RoutingDecisionRow {
+  decided_at: number;
+  conversation_key: string | null;
+  session_id: string | null;
+  chosen_key_label: string | null;
+  routing_decision: string;
+  priority_tier: number | null;
+  pool: string | null;
+  candidate_count: number | null;
+  affinity_hit: number;
+  remapped: number;
+  conversation_count_for_selected: number | null;
+  worst_headroom: number | null;
+  candidates_json: string;
+}
+
 function emptyBucket(): BucketAccumulator {
   return { requests: 0, successes: 0, errors: 0, rateLimits: 0, tokensIn: 0, tokensOut: 0, cacheRead: 0, cacheCreation: 0 };
 }
@@ -241,6 +288,10 @@ const FALLBACK_PRIMARY_UTIL_LIMIT = 0.50;
 // are counted from the last RECENT_SESSION_WINDOW_MS of conversation activity.
 const SESSION_BUCKET_SIZE = 3;
 
+// How long routing decision records are kept in the DB. Hourly cleanup drops
+// anything older — the data is only useful for recent forensics.
+const ROUTING_DECISION_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+
 // Seasonal factor table: how many weeks back, how few observations collapse a
 // slot to a "no signal" factor of 1, and how far we let a busy/quiet slot
 // stretch the projection. Clamp keeps a single anomalous week from dominating.
@@ -285,6 +336,7 @@ export class KeyManager {
       if (this.isClosed) return;
       try {
         this.cleanupOldTimeseries();
+        this.cleanupOldRoutingDecisions();
         this.cleanupExpiredConversationAffinities(true);
         this.prunePastResetCapacityWindows();
       } catch (error) {
@@ -452,6 +504,25 @@ export class KeyManager {
 
       CREATE INDEX IF NOT EXISTS idx_conversation_affinities_key ON conversation_affinities(key);
       CREATE INDEX IF NOT EXISTS idx_conversation_affinities_last_seen ON conversation_affinities(last_seen_at);
+
+      CREATE TABLE IF NOT EXISTS routing_decisions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        decided_at INTEGER NOT NULL,
+        conversation_key TEXT,
+        session_id TEXT,
+        chosen_key_label TEXT,
+        routing_decision TEXT NOT NULL,
+        priority_tier INTEGER,
+        pool TEXT,
+        candidate_count INTEGER,
+        affinity_hit INTEGER NOT NULL DEFAULT 0,
+        remapped INTEGER NOT NULL DEFAULT 0,
+        conversation_count_for_selected INTEGER,
+        worst_headroom REAL,
+        candidates_json TEXT NOT NULL DEFAULT '[]'
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_routing_decisions_decided_at ON routing_decisions(decided_at);
     `);
 
     // Migrate existing tables to add cache columns
@@ -639,6 +710,12 @@ export class KeyManager {
   }
 
   getKeyForConversation(conversationKey: string | null, sessionId?: string | null): ConversationKeySelection {
+    const selection = this.computeKeyForConversation(conversationKey, sessionId);
+    this.logRoutingDecision(conversationKey, sessionId ?? null, selection, now());
+    return selection;
+  }
+
+  private computeKeyForConversation(conversationKey: string | null, sessionId?: string | null): ConversationKeySelection {
     if (conversationKey === null) {
       const entry = this.getNextAvailableKey();
       const currentTime = now();
@@ -1522,6 +1599,116 @@ export class KeyManager {
     const cutoff = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 13);
     this.db.run("DELETE FROM stats_timeseries WHERE bucket < ?", [cutoff]);
     this.db.run("DELETE FROM capacity_window_timeseries WHERE bucket < ?", [cutoff]);
+  }
+
+  private cleanupOldRoutingDecisions(): void {
+    const cutoff = Date.now() - ROUTING_DECISION_RETENTION_MS;
+    this.db.run("DELETE FROM routing_decisions WHERE decided_at < ?", [cutoff]);
+  }
+
+  // Compact snapshot of every non-disabled key at decision time — what each
+  // one's pool, utilization, reset countdown, recent session count, and
+  // availability were. Stored per-row so a decision can be re-evaluated
+  // forensically without replaying live state.
+  private snapshotRoutingCandidates(currentTime: UnixMs): RoutingCandidateSnapshot[] {
+    const recent = this.countRecentSessionsByKey(
+      unixMs(currentTime - RECENT_SESSION_WINDOW_MS),
+    );
+    const snapshots: RoutingCandidateSnapshot[] = [];
+    for (const entry of this.keys) {
+      if (entry.priority === DISABLED_PRIORITY) continue;
+      let util5h: number | null = null;
+      let util7d: number | null = null;
+      let reset5h: number | null = null;
+      let reset7d: number | null = null;
+      for (const window of entry.capacity.windows) {
+        if (window.windowName === "unified-5h") {
+          util5h = window.utilization ?? null;
+          reset5h = window.resetAt ?? null;
+        } else if (window.windowName === "unified-7d") {
+          util7d = window.utilization ?? null;
+          reset7d = window.resetAt ?? null;
+        }
+      }
+      const recentSessions = recent.get(entry.key) ?? 0;
+      snapshots.push({
+        label: entry.label,
+        priority: entry.priority,
+        pool: this.assignPool(entry, currentTime),
+        available: this.isKeyAvailable(entry),
+        availableAt: entry.availableAt,
+        util5h, util7d, reset5h, reset7d,
+        recentSessions,
+        sessionBucket: Math.floor(recentSessions / SESSION_BUCKET_SIZE),
+        worstHeadroom: this.worstHeadroom(entry, currentTime),
+      });
+    }
+    return snapshots;
+  }
+
+  private logRoutingDecision(
+    conversationKey: string | null,
+    sessionId: string | null,
+    selection: ConversationKeySelection,
+    currentTime: UnixMs,
+  ): void {
+    try {
+      const candidates = this.snapshotRoutingCandidates(currentTime);
+      this.db.run(
+        `INSERT INTO routing_decisions
+         (decided_at, conversation_key, session_id, chosen_key_label, routing_decision,
+          priority_tier, pool, candidate_count, affinity_hit, remapped,
+          conversation_count_for_selected, worst_headroom, candidates_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          currentTime,
+          conversationKey,
+          sessionId,
+          selection.entry?.label ?? null,
+          selection.routingDecision,
+          selection.priorityTier,
+          selection.pool,
+          selection.candidateCount,
+          selection.affinityHit ? 1 : 0,
+          selection.remapped ? 1 : 0,
+          selection.conversationCountForSelectedKey,
+          selection.worstHeadroom,
+          JSON.stringify(candidates),
+        ],
+      );
+    } catch (error) {
+      log("warn", "Failed to persist routing decision", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  /** Most recent routing decisions (newest first), up to `limit` rows.
+   *  Reads straight from the DB — intended for dashboards / CLI forensics. */
+  getRecentRoutingDecisions(limit = 200): RoutingDecisionRecord[] {
+    const rows = this.db.query(
+      `SELECT decided_at, conversation_key, session_id, chosen_key_label, routing_decision,
+              priority_tier, pool, candidate_count, affinity_hit, remapped,
+              conversation_count_for_selected, worst_headroom, candidates_json
+       FROM routing_decisions
+       ORDER BY decided_at DESC
+       LIMIT ?`,
+    ).all(limit) as RoutingDecisionRow[];
+    return rows.map((r) => ({
+      decidedAt: r.decided_at,
+      conversationKey: r.conversation_key,
+      sessionId: r.session_id,
+      chosenKeyLabel: r.chosen_key_label,
+      routingDecision: r.routing_decision,
+      priorityTier: r.priority_tier,
+      pool: r.pool,
+      candidateCount: r.candidate_count,
+      affinityHit: r.affinity_hit === 1,
+      remapped: r.remapped === 1,
+      conversationCountForSelected: r.conversation_count_for_selected,
+      worstHeadroom: r.worst_headroom,
+      candidates: JSON.parse(r.candidates_json) as RoutingCandidateSnapshot[],
+    }));
   }
 
   private cleanupExpiredConversationAffinities(persist: boolean): void {
