@@ -12,6 +12,10 @@ import { emitWithKeys } from "./events.ts";
 import type { SchemaTracker } from "./schema-tracker.ts";
 
 const RATE_LIMIT_STATUS = 429 as const;
+// Cap per-iteration server-side wait for pinned-key short cooldowns. Stays
+// comfortably under the Bun idle timeout (255s) so the client connection
+// isn't dropped mid-wait. Longer cooldowns loop for multiple iterations.
+const AFFINITY_COOLDOWN_WAIT_CAP_MS = 200_000;
 const ACTIVE_STREAM_SNAPSHOT_INTERVAL_MS = 2_000;
 const RECENT_STREAM_ACTIVITY_WINDOW_MS = 1_000;
 const SLOW_STREAM_SILENCE_LOG_MS = 5_000;
@@ -287,11 +291,30 @@ export async function proxyRequest(
     preferredRetryKey = null;
 
     if (entry === null) {
-      // Pinned key briefly cooling — hand the client a 429 with retry-after
-      // matching the remaining cooldown, so it retries on the same key once
-      // it's back. Preserves prompt cache on huge affinity-pinned contexts.
+      // Pinned key briefly cooling — sleep until the cooldown ends and retry
+      // on the same key rather than remapping to a different account. Keeps
+      // the prompt cache warm on large affinity-pinned contexts without
+      // exposing a 429 to the client. Per-iteration wait is capped below the
+      // Bun idle timeout; longer cooldowns loop for multiple iterations.
       if (selection.routingDecision === "conversation_affinity_cooldown_passthrough") {
-        return affinityCooldownPassthroughResult(selection.cooldownRemainingMs ?? 0);
+        const waitMs = Math.min(
+          Math.max(0, selection.cooldownRemainingMs ?? 0),
+          AFFINITY_COOLDOWN_WAIT_CAP_MS,
+        );
+        log("info", "Waiting for pinned-key short cooldown", {
+          user: proxyUser?.label,
+          method: req.method,
+          path: url.pathname,
+          attempt: attempts,
+          traceId,
+          sessionId,
+          conversationKey,
+          waitMs,
+          cooldownRemainingMs: selection.cooldownRemainingMs,
+        });
+        if (waitMs > 0) await new Promise((resolve) => setTimeout(resolve, waitMs));
+        attempts++;
+        continue;
       }
       if (lastStreamStartFailure !== null && !sawRateLimit) {
         if (proxyUser) keyManager.recordTokenError(proxyUser);
@@ -640,13 +663,6 @@ export function resetProxyDebugStateForTests(): void {
 function allExhaustedResult(keyManager: KeyManager): ProxyResult {
   if (keyManager.totalCount() === 0) return { kind: "no_keys" };
   return { kind: "all_exhausted", earliestAvailableAt: keyManager.getEarliestAvailableAt() };
-}
-
-function affinityCooldownPassthroughResult(cooldownRemainingMs: number): ProxyResult {
-  return {
-    kind: "affinity_cooldown_passthrough",
-    retryAfterSecs: Math.max(1, Math.ceil(cooldownRemainingMs / 1000)),
-  };
 }
 
 function isKeyAvailableNow(entry: ApiKeyEntry): boolean {

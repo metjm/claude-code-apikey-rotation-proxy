@@ -187,18 +187,12 @@ interface ProxyAllExhausted {
   readonly earliestAvailableAt: UnixMs;
 }
 
-interface ProxyAffinityCooldownPassthrough {
-  readonly kind: "affinity_cooldown_passthrough";
-  readonly retryAfterSecs: number;
-}
-
 export type ProxyResult =
   | ProxySuccess
   | ProxyRateLimited
   | ProxyError
   | ProxyNoKeys
-  | ProxyAllExhausted
-  | ProxyAffinityCooldownPassthrough;
+  | ProxyAllExhausted;
 
 // ── Admin API request types ───────────────────────────────────────
 

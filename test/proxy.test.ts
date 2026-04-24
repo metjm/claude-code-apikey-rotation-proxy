@@ -2963,7 +2963,7 @@ describe("Day-restricted keys", () => {
         sessionAAttempts++;
         if (sessionAAttempts === 1) {
           // Long cooldown (> 5-min threshold) triggers the full remap path.
-          // Short cooldowns now return affinity_cooldown_passthrough instead.
+          // Short cooldowns would make the proxy wait server-side instead.
           return new Response("rate limited", {
             status: 429,
             headers: { "retry-after": "1800" },
@@ -3036,43 +3036,54 @@ describe("Day-restricted keys", () => {
   });
 });
 
-describe("Affinity cooldown passthrough", () => {
-  test("short cooldown on pinned key → returns affinity_cooldown_passthrough (not a remap)", async () => {
+describe("Affinity cooldown server-side wait", () => {
+  test("short cooldown on pinned key → proxy waits server-side and retries on same key", async () => {
     const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
     km.addKey(FAKE_KEY_B, "key-b");
 
+    let firstKeyLabel: string | null = null;
     let fakeKeyBCalled = false;
+    let calls = 0;
     const mock = upstream((req) => {
       const key = req.headers.get("x-api-key");
       if (key === FAKE_KEY_B) fakeKeyBCalled = true;
-      // First call from whoever is pinned: 429 with retry-after 60s (short).
-      return new Response("rate limited", {
-        status: 429,
-        headers: { "retry-after": "60" },
+      calls++;
+      if (calls === 1) {
+        firstKeyLabel = key;
+        // Short cooldown — 1 second so the test runs fast but still exercises the wait.
+        return new Response("rate limited", {
+          status: 429,
+          headers: { "retry-after": "1" },
+        });
+      }
+      // Any subsequent upstream call gets a success.
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
       });
     });
 
     const config = makeConfig(mock.url);
     const req = makeRequest("/v1/messages", {
       method: "POST",
-      headers: { "x-claude-code-session-id": "sess-passthrough" },
+      headers: { "x-claude-code-session-id": "sess-wait" },
       body: JSON.stringify({ model: "m", messages: [] }),
     });
 
-    // First call pins the session to whichever key is picked, gets 429 from
-    // upstream. Retry loop re-queries getKeyForConversation, which now sees
-    // the pinned key on a 60s cooldown and returns the passthrough decision
-    // instead of remapping to FAKE_KEY_B.
+    const started = Date.now();
     const result = await proxyRequest(req, km, config, st);
+    const elapsedMs = Date.now() - started;
 
-    expect(result.kind).toBe("affinity_cooldown_passthrough");
-    if (result.kind === "affinity_cooldown_passthrough") {
-      expect(result.retryAfterSecs).toBeGreaterThanOrEqual(55);
-      expect(result.retryAfterSecs).toBeLessThanOrEqual(60);
-    }
-    // FAKE_KEY_B must never be consulted during this request.
+    expect(result.kind).toBe("success");
+    expect(elapsedMs).toBeGreaterThanOrEqual(900); // waited ≥ ~1s
     expect(fakeKeyBCalled).toBe(false);
+    // The retry landed on the same key as the original 429, not the other one.
+    if (result.kind === "success") {
+      expect(result.usedKey.key).toBe(firstKeyLabel);
+    }
+    // Upstream saw two attempts — initial 429, then the post-wait retry.
+    expect(calls).toBe(2);
   });
 
   test("long cooldown (>5 min) on pinned key → remaps to other key as before", async () => {
@@ -3090,7 +3101,7 @@ describe("Affinity cooldown passthrough", () => {
           headers: { "content-type": "application/json" },
         });
       }
-      // Pinned key returns 429 with a 30-minute cooldown — past the threshold.
+      // Pinned key returns 429 with a 30-minute cooldown — past the 5-min threshold.
       return new Response("rate limited", {
         status: 429,
         headers: { "retry-after": "1800" },
