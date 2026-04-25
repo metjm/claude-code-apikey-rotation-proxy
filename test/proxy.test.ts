@@ -2917,16 +2917,21 @@ describe("Day-restricted keys", () => {
 
     const config = makeConfig(mock.url);
 
+    const turnsBySession = new Map<string, Array<{ role: string; content: string }>>();
     async function send(session: string, content: string): Promise<void> {
+      const turns = turnsBySession.get(session) ?? [];
+      turns.push({ role: "user", content });
+      turnsBySession.set(session, turns);
       const res = await proxyRequest(makeRequest("/v1/messages", {
         method: "POST",
         headers: {
           "content-type": "application/json",
           "x-claude-code-session-id": session,
         },
-        body: JSON.stringify({ messages: [{ role: "user", content }] }),
+        body: JSON.stringify({ messages: turns }),
       }), km, config, st);
       expect(res.kind).toBe("success");
+      turns.push({ role: "assistant", content: "ok" });
     }
 
     // First three new sessions land on key-a (bucket fills 3 before rolling),
@@ -2947,6 +2952,63 @@ describe("Day-restricted keys", () => {
       { session: "session-a", key: FAKE_KEY_A },
       { session: "session-d", key: FAKE_KEY_B },
     ]);
+  });
+
+  test("sub-agents under one session-id route to different keys when they have different messages[0]", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    km.addKey(FAKE_KEY_B, "key-b");
+
+    const seen: Array<{ key: string | null; firstContent: string }> = [];
+    const mock = upstream(async (req) => {
+      const body = await req.json() as { messages: Array<{ content: string }> };
+      seen.push({
+        key: req.headers.get("x-api-key"),
+        firstContent: body.messages[0].content,
+      });
+      return new Response(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+
+    const config = makeConfig(mock.url);
+    const session = "shared-session";
+    async function send(firstContent: string): Promise<void> {
+      const res = await proxyRequest(makeRequest("/v1/messages", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-claude-code-session-id": session,
+        },
+        body: JSON.stringify({ messages: [{ role: "user", content: firstContent }] }),
+      }), km, config, st);
+      expect(res.kind).toBe("success");
+    }
+
+    // Parent and sub-agents share session-id but have different first messages.
+    // The bucket-of-3 rotation fills key-a with the first three new conversations,
+    // then rolls to key-b for the fourth — proving the conversations are routed
+    // independently rather than all pinning to the parent's key.
+    await send("parent first prompt");
+    await send("sub-agent A first prompt");
+    await send("sub-agent B first prompt");
+    await send("sub-agent C first prompt");
+    // Each conversation is sticky on its own key for follow-ups.
+    await send("parent first prompt");
+    await send("sub-agent C first prompt");
+
+    const keyByContent = new Map<string, Set<string>>();
+    for (const s of seen) {
+      const ks = keyByContent.get(s.firstContent) ?? new Set();
+      ks.add(s.key ?? "");
+      keyByContent.set(s.firstContent, ks);
+    }
+    // Each logical conversation pinned to exactly one key.
+    for (const [, ks] of keyByContent) expect(ks.size).toBe(1);
+    // The conversations did not all collapse onto a single key.
+    const allKeys = new Set(seen.map((s) => s.key));
+    expect(allKeys.size).toBeGreaterThan(1);
   });
 
   test("a session remaps after 429 and stays on the new key", async () => {
@@ -2984,23 +3046,31 @@ describe("Day-restricted keys", () => {
 
     const config = makeConfig(mock.url);
 
+    const turn1: Array<{ role: string; content: string }> = [
+      { role: "user", content: "first" },
+    ];
     const first = await proxyRequest(makeRequest("/v1/messages", {
       method: "POST",
       headers: {
         "content-type": "application/json",
         "x-claude-code-session-id": "session-a",
       },
-      body: JSON.stringify({ messages: [{ role: "user", content: "first" }] }),
+      body: JSON.stringify({ messages: turn1 }),
     }), km, config, st);
     expect(first.kind).toBe("success");
 
+    const turn2 = [
+      ...turn1,
+      { role: "assistant", content: "ok" },
+      { role: "user", content: "follow-up" },
+    ];
     const second = await proxyRequest(makeRequest("/v1/messages", {
       method: "POST",
       headers: {
         "content-type": "application/json",
         "x-claude-code-session-id": "session-a",
       },
-      body: JSON.stringify({ messages: [{ role: "user", content: "second" }] }),
+      body: JSON.stringify({ messages: turn2 }),
     }), km, config, st);
     expect(second.kind).toBe("success");
 

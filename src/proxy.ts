@@ -9,7 +9,7 @@ import {
 } from "./types.ts";
 import { log } from "./logger.ts";
 import { emitWithKeys } from "./events.ts";
-import { extractMessagesFingerprint } from "./message-fingerprint.ts";
+import { computeFirstMessageHash } from "./message-fingerprint.ts";
 import type { SchemaTracker } from "./schema-tracker.ts";
 
 const RATE_LIMIT_STATUS = 429 as const;
@@ -241,7 +241,6 @@ export async function proxyRequest(
   const url = new URL(req.url);
   const traceId = req.headers.get("x-request-id") ?? crypto.randomUUID();
   const sessionId = normalizeConversationSessionId(req.headers.get("x-claude-code-session-id"));
-  const conversationKey = buildConversationKey(proxyUser, sessionId);
   const requestContentLength = req.headers.get("content-length");
   let requestBody: BufferedRequestBody;
   try {
@@ -266,7 +265,8 @@ export async function proxyRequest(
     };
   }
   const requestBodyState = snapshotRequestBodyState(req, requestBody);
-  const messagesFingerprint = extractMessagesFingerprint(requestBody, url.pathname);
+  const firstMessageHash = computeFirstMessageHash(requestBody, url.pathname);
+  const conversationKey = buildConversationKey(proxyUser, sessionId, firstMessageHash);
 
   let attempts = 0;
   let firstChunkRetries = 0;
@@ -355,10 +355,6 @@ export async function proxyRequest(
       upstreamUrl,
       requestContentLength,
       requestBodyState,
-      firstMessageHash: messagesFingerprint?.firstMessageHash ?? null,
-      secondMessageHash: messagesFingerprint?.secondMessageHash ?? null,
-      messageCount: messagesFingerprint?.messageCount ?? null,
-      firstMessagePreview: messagesFingerprint?.firstMessagePreview ?? null,
       headers: allHeaders,
     });
     registerActiveRequest(
@@ -685,10 +681,12 @@ function normalizeConversationSessionId(raw: string | null): string | null {
 function buildConversationKey(
   proxyUser: ProxyTokenEntry | null | undefined,
   sessionId: string | null,
+  firstMessageHash: string | null,
 ): string | null {
   if (sessionId === null) return null;
   const actor = proxyUser?.label ?? "anon";
-  return `${actor}:${sessionId}`;
+  const base = `${actor}:${sessionId}`;
+  return firstMessageHash === null ? base : `${base}:${firstMessageHash}`;
 }
 
 function firstChunkFailureResult(
