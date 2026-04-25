@@ -133,10 +133,7 @@
   .sessions-list {
     display: flex;
     flex-direction: column;
-    gap: 1px;
-    max-height: 240px;
-    overflow-y: auto;
-    overflow-x: hidden;
+    gap: 0;
     font-size: 10px;
   }
   .sessions-summary {
@@ -162,39 +159,70 @@
     font-style: italic;
   }
   .session-group {
-    display: flex;
-    flex-direction: column;
+    display: grid;
+    grid-template-columns: 14px minmax(0, 1fr) auto;
+    column-gap: 7px;
+    row-gap: 1px;
+    align-items: center;
     padding: 3px 4px 4px;
     border-radius: 3px;
     transition: background 120ms ease;
   }
   .session-group + .session-group { margin-top: 1px; }
   .session-group:hover { background: rgba(88,166,255,0.05); }
-  .session-row,
-  .conversation-row {
-    display: grid;
-    grid-template-columns: 8px 1fr auto;
-    gap: 7px;
+  .cell-dot {
+    display: flex;
+    justify-content: center;
     align-items: center;
+  }
+  .cell-dot .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--dot, var(--text-dim));
+    display: block;
+  }
+  .cell-dot--conv .dot {
+    width: 6px;
+    height: 6px;
+    opacity: 0.85;
+  }
+  .cell-id,
+  .cell-hash {
+    font-variant-numeric: tabular-nums;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
     min-width: 0;
   }
-  .conversation-row {
-    padding-left: 14px;
-    grid-template-columns: 6px 1fr auto;
-    margin-top: 1px;
+  .cell-id { color: var(--text-bright); }
+  .cell-hash { color: var(--text); }
+  .id-tail { color: var(--text-dim); }
+  .cell-right {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--text-dim);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    justify-self: end;
   }
-  .session-meta-row {
+  .cell-meta-row {
+    grid-column: 2 / -1;
     display: flex;
     align-items: center;
     gap: 5px;
     flex-wrap: wrap;
-    padding-left: 15px;
-    margin-top: 1px;
     color: var(--text-dim);
     font-size: 9.5px;
     letter-spacing: 0.1px;
   }
-  .session-actor {
+  .cell-meta-row b {
+    color: var(--text);
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }
+  .cell-actor {
     color: var(--text);
     font-weight: 500;
     max-width: 150px;
@@ -202,51 +230,9 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .meta-sep {
+  .cell-sep {
     color: var(--border);
     user-select: none;
-  }
-  .meta-tag {
-    display: inline-flex;
-    align-items: center;
-    gap: 3px;
-  }
-  .meta-tag b {
-    color: var(--text);
-    font-weight: 600;
-    font-variant-numeric: tabular-nums;
-  }
-  .session-dot {
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    background: var(--dot, var(--text-dim));
-    flex-shrink: 0;
-    justify-self: center;
-  }
-  .conversation-row .session-dot {
-    width: 6px;
-    height: 6px;
-    opacity: 0.8;
-  }
-  .session-id-text,
-  .conversation-hash {
-    font-variant-numeric: tabular-nums;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    min-width: 0;
-  }
-  .session-id-text { color: var(--text-bright); }
-  .conversation-hash { color: var(--text); }
-  .id-tail { color: var(--text-dim); }
-  .session-meta {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    color: var(--text-dim);
-    font-variant-numeric: tabular-nums;
-    white-space: nowrap;
   }
   .session-count {
     display: inline-flex;
@@ -1778,43 +1764,39 @@ function renderKeysInner() {
       const groupsHtml = recentSessions.map(session => {
         const convs = Array.isArray(session.conversations) ? session.conversations : [];
         const ageTitle = session.firstSeenAt ? `Session first seen ${session.firstSeenAt}` : '';
-        const sessionRow = `
-          <div class="session-row" style="--dot:${colorForId(session.sessionId)}" title="${esc(session.sessionId)}">
-            <span class="session-dot"></span>
-            <span class="session-id-text">${idHtml(session.sessionId, 8, 4)}</span>
-            <span class="session-meta">
-              ${convs.length > 1 ? `<span class="session-count">×${convs.length}</span>` : ''}
-              <span>${esc(fmtRelative(session.lastSeenAt))}</span>
-            </span>
-          </div>
-          <div class="session-meta-row">
-            <span class="session-actor" title="Proxy token">${esc(session.actor || 'anon')}</span>
-            <span class="meta-sep">·</span>
-            <span class="meta-tag" title="${esc(ageTitle)}"><b>${esc(fmtAge(session.firstSeenAt))}</b> old</span>
-            <span class="meta-sep">·</span>
-            <span class="meta-tag" title="Routing decisions on this key in last 15m"><b>${esc(fmtNum(session.totalRequests || 0))}</b> req</span>
-          </div>`;
-        const conversationRows = convs.length > 1
+        const sessionCells = `
+          <span class="cell-dot" style="--dot:${colorForId(session.sessionId)}"><span class="dot"></span></span>
+          <span class="cell-id" title="${esc(session.sessionId)}">${idHtml(session.sessionId, 8, 4)}</span>
+          <span class="cell-right">
+            ${convs.length > 1 ? `<span class="session-count">×${convs.length}</span>` : ''}
+            <span>${esc(fmtRelative(session.lastSeenAt))}</span>
+          </span>
+          <span class="cell-meta-row">
+            <span class="cell-actor" title="Proxy token">${esc(session.actor || 'anon')}</span>
+            <span class="cell-sep">·</span>
+            <span title="${esc(ageTitle)}"><b>${esc(fmtAge(session.firstSeenAt))}</b> old</span>
+            <span class="cell-sep">·</span>
+            <span title="Routing decisions on this key in last 15m"><b>${esc(fmtNum(session.totalRequests || 0))}</b> req</span>
+          </span>`;
+        const convCells = convs.length > 1
           ? convs.map(c => {
               const dotColor = c.hash ? colorForId(c.hash) : 'var(--text-dim)';
               const label = c.hash || '(no hash)';
               const display = c.hash ? idHtml(c.hash, 8, 8) : esc(label);
               const convAgeTitle = c.firstSeenAt ? `Conversation first seen ${c.firstSeenAt}` : '';
               return `
-                <div class="conversation-row" style="--dot:${dotColor}" title="${esc(label)}">
-                  <span class="session-dot"></span>
-                  <span class="conversation-hash">${display}</span>
-                  <span class="session-meta">
-                    <span title="${esc(convAgeTitle)}">${esc(fmtAge(c.firstSeenAt))}</span>
-                    <span class="meta-sep">·</span>
-                    <span title="Requests on this key in last 15m">${esc(fmtNum(c.requestCount || 0))}r</span>
-                    <span class="meta-sep">·</span>
-                    <span>${esc(fmtRelative(c.lastSeenAt))}</span>
-                  </span>
-                </div>`;
+                <span class="cell-dot cell-dot--conv" style="--dot:${dotColor}"><span class="dot"></span></span>
+                <span class="cell-hash" title="${esc(label)}">${display}</span>
+                <span class="cell-right">
+                  <span title="${esc(convAgeTitle)}">${esc(fmtAge(c.firstSeenAt))}</span>
+                  <span class="cell-sep">·</span>
+                  <span title="Requests on this key in last 15m">${esc(fmtNum(c.requestCount || 0))}r</span>
+                  <span class="cell-sep">·</span>
+                  <span>${esc(fmtRelative(c.lastSeenAt))}</span>
+                </span>`;
             }).join('')
           : '';
-        return `<div class="session-group">${sessionRow}${conversationRows}</div>`;
+        return `<div class="session-group">${sessionCells}${convCells}</div>`;
       }).join('');
       sessionsHtml = `
         <div class="sessions-list">
