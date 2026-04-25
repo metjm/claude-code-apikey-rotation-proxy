@@ -32,6 +32,7 @@ import {
   unixMs,
 } from "./types.ts";
 import { log } from "./logger.ts";
+import { extractFirstMessageHashFromConversationKey } from "./message-fingerprint.ts";
 
 // ── SQLite row shapes ─────────────────────────────────────────────
 
@@ -1806,22 +1807,44 @@ export class KeyManager {
 
   private listRecentConversationSessionsByKey(
     cutoff: UnixMs,
-  ): Map<ApiKey, Array<{ sessionId: string; lastSeenAt: string }>> {
-    const sessionsByKey = new Map<ApiKey, Array<{ sessionId: string; lastSeenAt: string }>>();
+  ): Map<ApiKey, Array<{
+    sessionId: string;
+    lastSeenAt: string;
+    conversations: Array<{ hash: string | null; lastSeenAt: string }>;
+  }>> {
+    type SessionGroup = Map<string, ConversationAffinityEntry[]>;
+    const grouped = new Map<ApiKey, SessionGroup>();
     for (const affinity of this.conversationAffinities.values()) {
       if (affinity.lastSeenAt < cutoff) continue;
-      const existing = sessionsByKey.get(affinity.key) ?? [];
-      existing.push({
-        sessionId: affinity.sessionId ?? affinity.conversationKey,
-        lastSeenAt: new Date(affinity.lastSeenAt).toISOString(),
-      });
-      sessionsByKey.set(affinity.key, existing);
+      const sessionId = affinity.sessionId ?? affinity.conversationKey;
+      const sessions = grouped.get(affinity.key) ?? new Map();
+      const list = sessions.get(sessionId) ?? [];
+      list.push(affinity);
+      sessions.set(sessionId, list);
+      grouped.set(affinity.key, sessions);
     }
 
-    for (const sessions of sessionsByKey.values()) {
+    const sessionsByKey = new Map<ApiKey, Array<{
+      sessionId: string;
+      lastSeenAt: string;
+      conversations: Array<{ hash: string | null; lastSeenAt: string }>;
+    }>>();
+    for (const [key, sessionMap] of grouped) {
+      const sessions = [...sessionMap.entries()].map(([sessionId, affinities]) => {
+        const sortedAffinities = [...affinities].sort((a, b) => b.lastSeenAt - a.lastSeenAt);
+        return {
+          sessionId,
+          lastSeenAt: new Date(sortedAffinities[0]!.lastSeenAt).toISOString(),
+          conversations: sortedAffinities.map((a) => ({
+            hash: extractFirstMessageHashFromConversationKey(a.conversationKey),
+            lastSeenAt: new Date(a.lastSeenAt).toISOString(),
+          })),
+        };
+      });
       sessions.sort((a, b) =>
         b.lastSeenAt.localeCompare(a.lastSeenAt) || a.sessionId.localeCompare(b.sessionId)
       );
+      sessionsByKey.set(key, sessions);
     }
     return sessionsByKey;
   }

@@ -147,6 +147,18 @@
     white-space: nowrap;
     display: inline-block;
   }
+  .conversation-count {
+    display: inline-block;
+    margin-left: 4px;
+    padding: 0 4px;
+    font-size: 9px;
+    line-height: 14px;
+    border-radius: 7px;
+    background: rgba(88,166,255,0.18);
+    color: var(--blue);
+    border: 1px solid rgba(88,166,255,0.35);
+    cursor: help;
+  }
   .table-controls { display: flex; flex-direction: column; gap: 4px; align-items: flex-start; }
   .key-priority-select {
     min-width: 96px; background: var(--bg3); color: var(--text); border: 1px solid var(--border);
@@ -1624,12 +1636,24 @@ function renderKeysInner() {
     const sessionsHtml = recentSessions.length === 0
       ? '<div class="table-sub">No sessions seen in last 15m</div>'
       : `<table class="session-table"><thead><tr><th>Session</th><th>Seen</th></tr></thead><tbody>${
-          recentSessions.map(session => `
-            <tr>
-              <td><span class="session-id" title="${esc(session.sessionId)}">${esc(session.sessionId)}</span></td>
-              <td>${esc(fmtRelative(session.lastSeenAt))}</td>
-            </tr>
-          `).join('')
+          recentSessions.map(session => {
+            const convs = Array.isArray(session.conversations) ? session.conversations : [];
+            let countChip = '';
+            if (convs.length > 1) {
+              const lines = convs.map(c => {
+                const label = c.hash ? c.hash.slice(0, 8) + '…' : '(no hash)';
+                return `  ${label}  ${fmtRelative(c.lastSeenAt)}`;
+              }).join('\n');
+              const tip = `${convs.length} conversations on this key under this session-id:\n${lines}`;
+              countChip = ` <span class="conversation-count" title="${esc(tip)}">×${convs.length}</span>`;
+            }
+            return `
+              <tr>
+                <td><span class="session-id" title="${esc(session.sessionId)}">${esc(session.sessionId)}</span>${countChip}</td>
+                <td>${esc(fmtRelative(session.lastSeenAt))}</td>
+              </tr>
+            `;
+          }).join('')
         }</tbody></table>`;
 
     html += `<tr class="${esc(tone)}">

@@ -1,5 +1,8 @@
 import { describe, test, expect } from "bun:test";
-import { computeFirstMessageHash } from "../src/message-fingerprint.ts";
+import {
+  computeFirstMessageHash,
+  extractFirstMessageHashFromConversationKey,
+} from "../src/message-fingerprint.ts";
 
 function bodyOf(obj: unknown): Uint8Array {
   return new TextEncoder().encode(JSON.stringify(obj));
@@ -83,5 +86,32 @@ describe("computeFirstMessageHash", () => {
       "/v1/messages",
     );
     expect(asString).not.toBe(asBlocks);
+  });
+});
+
+describe("extractFirstMessageHashFromConversationKey", () => {
+  test("returns the trailing 16-hex hash when present", () => {
+    expect(extractFirstMessageHashFromConversationKey("till:abc-123:0123456789abcdef"))
+      .toBe("0123456789abcdef");
+  });
+
+  test("returns null for legacy 2-part keys without a hash", () => {
+    expect(extractFirstMessageHashFromConversationKey("till:abc-123")).toBeNull();
+  });
+
+  test("ignores trailing segments that are not 16-hex", () => {
+    expect(extractFirstMessageHashFromConversationKey("till:abc-123:nothex"))
+      .toBeNull();
+    expect(extractFirstMessageHashFromConversationKey("till:abc-123:0123456789ABCDEF"))
+      .toBeNull();
+  });
+
+  test("round-trips with computeFirstMessageHash", () => {
+    const body = new TextEncoder().encode(JSON.stringify({
+      messages: [{ role: "user", content: "round trip" }],
+    }));
+    const hash = computeFirstMessageHash(body, "/v1/messages")!;
+    const conversationKey = `actor:session:${hash}`;
+    expect(extractFirstMessageHashFromConversationKey(conversationKey)).toBe(hash);
   });
 });

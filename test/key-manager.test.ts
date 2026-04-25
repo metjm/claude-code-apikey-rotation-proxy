@@ -336,6 +336,35 @@ describe("Key CRUD", () => {
     expect(entry.recentSessions15m).toEqual([]);
   });
 
+  test("listKeys() groups multiple conversations under one session-id and exposes their hashes", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "a");
+
+    // Three sub-agents share a session-id but have distinct first-message hashes.
+    km.getKeyForConversation("user-1:session-x:1111111111111111", "session-x");
+    km.getKeyForConversation("user-1:session-x:2222222222222222", "session-x");
+    km.getKeyForConversation("user-1:session-x:3333333333333333", "session-x");
+    // Plus a second session with no augmenting hash (legacy / non-/v1/messages).
+    km.getKeyForConversation("user-1:session-y", "session-y");
+
+    const entry = km.listKeys().find((k) => k.label === "a")!;
+    const sessions = entry.recentSessions15m;
+    const xs = sessions.find((s) => s.sessionId === "session-x");
+    const ys = sessions.find((s) => s.sessionId === "session-y");
+
+    expect(xs).toBeDefined();
+    expect(xs!.conversations.length).toBe(3);
+    expect(xs!.conversations.map((c) => c.hash).sort()).toEqual([
+      "1111111111111111",
+      "2222222222222222",
+      "3333333333333333",
+    ]);
+
+    expect(ys).toBeDefined();
+    expect(ys!.conversations.length).toBe(1);
+    expect(ys!.conversations[0]!.hash).toBeNull();
+  });
+
   test("listKeys() tracks recent sessions active in the last 15 minutes", () => {
     const km = create();
     const originalNow = Date.now;

@@ -119,6 +119,10 @@ export interface MaskedKeyEntry {
   readonly recentSessions15m: readonly {
     readonly sessionId: string;
     readonly lastSeenAt: string;
+    readonly conversations: readonly {
+      readonly hash: string | null;
+      readonly lastSeenAt: string;
+    }[];
   }[];
 }
 
