@@ -31,3 +31,8 @@ export function extractFirstMessageHashFromConversationKey(
 ): string | null {
   return conversationKey.match(HASH_SUFFIX_PATTERN)?.[1] ?? null;
 }
+
+export function extractActorFromConversationKey(conversationKey: string): string {
+  const idx = conversationKey.indexOf(":");
+  return idx === -1 ? conversationKey : conversationKey.slice(0, idx);
+}

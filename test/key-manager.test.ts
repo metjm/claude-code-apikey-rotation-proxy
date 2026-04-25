@@ -359,10 +359,18 @@ describe("Key CRUD", () => {
       "2222222222222222",
       "3333333333333333",
     ]);
+    expect(xs!.actor).toBe("user-1");
+    expect(xs!.firstSeenAt).toBeTruthy();
+    expect(xs!.totalRequests).toBeGreaterThan(0);
+    for (const conv of xs!.conversations) {
+      expect(conv.firstSeenAt).toBeTruthy();
+      expect(conv.requestCount).toBeGreaterThan(0);
+    }
 
     expect(ys).toBeDefined();
     expect(ys!.conversations.length).toBe(1);
     expect(ys!.conversations[0]!.hash).toBeNull();
+    expect(ys!.actor).toBe("user-1");
   });
 
   test("listKeys() tracks recent sessions active in the last 15 minutes", () => {

@@ -1,6 +1,7 @@
 import { describe, test, expect } from "bun:test";
 import {
   computeFirstMessageHash,
+  extractActorFromConversationKey,
   extractFirstMessageHashFromConversationKey,
 } from "../src/message-fingerprint.ts";
 
@@ -104,6 +105,13 @@ describe("extractFirstMessageHashFromConversationKey", () => {
       .toBeNull();
     expect(extractFirstMessageHashFromConversationKey("till:abc-123:0123456789ABCDEF"))
       .toBeNull();
+  });
+
+  test("round-trips with extractActorFromConversationKey", () => {
+    expect(extractActorFromConversationKey("till@trainly.ai:abc-123:0123456789abcdef"))
+      .toBe("till@trainly.ai");
+    expect(extractActorFromConversationKey("till:abc-123")).toBe("till");
+    expect(extractActorFromConversationKey("standalone")).toBe("standalone");
   });
 
   test("round-trips with computeFirstMessageHash", () => {

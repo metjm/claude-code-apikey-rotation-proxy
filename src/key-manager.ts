@@ -32,7 +32,10 @@ import {
   unixMs,
 } from "./types.ts";
 import { log } from "./logger.ts";
-import { extractFirstMessageHashFromConversationKey } from "./message-fingerprint.ts";
+import {
+  extractActorFromConversationKey,
+  extractFirstMessageHashFromConversationKey,
+} from "./message-fingerprint.ts";
 
 // ── SQLite row shapes ─────────────────────────────────────────────
 
@@ -1809,9 +1812,21 @@ export class KeyManager {
     cutoff: UnixMs,
   ): Map<ApiKey, Array<{
     sessionId: string;
+    actor: string;
+    firstSeenAt: string;
     lastSeenAt: string;
-    conversations: Array<{ hash: string | null; lastSeenAt: string }>;
+    totalRequests: number;
+    conversations: Array<{
+      hash: string | null;
+      firstSeenAt: string;
+      lastSeenAt: string;
+      requestCount: number;
+    }>;
   }>> {
+    const requestCounts = this.countRecentRequestsByKeyAndConversation(cutoff);
+    const labelByKey = new Map<ApiKey, string>();
+    for (const e of this.keys) labelByKey.set(e.key, e.label);
+
     type SessionGroup = Map<string, ConversationAffinityEntry[]>;
     const grouped = new Map<ApiKey, SessionGroup>();
     for (const affinity of this.conversationAffinities.values()) {
@@ -1826,28 +1841,67 @@ export class KeyManager {
 
     const sessionsByKey = new Map<ApiKey, Array<{
       sessionId: string;
+      actor: string;
+      firstSeenAt: string;
       lastSeenAt: string;
-      conversations: Array<{ hash: string | null; lastSeenAt: string }>;
+      totalRequests: number;
+      conversations: Array<{
+        hash: string | null;
+        firstSeenAt: string;
+        lastSeenAt: string;
+        requestCount: number;
+      }>;
     }>>();
     for (const [key, sessionMap] of grouped) {
+      const label = labelByKey.get(key) ?? "";
+      const countsForKey = requestCounts.get(label) ?? new Map<string, number>();
       const sessions = [...sessionMap.entries()].map(([sessionId, affinities]) => {
         const sortedAffinities = [...affinities].sort((a, b) =>
           a.conversationKey.localeCompare(b.conversationKey)
         );
-        const mostRecentMs = affinities.reduce((m, a) => Math.max(m, a.lastSeenAt), 0);
+        const conversations = sortedAffinities.map((a) => ({
+          hash: extractFirstMessageHashFromConversationKey(a.conversationKey),
+          firstSeenAt: new Date(a.assignedAt).toISOString(),
+          lastSeenAt: new Date(a.lastSeenAt).toISOString(),
+          requestCount: countsForKey.get(a.conversationKey) ?? 0,
+        }));
+        const firstSeenMs = affinities.reduce((m, a) => Math.min(m, a.assignedAt), Infinity);
+        const lastSeenMs = affinities.reduce((m, a) => Math.max(m, a.lastSeenAt), 0);
+        const totalRequests = conversations.reduce((s, c) => s + c.requestCount, 0);
         return {
           sessionId,
-          lastSeenAt: new Date(mostRecentMs).toISOString(),
-          conversations: sortedAffinities.map((a) => ({
-            hash: extractFirstMessageHashFromConversationKey(a.conversationKey),
-            lastSeenAt: new Date(a.lastSeenAt).toISOString(),
-          })),
+          actor: extractActorFromConversationKey(sortedAffinities[0]!.conversationKey),
+          firstSeenAt: new Date(firstSeenMs).toISOString(),
+          lastSeenAt: new Date(lastSeenMs).toISOString(),
+          totalRequests,
+          conversations,
         };
       });
       sessions.sort((a, b) => a.sessionId.localeCompare(b.sessionId));
       sessionsByKey.set(key, sessions);
     }
     return sessionsByKey;
+  }
+
+  private countRecentRequestsByKeyAndConversation(
+    cutoff: UnixMs,
+  ): Map<string, Map<string, number>> {
+    const rows = this.db.query<
+      { chosen_key_label: string; conversation_key: string; cnt: number },
+      [number]
+    >(`
+      SELECT chosen_key_label, conversation_key, COUNT(*) AS cnt
+      FROM routing_decisions
+      WHERE decided_at >= ? AND chosen_key_label IS NOT NULL AND conversation_key IS NOT NULL
+      GROUP BY chosen_key_label, conversation_key
+    `).all(cutoff);
+    const result = new Map<string, Map<string, number>>();
+    for (const r of rows) {
+      const inner = result.get(r.chosen_key_label) ?? new Map<string, number>();
+      inner.set(r.conversation_key, r.cnt);
+      result.set(r.chosen_key_label, inner);
+    }
+    return result;
   }
 
   // Worst-window headroom for a key. Returns 1 - max(utilization) across
