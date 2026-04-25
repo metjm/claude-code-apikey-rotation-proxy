@@ -114,63 +114,100 @@
   .table-sub { color: var(--text-dim); font-size: 10px; line-height: 1.35; }
   .table-metrics { display: flex; flex-direction: column; gap: 1px; }
   .table-metrics strong { color: var(--text-bright); font-weight: 600; }
-  .session-table {
-    width: 100%;
-    border-collapse: collapse;
+  .sessions-list {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    max-height: 240px;
+    overflow-y: auto;
+    overflow-x: hidden;
     font-size: 10px;
   }
-  .session-table th,
-  .session-table td {
-    padding: 2px 0;
-    border: none;
-    vertical-align: top;
-  }
-  .session-table th {
+  .sessions-summary {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
     color: var(--text-dim);
     font-size: 9px;
-    font-weight: 600;
     text-transform: uppercase;
-    letter-spacing: 0.35px;
-    position: static;
-    background: transparent;
+    letter-spacing: 0.4px;
+    padding: 0 4px 4px;
+    margin-bottom: 2px;
+    border-bottom: 1px solid rgba(48,54,61,0.6);
   }
-  .session-table td:last-child,
-  .session-table th:last-child {
-    text-align: right;
-    white-space: nowrap;
+  .sessions-summary-right {
+    font-variant-numeric: tabular-nums;
+    text-transform: none;
+    letter-spacing: 0;
   }
-  .session-id {
-    color: var(--text-bright);
-    max-width: 180px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    display: inline-block;
-    vertical-align: middle;
+  .sessions-empty {
+    color: var(--text-dim);
+    font-size: 10px;
+    font-style: italic;
+  }
+  .session-group { display: flex; flex-direction: column; }
+  .session-row,
+  .conversation-row {
+    display: grid;
+    grid-template-columns: 8px 1fr auto;
+    gap: 7px;
+    align-items: center;
+    padding: 2px 4px;
+    border-radius: 3px;
+    min-width: 0;
+    transition: background 120ms ease;
+  }
+  .session-row:hover,
+  .conversation-row:hover {
+    background: rgba(88,166,255,0.06);
+  }
+  .conversation-row {
+    padding-left: 18px;
+    grid-template-columns: 6px 1fr auto;
   }
   .session-dot {
-    display: inline-block;
     width: 8px;
     height: 8px;
     border-radius: 50%;
-    margin-right: 6px;
-    vertical-align: middle;
+    background: var(--dot, var(--text-dim));
     flex-shrink: 0;
-  }
-  .conversation-row td {
-    color: var(--text-dim);
-  }
-  .conversation-row td:first-child {
-    padding-left: 14px;
+    justify-self: center;
   }
   .conversation-row .session-dot {
     width: 6px;
     height: 6px;
+    opacity: 0.8;
   }
+  .session-id-text,
   .conversation-hash {
-    font-family: var(--font);
+    font-variant-numeric: tabular-nums;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+  }
+  .session-id-text { color: var(--text-bright); }
+  .conversation-hash { color: var(--text); }
+  .id-tail { color: var(--text-dim); }
+  .session-meta {
+    display: flex;
+    align-items: center;
+    gap: 6px;
     color: var(--text-dim);
-    vertical-align: middle;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  .session-count {
+    display: inline-flex;
+    align-items: center;
+    height: 13px;
+    padding: 0 5px;
+    font-size: 9px;
+    font-weight: 600;
+    letter-spacing: 0.3px;
+    border-radius: 7px;
+    background: rgba(88,166,255,0.13);
+    color: var(--blue);
   }
   .table-controls { display: flex; flex-direction: column; gap: 4px; align-items: flex-start; }
   .key-priority-select {
@@ -865,6 +902,14 @@ function colorForId(id) {
   let h = 0;
   for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) | 0;
   return 'hsl(' + (((h % 360) + 360) % 360) + ', 70%, 62%)';
+}
+function idHtml(id, headLen, tailLen) {
+  if (!id) return '';
+  if (id.length <= headLen) return esc(id);
+  if (id.length <= headLen + tailLen) {
+    return esc(id.slice(0, headLen)) + '<span class="id-tail">' + esc(id.slice(headLen)) + '</span>';
+  }
+  return esc(id.slice(0, headLen)) + '<span class="id-tail">' + esc(id.slice(-tailLen)) + '</span>';
 }
 function humanizeWindowName(name) {
   if (!name) return '--';
@@ -1652,35 +1697,51 @@ function renderKeysInner() {
       usageLines.push(`<div title="Cache read / cache write">${fmtNum(k.stats.totalCacheRead || 0)} cache / ${fmtNum(k.stats.totalCacheCreation || 0)} write</div>`);
     }
     const recentSessions = Array.isArray(k.recentSessions15m) ? k.recentSessions15m : [];
-    const sessionsHtml = recentSessions.length === 0
-      ? '<div class="table-sub">No sessions seen in last 15m</div>'
-      : `<table class="session-table"><thead><tr><th>Session</th><th>Seen</th></tr></thead><tbody>${
-          recentSessions.map(session => {
-            const convs = Array.isArray(session.conversations) ? session.conversations : [];
-            const sessionRow = `
-              <tr>
-                <td>
-                  <span class="session-dot" style="background:${colorForId(session.sessionId)}"></span>
-                  <span class="session-id" title="${esc(session.sessionId)}">${esc(session.sessionId)}</span>
-                </td>
-                <td>${esc(fmtRelative(session.lastSeenAt))}</td>
-              </tr>`;
-            const conversationRows = convs.length > 1
-              ? convs.map(c => {
-                  const label = c.hash ? c.hash : '(no hash)';
-                  return `
-                    <tr class="conversation-row">
-                      <td>
-                        <span class="session-dot" style="background:${colorForId(c.hash || session.sessionId + ':null')}"></span>
-                        <span class="conversation-hash" title="${esc(label)}">${esc(label)}</span>
-                      </td>
-                      <td>${esc(fmtRelative(c.lastSeenAt))}</td>
-                    </tr>`;
-                }).join('')
-              : '';
-            return sessionRow + conversationRows;
-          }).join('')
-        }</tbody></table>`;
+    let sessionsHtml;
+    if (recentSessions.length === 0) {
+      sessionsHtml = '<div class="sessions-empty">No sessions in last 15m</div>';
+    } else {
+      const totalConvs = recentSessions.reduce((sum, s) =>
+        sum + (Array.isArray(s.conversations) ? s.conversations.length : 1), 0);
+      const mostRecent = recentSessions.reduce((best, s) =>
+        (best === null || s.lastSeenAt > best) ? s.lastSeenAt : best, null);
+      const summaryLeft = recentSessions.length + ' session' + (recentSessions.length === 1 ? '' : 's')
+        + (totalConvs !== recentSessions.length ? ' · ' + totalConvs + ' convs' : '');
+      const groupsHtml = recentSessions.map(session => {
+        const convs = Array.isArray(session.conversations) ? session.conversations : [];
+        const sessionRow = `
+          <div class="session-row" style="--dot:${colorForId(session.sessionId)}" title="${esc(session.sessionId)}">
+            <span class="session-dot"></span>
+            <span class="session-id-text">${idHtml(session.sessionId, 8, 4)}</span>
+            <span class="session-meta">
+              <span>${esc(fmtRelative(session.lastSeenAt))}</span>
+              ${convs.length > 1 ? `<span class="session-count">×${convs.length}</span>` : ''}
+            </span>
+          </div>`;
+        const conversationRows = convs.length > 1
+          ? convs.map(c => {
+              const dotColor = c.hash ? colorForId(c.hash) : 'var(--text-dim)';
+              const label = c.hash || '(no hash)';
+              const display = c.hash ? idHtml(c.hash, 8, 8) : esc(label);
+              return `
+                <div class="conversation-row" style="--dot:${dotColor}" title="${esc(label)}">
+                  <span class="session-dot"></span>
+                  <span class="conversation-hash">${display}</span>
+                  <span class="session-meta">${esc(fmtRelative(c.lastSeenAt))}</span>
+                </div>`;
+            }).join('')
+          : '';
+        return `<div class="session-group">${sessionRow}${conversationRows}</div>`;
+      }).join('');
+      sessionsHtml = `
+        <div class="sessions-list">
+          <div class="sessions-summary">
+            <span>${esc(summaryLeft)}</span>
+            <span class="sessions-summary-right">${mostRecent ? esc(fmtRelative(mostRecent)) : ''}</span>
+          </div>
+          ${groupsHtml}
+        </div>`;
+    }
 
     html += `<tr class="${esc(tone)}">
       <td>
