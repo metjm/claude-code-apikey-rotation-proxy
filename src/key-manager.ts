@@ -1831,19 +1831,20 @@ export class KeyManager {
     }>>();
     for (const [key, sessionMap] of grouped) {
       const sessions = [...sessionMap.entries()].map(([sessionId, affinities]) => {
-        const sortedAffinities = [...affinities].sort((a, b) => b.lastSeenAt - a.lastSeenAt);
+        const sortedAffinities = [...affinities].sort((a, b) =>
+          a.conversationKey.localeCompare(b.conversationKey)
+        );
+        const mostRecentMs = affinities.reduce((m, a) => Math.max(m, a.lastSeenAt), 0);
         return {
           sessionId,
-          lastSeenAt: new Date(sortedAffinities[0]!.lastSeenAt).toISOString(),
+          lastSeenAt: new Date(mostRecentMs).toISOString(),
           conversations: sortedAffinities.map((a) => ({
             hash: extractFirstMessageHashFromConversationKey(a.conversationKey),
             lastSeenAt: new Date(a.lastSeenAt).toISOString(),
           })),
         };
       });
-      sessions.sort((a, b) =>
-        b.lastSeenAt.localeCompare(a.lastSeenAt) || a.sessionId.localeCompare(b.sessionId)
-      );
+      sessions.sort((a, b) => a.sessionId.localeCompare(b.sessionId));
       sessionsByKey.set(key, sessions);
     }
     return sessionsByKey;

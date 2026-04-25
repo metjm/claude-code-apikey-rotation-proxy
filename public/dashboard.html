@@ -146,18 +146,31 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     display: inline-block;
+    vertical-align: middle;
   }
-  .conversation-count {
+  .session-dot {
     display: inline-block;
-    margin-left: 4px;
-    padding: 0 4px;
-    font-size: 9px;
-    line-height: 14px;
-    border-radius: 7px;
-    background: rgba(88,166,255,0.18);
-    color: var(--blue);
-    border: 1px solid rgba(88,166,255,0.35);
-    cursor: help;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    margin-right: 6px;
+    vertical-align: middle;
+    flex-shrink: 0;
+  }
+  .conversation-row td {
+    color: var(--text-dim);
+  }
+  .conversation-row td:first-child {
+    padding-left: 14px;
+  }
+  .conversation-row .session-dot {
+    width: 6px;
+    height: 6px;
+  }
+  .conversation-hash {
+    font-family: var(--font);
+    color: var(--text-dim);
+    vertical-align: middle;
   }
   .table-controls { display: flex; flex-direction: column; gap: 4px; align-items: flex-start; }
   .key-priority-select {
@@ -847,6 +860,12 @@ function keyColor(label) {
   return keyColorMap[label];
 }
 function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML.replace(/'/g, '&#39;'); }
+function colorForId(id) {
+  if (!id) return 'var(--text-dim)';
+  let h = 0;
+  for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) | 0;
+  return 'hsl(' + (((h % 360) + 360) % 360) + ', 70%, 62%)';
+}
 function humanizeWindowName(name) {
   if (!name) return '--';
   if (name === 'unified') return 'Primary limit signal';
@@ -1638,21 +1657,28 @@ function renderKeysInner() {
       : `<table class="session-table"><thead><tr><th>Session</th><th>Seen</th></tr></thead><tbody>${
           recentSessions.map(session => {
             const convs = Array.isArray(session.conversations) ? session.conversations : [];
-            let countChip = '';
-            if (convs.length > 1) {
-              const lines = convs.map(c => {
-                const label = c.hash ? c.hash.slice(0, 8) + '…' : '(no hash)';
-                return `  ${label}  ${fmtRelative(c.lastSeenAt)}`;
-              }).join('\n');
-              const tip = `${convs.length} conversations on this key under this session-id:\n${lines}`;
-              countChip = ` <span class="conversation-count" title="${esc(tip)}">×${convs.length}</span>`;
-            }
-            return `
+            const sessionRow = `
               <tr>
-                <td><span class="session-id" title="${esc(session.sessionId)}">${esc(session.sessionId)}</span>${countChip}</td>
+                <td>
+                  <span class="session-dot" style="background:${colorForId(session.sessionId)}"></span>
+                  <span class="session-id" title="${esc(session.sessionId)}">${esc(session.sessionId)}</span>
+                </td>
                 <td>${esc(fmtRelative(session.lastSeenAt))}</td>
-              </tr>
-            `;
+              </tr>`;
+            const conversationRows = convs.length > 1
+              ? convs.map(c => {
+                  const label = c.hash ? c.hash : '(no hash)';
+                  return `
+                    <tr class="conversation-row">
+                      <td>
+                        <span class="session-dot" style="background:${colorForId(c.hash || session.sessionId + ':null')}"></span>
+                        <span class="conversation-hash" title="${esc(label)}">${esc(label)}</span>
+                      </td>
+                      <td>${esc(fmtRelative(c.lastSeenAt))}</td>
+                    </tr>`;
+                }).join('')
+              : '';
+            return sessionRow + conversationRows;
           }).join('')
         }</tbody></table>`;
 
