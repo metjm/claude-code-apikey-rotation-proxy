@@ -9,6 +9,7 @@ import {
 } from "./types.ts";
 import { log } from "./logger.ts";
 import { emitWithKeys } from "./events.ts";
+import { extractMessagesFingerprint } from "./message-fingerprint.ts";
 import type { SchemaTracker } from "./schema-tracker.ts";
 
 const RATE_LIMIT_STATUS = 429 as const;
@@ -265,6 +266,7 @@ export async function proxyRequest(
     };
   }
   const requestBodyState = snapshotRequestBodyState(req, requestBody);
+  const messagesFingerprint = extractMessagesFingerprint(requestBody, url.pathname);
 
   let attempts = 0;
   let firstChunkRetries = 0;
@@ -353,6 +355,10 @@ export async function proxyRequest(
       upstreamUrl,
       requestContentLength,
       requestBodyState,
+      firstMessageHash: messagesFingerprint?.firstMessageHash ?? null,
+      secondMessageHash: messagesFingerprint?.secondMessageHash ?? null,
+      messageCount: messagesFingerprint?.messageCount ?? null,
+      firstMessagePreview: messagesFingerprint?.firstMessagePreview ?? null,
       headers: allHeaders,
     });
     registerActiveRequest(
