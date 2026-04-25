@@ -131,12 +131,14 @@
   .table-metrics { display: flex; flex-direction: column; gap: 1px; }
   .table-metrics strong { color: var(--text-bright); font-weight: 600; }
   .sessions-list {
-    display: flex;
-    flex-direction: column;
-    gap: 0;
+    display: grid;
+    grid-template-columns: 14px minmax(0, 1fr) auto;
+    column-gap: 7px;
+    row-gap: 0;
     font-size: 10px;
   }
   .sessions-summary {
+    grid-column: 1 / -1;
     display: flex;
     justify-content: space-between;
     align-items: baseline;
@@ -160,8 +162,8 @@
   }
   .session-group {
     display: grid;
-    grid-template-columns: 14px minmax(0, 1fr) auto;
-    column-gap: 7px;
+    grid-column: 1 / -1;
+    grid-template-columns: subgrid;
     row-gap: 1px;
     align-items: center;
     padding: 3px 4px 4px;
@@ -445,12 +447,6 @@
   .card-remove:hover { color: var(--red); }
   .editable { cursor: pointer; border-bottom: 1px dashed var(--border); }
   .editable:hover { border-bottom-color: var(--blue); }
-  .priority-select {
-    background: var(--bg3); color: var(--text); border: 1px solid var(--border); border-radius: 3px;
-    font-family: var(--font); font-size: 10px; padding: 1px 4px; cursor: pointer; margin-top: 4px;
-  }
-  .priority-select:focus { outline: none; border-color: var(--blue); }
-  .priority-select option { background: var(--bg2); color: var(--text); }
   .empty-state { color: var(--text-dim); font-size: 12px; padding: 20px 0; text-align: center; flex: 1; display: flex; align-items: center; justify-content: center; }
   .card-capacity {
     margin-top: 8px; padding-top: 8px; border-top: 1px solid rgba(48,54,61,0.55);
@@ -789,6 +785,7 @@
 
 <script src="/dashboard/chart.umd.min.js"></script>
 <script src="/dashboard/pace.js"></script>
+<script src="/dashboard/vue.global.prod.js"></script>
 <script>
 // ── Chart.js defaults (dark theme) ────────────────────────────
 Chart.defaults.color = '#8b949e';
@@ -940,13 +937,19 @@ function colorForId(id) {
   for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) | 0;
   return 'hsl(' + (((h % 360) + 360) % 360) + ', 70%, 62%)';
 }
-function idHtml(id, headLen, tailLen) {
+// Split an identifier into a bright head and a dim tail for the Vue templates,
+// so each segment can be rendered with its own class without v-html. When the
+// id is shorter than head+tail the tail string is empty.
+function idHead(id, headLen, tailLen) {
   if (!id) return '';
-  if (id.length <= headLen) return esc(id);
-  if (id.length <= headLen + tailLen) {
-    return esc(id.slice(0, headLen)) + '<span class="id-tail">' + esc(id.slice(headLen)) + '</span>';
-  }
-  return esc(id.slice(0, headLen)) + '<span class="id-tail">' + esc(id.slice(-tailLen)) + '</span>';
+  if (id.length <= headLen) return id;
+  return id.slice(0, headLen);
+}
+function idTail(id, headLen, tailLen) {
+  if (!id) return '';
+  if (id.length <= headLen) return '';
+  if (id.length <= headLen + tailLen) return id.slice(headLen);
+  return id.slice(-tailLen);
 }
 function fmtAge(iso) {
   if (!iso) return '--';
@@ -1252,9 +1255,6 @@ function compactQuotaState(key) {
     label: 'Observed',
     title: 'Limit telemetry is present, but there is no clear signal to act on.',
   };
-}
-function retryBadge(key) {
-  return '';
 }
 function capacityHeadline(key) {
   const responseCount = key.capacity?.responseCount || 0;
@@ -1626,248 +1626,325 @@ function renderCapacitySummaryInner() {
 }
 
 // ── Render keys ────────────────────────────────────────────────
-function renderKeys() {
-  try { return renderKeysInner(); } catch (err) {
-    // Preserve the previously-rendered DOM on an unexpected error.
-    // Without this, a single bad pace computation would blank the whole table.
-    console.warn('renderKeys failed, keeping previous DOM:', err);
-  }
-}
-function renderKeysInner() {
-  const el = document.getElementById('key-cards');
-  const active = document.activeElement;
-  if (active && active.tagName === 'SELECT' && active.closest('#key-cards')) {
-    // Don't re-render while the user is interacting with a dropdown — would
-    // snap focus away. The countdown timer fires every second, so we'd
-    // otherwise blow away the open select on every tick.
-    return;
-  }
-  if (keys.length === 0) {
-    el.innerHTML = '<div class="empty-state">No API keys configured</div>';
-    return;
-  }
-  const now = Date.now();
-  // Priority-preserving sort: priority tier ASC (preferred before normal
-  // before fallback — must match the routing logic in
-  // selectLeastLoadedAvailableKey which fully exhausts tier 1 before tier 2).
-  // Within a tier: worst-tone-first, then reset-soonest, then label.
-  // The tone quantization avoids per-second row jitter from raw pace ratios.
-  const displayKeys = typeof window.PaceMath !== 'undefined'
-    ? window.PaceMath.sortKeysForDisplay(keys, now)
-    : [...keys].sort((a, b) =>
-        (Number(a.priority || 2) - Number(b.priority || 2))
-        || String(a.label).localeCompare(String(b.label))
-      );
+// Vue app state. The host script keeps `keys` as a global (other panels read
+// it directly) and syncs into the Vue app on every renderKeys() tick.
+let keysVm = null;
+function ensureKeysApp() {
+  if (keysVm) return keysVm;
 
-  let html = `<table class="ops-table">
-    <colgroup>
-      <col class="col-key">
-      <col class="col-state">
-      <col class="col-limits">
-      <col class="col-usage">
-      <col>
-      <col class="col-controls">
-    </colgroup>
-    <thead>
-      <tr>
-        <th>Key</th>
-        <th>State</th>
-        <th>Limits</th>
-        <th>Usage</th>
-        <th>Sessions (15m)</th>
-        <th>Controls</th>
-      </tr>
-    </thead>
-    <tbody>`;
-
-  for (const k of displayKeys) {
-    const cc = keyColor(k.label);
-    const pri = k.priority || 2;
-    const telemetry = capacityHeadline(k);
-    const quotaState = compactQuotaState(k);
-    const tone = keyRowTone(k, telemetry);
-    const claim = k.capacity?.representativeClaim ? humanizeClaim(k.capacity.representativeClaim) : 'No driver';
-    const routingDetail = [
-      `${fmtNum(k.stats.rateLimitHits)} RL`,
-      (k.recentErrors || 0) > 0 ? `${fmtNum(k.recentErrors || 0)} err` : null,
-      !k.isAvailable ? fmtCountdown(k.availableAt - Date.now()) : null,
-    ].filter(Boolean).join(' · ');
-    const keyMetaTitle = [
-      `Priority: ${humanizePriority(pri)}`,
-      k.capacity?.organizationId ? `Organization: ${k.capacity.organizationId}` : null,
-      `Primary limit driver: ${claim}`,
-    ].filter(Boolean).join('\n');
-    const hasAnyWindow = sortedCapacityWindows(k).length > 0;
-    // For each primary window, build a pace bar (fill = utilization,
-    // tick = time elapsed). The bar IS the "used %" value — fill color
-    // encodes pace relative to elapsed, tick gives the reference line.
-    const limitRows = ['unified-5h', 'unified-7d'].map(windowName => {
-      const w = capacityWindow(k, windowName);
-      const pace = (typeof window.PaceMath !== 'undefined')
-        ? window.PaceMath.computeWindowPace({
-            utilization: w?.utilization,
-            resetAt: w?.resetAt,
-            windowName: windowName,
-            now: now,
-          })
-        : null;
-      const utilPct = pace && pace.utilization !== null ? Math.round(pace.utilization * 100) : null;
-      const elapsedPct = pace && pace.elapsedFrac !== null ? Math.round(pace.elapsedFrac * 100) : null;
-      const tone = pace ? pace.tone : 'dim';
-      const paceText = pace && pace.paceRatio !== null
-        ? `${pace.paceRatio.toFixed(2)}× ${paceLabel(pace.tone, pace.paceRatio)}`
-        : 'no signal yet';
-      const title = w
-        ? `${friendlyWindowName(windowName)} · used ${utilPct === null ? '--' : utilPct + '%'} · elapsed ${elapsedPct === null ? '--' : elapsedPct + '%'} · pace ${paceText}${w.resetAt ? ' · resets in ' + fmtCountdown(w.resetAt - now) : ''}`
-        : `No ${friendlyWindowName(windowName).toLowerCase()} telemetry observed recently.`;
-      return {
-        label: compactWindowName(windowName),
-        utilPct: utilPct,
-        elapsedPct: elapsedPct,
-        tone: tone,
-        reset: w?.resetAt ? fmtCountdown(w.resetAt - now) : '--',
-        title: title,
-      };
-    });
-    const limitsHtml = `<div class="limit-summary">
-      <div class="limit-driver" title="${esc(keyMetaTitle)}">driver ${esc(claim)}</div>
-      ${limitRows.map(row => `
-        <div class="pace-cell" title="${esc(row.title)}">
-          <span class="pace-cell-label">${esc(row.label)}</span>
-          <div class="pace-bar tone-${esc(row.tone)}">
-            <div class="pace-bar-fill" style="width:${row.utilPct === null ? 0 : row.utilPct}%"></div>
-            ${row.elapsedPct === null ? '' : `<div class="pace-bar-tick" style="left:${row.elapsedPct}%"></div>`}
-          </div>
-          <span class="pace-cell-reset">${esc(row.reset)}</span>
-        </div>
-      `).join('')}
-      ${hasAnyWindow ? '' : `<div class="table-sub" title="${esc((k.capacity?.normalizedHeaderCount || 0) > 0 ? telemetryAwaitingNote(k) : 'Awaiting limit headers')}">${esc((k.capacity?.normalizedHeaderCount || 0) > 0 ? telemetryAwaitingLabel(k) : 'Awaiting limit headers')}</div>`}
-    </div>`;
-    const keyRef = JSON.stringify(k.maskedKey);
-    const usageLines = [
-      `<div><strong>${fmtNum(k.stats.totalRequests)}</strong> req · ${fmtNum(k.stats.totalTokensIn)} in / ${fmtNum(k.stats.totalTokensOut)} out</div>`,
-    ];
-    if ((k.stats.totalCacheRead || 0) > 0 || (k.stats.totalCacheCreation || 0) > 0) {
-      usageLines.push(`<div title="Cache read / cache write">${fmtNum(k.stats.totalCacheRead || 0)} cache / ${fmtNum(k.stats.totalCacheCreation || 0)} write</div>`);
-    }
-    const recentSessions = Array.isArray(k.recentSessions15m) ? k.recentSessions15m : [];
-    let sessionsHtml;
-    if (recentSessions.length === 0) {
-      sessionsHtml = '<div class="sessions-empty">No sessions in last 15m</div>';
-    } else {
-      const totalConvs = recentSessions.reduce((sum, s) =>
-        sum + (Array.isArray(s.conversations) ? s.conversations.length : 1), 0);
-      const mostRecent = recentSessions.reduce((best, s) =>
-        (best === null || s.lastSeenAt > best) ? s.lastSeenAt : best, null);
-      const summaryLeft = recentSessions.length + ' session' + (recentSessions.length === 1 ? '' : 's')
-        + (totalConvs !== recentSessions.length ? ' · ' + totalConvs + ' convs' : '');
-      const groupsHtml = recentSessions.map(session => {
-        const convs = Array.isArray(session.conversations) ? session.conversations : [];
-        const ageTitle = session.firstSeenAt ? `Session first seen ${session.firstSeenAt}` : '';
-        const sessionCells = `
-          <span class="cell-dot" style="--dot:${colorForId(session.sessionId)}"><span class="dot"></span></span>
-          <span class="cell-id" title="${esc(session.sessionId)}">${idHtml(session.sessionId, 8, 4)}</span>
+  const SessionGroupComponent = {
+    props: { session: { type: Object, required: true } },
+    computed: {
+      convs() {
+        return Array.isArray(this.session.conversations) ? this.session.conversations : [];
+      },
+      hasMultipleConvs() { return this.convs.length > 1; },
+      // Children rendered into the subgrid only when there's more than one
+      // conversation under the session — v-for on this list keeps the v-for /
+      // v-if separation Vue 3 prefers. Each item gets a stable, unique key:
+      // the hash when present, otherwise the firstSeenAt timestamp (only one
+      // null-hash entry can exist per session group, so this can't collide).
+      convsToRender() {
+        return this.hasMultipleConvs
+          ? this.convs.map((c) => ({
+              ...c,
+              vueKey: c.hash || ('no-hash::' + (c.firstSeenAt || c.lastSeenAt || '')),
+            }))
+          : [];
+      },
+      sessionDotStyle() { return { '--dot': colorForId(this.session.sessionId) }; },
+      idHead() { return idHead(this.session.sessionId, 8, 4); },
+      idTailText() { return idTail(this.session.sessionId, 8, 4); },
+    },
+    methods: {
+      convDotStyle(c) { return { '--dot': c.hash ? colorForId(c.hash) : 'var(--text-dim)' }; },
+      convIdHead(c) { return idHead(c.hash || '(no hash)', 8, 8); },
+      convIdTail(c) { return idTail(c.hash || '(no hash)', 8, 8); },
+      ageTitle(iso) { return iso ? 'First seen ' + iso : ''; },
+      fmtAge: fmtAge,
+      fmtRelative: fmtRelative,
+      fmtNum: fmtNum,
+    },
+    template: `
+      <div class="session-group">
+        <span class="cell-dot" :style="sessionDotStyle"><span class="dot"></span></span>
+        <span class="cell-id" :title="session.sessionId">{{ idHead }}<span v-if="idTailText" class="id-tail">{{ idTailText }}</span></span>
+        <span class="cell-right">
+          <span v-if="hasMultipleConvs" class="session-count">×{{ convs.length }}</span>
+          <span>{{ fmtRelative(session.lastSeenAt) }}</span>
+        </span>
+        <span class="cell-meta-row">
+          <span class="cell-actor" title="Proxy token">{{ session.actor || 'anon' }}</span>
+          <span class="cell-sep">·</span>
+          <span :title="ageTitle(session.firstSeenAt)"><b>{{ fmtAge(session.firstSeenAt) }}</b> old</span>
+          <span class="cell-sep">·</span>
+          <span title="Routing decisions on this key in last 15m"><b>{{ fmtNum(session.totalRequests || 0) }}</b> req</span>
+        </span>
+        <template v-for="c in convsToRender" :key="c.vueKey">
+          <span class="cell-dot cell-dot--conv" :style="convDotStyle(c)"><span class="dot"></span></span>
+          <span class="cell-hash" :title="c.hash || '(no hash)'">{{ convIdHead(c) }}<span class="id-tail">{{ convIdTail(c) }}</span></span>
           <span class="cell-right">
-            ${convs.length > 1 ? `<span class="session-count">×${convs.length}</span>` : ''}
-            <span>${esc(fmtRelative(session.lastSeenAt))}</span>
+            <span :title="ageTitle(c.firstSeenAt)">{{ fmtAge(c.firstSeenAt) }}</span>
+            <span class="cell-sep">·</span>
+            <span title="Requests on this key in last 15m">{{ fmtNum(c.requestCount || 0) }}r</span>
+            <span class="cell-sep">·</span>
+            <span>{{ fmtRelative(c.lastSeenAt) }}</span>
           </span>
-          <span class="cell-meta-row">
-            <span class="cell-actor" title="Proxy token">${esc(session.actor || 'anon')}</span>
-            <span class="cell-sep">·</span>
-            <span title="${esc(ageTitle)}"><b>${esc(fmtAge(session.firstSeenAt))}</b> old</span>
-            <span class="cell-sep">·</span>
-            <span title="Routing decisions on this key in last 15m"><b>${esc(fmtNum(session.totalRequests || 0))}</b> req</span>
-          </span>`;
-        const convCells = convs.length > 1
-          ? convs.map(c => {
-              const dotColor = c.hash ? colorForId(c.hash) : 'var(--text-dim)';
-              const label = c.hash || '(no hash)';
-              const display = c.hash ? idHtml(c.hash, 8, 8) : esc(label);
-              const convAgeTitle = c.firstSeenAt ? `Conversation first seen ${c.firstSeenAt}` : '';
-              return `
-                <span class="cell-dot cell-dot--conv" style="--dot:${dotColor}"><span class="dot"></span></span>
-                <span class="cell-hash" title="${esc(label)}">${display}</span>
-                <span class="cell-right">
-                  <span title="${esc(convAgeTitle)}">${esc(fmtAge(c.firstSeenAt))}</span>
-                  <span class="cell-sep">·</span>
-                  <span title="Requests on this key in last 15m">${esc(fmtNum(c.requestCount || 0))}r</span>
-                  <span class="cell-sep">·</span>
-                  <span>${esc(fmtRelative(c.lastSeenAt))}</span>
-                </span>`;
-            }).join('')
-          : '';
-        return `<div class="session-group">${sessionCells}${convCells}</div>`;
-      }).join('');
-      sessionsHtml = `
-        <div class="sessions-list">
-          <div class="sessions-summary">
-            <span>${esc(summaryLeft)}</span>
-            <span class="sessions-summary-right">${mostRecent ? esc(fmtRelative(mostRecent)) : ''}</span>
-          </div>
-          ${groupsHtml}
-        </div>`;
-    }
+        </template>
+      </div>
+    `,
+  };
 
-    html += `<tr class="${esc(tone)}">
-      <td>
-        <div class="table-stack">
-          <div class="table-title-row">
-            <span class="table-title ${esc(cc)}">${esc(k.label)}</span>
-          </div>
-          <div class="table-masked">${esc(k.maskedKey)}</div>
-          <div class="table-meta" title="${esc(keyMetaTitle)}">${esc(humanizePriority(pri))} · ${esc(shortOrg(k.capacity?.organizationId))} · ${esc(claim)}</div>
+  const SessionsCellComponent = {
+    props: { sessions: { type: Array, default: () => [] } },
+    components: { 'session-group': SessionGroupComponent },
+    computed: {
+      hasAny() { return Array.isArray(this.sessions) && this.sessions.length > 0; },
+      totalConvs() {
+        return this.sessions.reduce((s, sess) => s + (Array.isArray(sess.conversations) ? sess.conversations.length : 1), 0);
+      },
+      mostRecent() {
+        return this.sessions.reduce((best, s) => (best === null || s.lastSeenAt > best) ? s.lastSeenAt : best, null);
+      },
+      summaryLeft() {
+        const n = this.sessions.length;
+        return n + ' session' + (n === 1 ? '' : 's')
+          + (this.totalConvs !== n ? ' · ' + this.totalConvs + ' convs' : '');
+      },
+      summaryRight() { return this.mostRecent ? fmtRelative(this.mostRecent) : ''; },
+    },
+    template: `
+      <div v-if="!hasAny" class="sessions-empty">No sessions in last 15m</div>
+      <div v-else class="sessions-list">
+        <div class="sessions-summary">
+          <span>{{ summaryLeft }}</span>
+          <span class="sessions-summary-right">{{ summaryRight }}</span>
         </div>
-      </td>
-      <td>
-        <div class="table-stack" title="${esc(telemetry.title)}&#10;&#10;${esc(telemetry.subtitle)}">
-          <div class="badge-row">
-            ${routingBadge(k)}
-            ${k.isAvailable ? `<span class="badge ${esc(quotaState.className)}" title="${esc(quotaState.title)}">${esc(quotaState.label)}</span>` : ''}
-            ${k.capacity?.overageStatus === 'rejected' ? `<span class="badge badge-blue" title="${esc(overageNote(k))}">Extra usage off</span>` : ''}
-            ${retryBadge(k)}
+        <session-group v-for="s in sessions" :key="s.sessionId" :session="s"></session-group>
+      </div>
+    `,
+  };
+
+  const KeyRowComponent = {
+    props: { k: { type: Object, required: true }, now: { type: Number, required: true } },
+    components: { 'sessions-cell': SessionsCellComponent },
+    computed: {
+      cc() { return keyColor(this.k.label); },
+      pri() { return this.k.priority || 2; },
+      telemetry() { return capacityHeadline(this.k); },
+      quotaState() { return compactQuotaState(this.k); },
+      tone() { return keyRowTone(this.k, this.telemetry); },
+      claim() {
+        return this.k.capacity?.representativeClaim ? humanizeClaim(this.k.capacity.representativeClaim) : 'No driver';
+      },
+      keyMetaTitle() {
+        return [
+          'Priority: ' + humanizePriority(this.pri),
+          this.k.capacity?.organizationId ? 'Organization: ' + this.k.capacity.organizationId : null,
+          'Primary limit driver: ' + this.claim,
+        ].filter(Boolean).join('\n');
+      },
+      keyMetaLine() {
+        return humanizePriority(this.pri) + ' · ' + shortOrg(this.k.capacity?.organizationId) + ' · ' + this.claim;
+      },
+      routingDetail() {
+        return [
+          fmtNum(this.k.stats.rateLimitHits) + ' RL',
+          (this.k.recentErrors || 0) > 0 ? fmtNum(this.k.recentErrors || 0) + ' err' : null,
+          !this.k.isAvailable ? fmtCountdown(this.k.availableAt - this.now) : null,
+        ].filter(Boolean).join(' · ') || '--';
+      },
+      hasAnyWindow() { return sortedCapacityWindows(this.k).length > 0; },
+      hasNormalizedHeaders() { return (this.k.capacity?.normalizedHeaderCount || 0) > 0; },
+      awaitingNote() { return this.hasNormalizedHeaders ? telemetryAwaitingNote(this.k) : 'Awaiting limit headers'; },
+      awaitingLabel() { return this.hasNormalizedHeaders ? telemetryAwaitingLabel(this.k) : 'Awaiting limit headers'; },
+      limitRows() {
+        return ['unified-5h', 'unified-7d'].map(windowName => {
+          const w = capacityWindow(this.k, windowName);
+          const pace = (typeof window.PaceMath !== 'undefined')
+            ? window.PaceMath.computeWindowPace({
+                utilization: w?.utilization, resetAt: w?.resetAt, windowName, now: this.now,
+              })
+            : null;
+          const utilPct = pace && pace.utilization !== null ? Math.round(pace.utilization * 100) : null;
+          const elapsedPct = pace && pace.elapsedFrac !== null ? Math.round(pace.elapsedFrac * 100) : null;
+          const tone = pace ? pace.tone : 'dim';
+          const paceText = pace && pace.paceRatio !== null
+            ? pace.paceRatio.toFixed(2) + '× ' + paceLabel(pace.tone, pace.paceRatio)
+            : 'no signal yet';
+          const title = w
+            ? friendlyWindowName(windowName) + ' · used ' + (utilPct === null ? '--' : utilPct + '%')
+              + ' · elapsed ' + (elapsedPct === null ? '--' : elapsedPct + '%')
+              + ' · pace ' + paceText
+              + (w.resetAt ? ' · resets in ' + fmtCountdown(w.resetAt - this.now) : '')
+            : 'No ' + friendlyWindowName(windowName).toLowerCase() + ' telemetry observed recently.';
+          return {
+            label: compactWindowName(windowName),
+            utilPct, elapsedPct, tone,
+            reset: w?.resetAt ? fmtCountdown(w.resetAt - this.now) : '--',
+            title,
+          };
+        });
+      },
+      stateTitle() { return (this.telemetry.title || '') + '\n\n' + (this.telemetry.subtitle || ''); },
+      routingBadgeHtml() { return routingBadge(this.k); },
+      showOverageBadge() { return this.k.capacity?.overageStatus === 'rejected'; },
+      overageNoteText() { return overageNote(this.k); },
+      usageMain() {
+        return fmtNum(this.k.stats.totalRequests) + ' req · ' + fmtNum(this.k.stats.totalTokensIn) + ' in / ' + fmtNum(this.k.stats.totalTokensOut) + ' out';
+      },
+      hasCacheStats() { return (this.k.stats.totalCacheRead || 0) > 0 || (this.k.stats.totalCacheCreation || 0) > 0; },
+      cacheLine() { return fmtNum(this.k.stats.totalCacheRead || 0) + ' cache / ' + fmtNum(this.k.stats.totalCacheCreation || 0) + ' write'; },
+      allowedDays() { return this.k.allowedDays || [0,1,2,3,4,5,6]; },
+    },
+    methods: {
+      onPriorityChange(e) { updateKeyPriority(this.k.maskedKey, Number(e.target.value)); },
+      onDayClick(day) {
+        const active = this.allowedDays.includes(day);
+        toggleKeyDay(this.k.maskedKey, day, !active);
+      },
+      onRename() { renameKey(this.k.maskedKey); },
+      onRemove() { removeKey(this.k.maskedKey); },
+      isDayActive(day) { return this.allowedDays.includes(day); },
+      paceFillStyle(row) { return { width: (row.utilPct === null ? 0 : row.utilPct) + '%' }; },
+      paceTickStyle(row) { return { left: row.elapsedPct + '%' }; },
+      paceTone(row) { return 'tone-' + row.tone; },
+    },
+    template: `
+      <tr :class="tone">
+        <td>
+          <div class="table-stack">
+            <div class="table-title-row">
+              <span class="table-title" :class="cc">{{ k.label }}</span>
+            </div>
+            <div class="table-masked">{{ k.maskedKey }}</div>
+            <div class="table-meta" :title="keyMetaTitle">{{ keyMetaLine }}</div>
           </div>
-          <div class="metric-inline">${esc(routingDetail || '--')}</div>
-        </div>
-      </td>
-      <td>
-        ${limitsHtml}
-      </td>
-      <td>
-        <div class="table-metrics">
-          ${usageLines.join('')}
-        </div>
-      </td>
-      <td>
-        ${sessionsHtml}
-      </td>
-      <td>
-        <div class="table-controls">
-          <select class="key-priority-select" title="Selection priority" onchange='updateKeyPriority(${keyRef}, Number(this.value))'>
-            <option value="1"${pri === 1 ? ' selected' : ''}>Preferred</option>
-            <option value="2"${pri === 2 ? ' selected' : ''}>Normal</option>
-            <option value="3"${pri === 3 ? ' selected' : ''}>Fallback</option>
-            <option value="4"${pri === 4 ? ' selected' : ''}>Disabled</option>
-          </select>
-          <div class="day-picker" title="Days this key is eligible for routing">
-            ${[['Su',0],['Mo',1],['Tu',2],['We',3],['Th',4],['Fr',5],['Sa',6]].map(([label, day]) => {
-              const active = (k.allowedDays || [0,1,2,3,4,5,6]).includes(day);
-              return `<button class="day-btn${active ? ' day-active' : ''}"
-                onclick='toggleKeyDay(${keyRef}, ${day}, ${!active})'
-                title="${['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'][day]}"
-              >${label}</button>`;
-            }).join('')}
+        </td>
+        <td>
+          <div class="table-stack" :title="stateTitle">
+            <div class="badge-row">
+              <span v-html="routingBadgeHtml"></span>
+              <span v-if="k.isAvailable" class="badge" :class="quotaState.className" :title="quotaState.title">{{ quotaState.label }}</span>
+              <span v-if="showOverageBadge" class="badge badge-blue" :title="overageNoteText">Extra usage off</span>
+            </div>
+            <div class="metric-inline">{{ routingDetail }}</div>
           </div>
-          <div class="badge-row">
-            <button class="btn-link" onclick='renameKey(${keyRef})'>Rename</button>
-            <button class="btn-link" onclick='removeKey(${keyRef})'>Remove</button>
+        </td>
+        <td>
+          <div class="limit-summary">
+            <div class="limit-driver" :title="keyMetaTitle">driver {{ claim }}</div>
+            <div v-for="row in limitRows" :key="row.label" class="pace-cell" :title="row.title">
+              <span class="pace-cell-label">{{ row.label }}</span>
+              <div class="pace-bar" :class="paceTone(row)">
+                <div class="pace-bar-fill" :style="paceFillStyle(row)"></div>
+                <div v-if="row.elapsedPct !== null" class="pace-bar-tick" :style="paceTickStyle(row)"></div>
+              </div>
+              <span class="pace-cell-reset">{{ row.reset }}</span>
+            </div>
+            <div v-if="!hasAnyWindow" class="table-sub" :title="awaitingNote">{{ awaitingLabel }}</div>
           </div>
-        </div>
-      </td>
-    </tr>`;
+        </td>
+        <td>
+          <div class="table-metrics">
+            <div><strong>{{ fmtNum(k.stats.totalRequests) }}</strong> req · {{ fmtNum(k.stats.totalTokensIn) }} in / {{ fmtNum(k.stats.totalTokensOut) }} out</div>
+            <div v-if="hasCacheStats" title="Cache read / cache write">{{ cacheLine }}</div>
+          </div>
+        </td>
+        <td>
+          <sessions-cell :sessions="k.recentSessions15m"></sessions-cell>
+        </td>
+        <td>
+          <div class="table-controls">
+            <select class="key-priority-select" title="Selection priority" :value="pri" @change="onPriorityChange">
+              <option :value="1">Preferred</option>
+              <option :value="2">Normal</option>
+              <option :value="3">Fallback</option>
+              <option :value="4">Disabled</option>
+            </select>
+            <div class="day-picker" title="Days this key is eligible for routing">
+              <button v-for="d in dayDefs" :key="d.day" class="day-btn" :class="{ 'day-active': isDayActive(d.day) }"
+                @click="onDayClick(d.day)" :title="d.full">{{ d.label }}</button>
+            </div>
+            <div class="badge-row">
+              <button class="btn-link" @click="onRename">Rename</button>
+              <button class="btn-link" @click="onRemove">Remove</button>
+            </div>
+          </div>
+        </td>
+      </tr>
+    `,
+    data() {
+      return {
+        fmtNum,
+        dayDefs: [
+          { label: 'Su', day: 0, full: 'Sunday' },
+          { label: 'Mo', day: 1, full: 'Monday' },
+          { label: 'Tu', day: 2, full: 'Tuesday' },
+          { label: 'We', day: 3, full: 'Wednesday' },
+          { label: 'Th', day: 4, full: 'Thursday' },
+          { label: 'Fr', day: 5, full: 'Friday' },
+          { label: 'Sa', day: 6, full: 'Saturday' },
+        ],
+      };
+    },
+  };
+
+  const RootComponent = {
+    components: { 'key-row': KeyRowComponent },
+    data() { return { keys: [], now: Date.now() }; },
+    computed: {
+      isEmpty() { return !this.keys || this.keys.length === 0; },
+      displayKeys() {
+        if (typeof window.PaceMath !== 'undefined') {
+          return window.PaceMath.sortKeysForDisplay(this.keys, this.now);
+        }
+        return [...this.keys].sort((a, b) =>
+          (Number(a.priority || 2) - Number(b.priority || 2))
+          || String(a.label).localeCompare(String(b.label))
+        );
+      },
+    },
+    template: `
+      <div v-if="isEmpty" class="empty-state">No API keys configured</div>
+      <table v-else class="ops-table">
+        <colgroup>
+          <col class="col-key">
+          <col class="col-state">
+          <col class="col-limits">
+          <col class="col-usage">
+          <col>
+          <col class="col-controls">
+        </colgroup>
+        <thead>
+          <tr>
+            <th>Key</th><th>State</th><th>Limits</th><th>Usage</th>
+            <th>Sessions (15m)</th><th>Controls</th>
+          </tr>
+        </thead>
+        <tbody>
+          <key-row v-for="k in displayKeys" :key="k.maskedKey" :k="k" :now="now"></key-row>
+        </tbody>
+      </table>
+    `,
+  };
+
+  const app = Vue.createApp(RootComponent);
+  app.config.errorHandler = (err) => {
+    console.warn('Vue keys-app render error:', err);
+  };
+  keysVm = app.mount('#key-cards');
+  return keysVm;
+}
+
+function renderKeys() {
+  try {
+    const vm = ensureKeysApp();
+    vm.keys = keys;
+    vm.now = Date.now();
+  } catch (err) {
+    console.warn('renderKeys failed:', err);
   }
-
-  html += '</tbody></table>';
-  el.innerHTML = html;
 }
 
 // ── Render tokens ──────────────────────────────────────────────
@@ -2072,7 +2149,7 @@ async function removeKey(maskedKey) {
 async function refreshKeys() {
   try {
     const data = await api('GET', '/admin/stats');
-    keys = data.keys;
+    keys = mergeDemoFixture(data.keys);
     capacitySummary = data.capacitySummary || capacitySummary;
     renderKeys();
     renderHeader();

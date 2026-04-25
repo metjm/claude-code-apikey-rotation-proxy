@@ -86,6 +86,12 @@ function startProxy(opts: {
           { headers: { "content-type": "application/javascript" } },
         );
       }
+      if (url.pathname === "/dashboard/vue.global.prod.js") {
+        return new Response(
+          Bun.file(new URL("../public/vue.global.prod.js", import.meta.url).pathname),
+          { headers: { "content-type": "application/javascript" } },
+        );
+      }
       if (url.pathname === "/dashboard/chart.umd.min.js") {
         return new Response(
           Bun.file(new URL("../public/chart.umd.min.js", import.meta.url).pathname),
@@ -412,6 +418,132 @@ describe("Dashboard fleet-pressure gradient (real browser)", () => {
       expect(spike!.factor).toBeGreaterThan(1);
       const quiet = body.slots.find((s) => s.dow === 0 && s.hour === 3);
       expect(quiet!.factor).toBeLessThan(spike!.factor);
+    } finally {
+      proxy.stop();
+      upstream.stop();
+      cleanupTempDir(dataDir);
+    }
+  });
+});
+
+describe("Dashboard sessions cell (Vue render)", () => {
+  let browser: Browser;
+
+  beforeAll(async () => {
+    browser = await launchBrowser();
+  });
+
+  afterAll(async () => {
+    await browser.close();
+  });
+
+  test("renders sessions with actor, age, request count and aligns columns across rows", async () => {
+    const dataDir = makeTempDir();
+    const upstream = startMockUpstream();
+    const proxy = startProxy({ dataDir, upstream: upstream.url, adminToken: ADMIN_TOKEN });
+
+    try {
+      // One key so the bucket-of-3 routing doesn't split conversations across
+      // accounts — we want both sessions and all of multi's three conversations
+      // pinned to the same key for the per-cell alignment assertions.
+      proxy.km.addKey(VALID_KEY_1, "key-a");
+
+      // Seed the targeted key with a session that has 1 conversation, plus a
+      // session that has 3 sub-agent conversations sharing one session-id —
+      // the multi-conv case the redesign exists for.
+      const sessionLone = "10000000-0000-0000-0000-000000000001";
+      const sessionMulti = "20000000-0000-0000-0000-000000000002";
+      const aLoneHash = "aaaaaaaaaaaaaaaa";
+      const bMulti1 = "bbbb111111111111";
+      const bMulti2 = "bbbb222222222222";
+      const bMulti3 = "bbbb333333333333";
+
+      // Use an explicit actor in the conversation key so the cell shows it.
+      const actor = "till@trainly";
+      proxy.km.getKeyForConversation(`${actor}:${sessionLone}:${aLoneHash}`, sessionLone);
+      proxy.km.getKeyForConversation(`${actor}:${sessionMulti}:${bMulti1}`, sessionMulti);
+      proxy.km.getKeyForConversation(`${actor}:${sessionMulti}:${bMulti2}`, sessionMulti);
+      proxy.km.getKeyForConversation(`${actor}:${sessionMulti}:${bMulti3}`, sessionMulti);
+
+      const page = await openDashboard(browser, proxy.url, ADMIN_TOKEN);
+      await page.waitForSelector("#key-cards .ops-table tbody tr", { timeout: 15_000 });
+      // Vue render is synchronous after data lands, but give it a tick.
+      await page.waitForSelector(".session-group", { timeout: 5_000 });
+
+      // 1. Sessions cell shows both sessions for key-a, sorted alphabetically.
+      const sessionIds = await page.$$eval(
+        "#key-cards .ops-table tbody tr:first-child .session-group .cell-id",
+        (els) => els.map((e) => e.getAttribute("title")),
+      );
+      expect(sessionIds).toEqual([sessionLone, sessionMulti]);
+
+      // 2. The multi-conv session shows ×3 chip and 3 conversation rows.
+      const multiGroup = await page.$$eval(
+        "#key-cards .ops-table tbody tr:first-child .session-group",
+        (groups) =>
+          groups.map((g) => ({
+            sessionId: g.querySelector(".cell-id")?.getAttribute("title"),
+            countText: g.querySelector(".session-count")?.textContent ?? "",
+            convHashes: [...g.querySelectorAll(".cell-hash")].map((c) => c.getAttribute("title")),
+            actor: g.querySelector(".cell-actor")?.textContent?.trim() ?? "",
+            metaText: g.querySelector(".cell-meta-row")?.textContent?.replace(/\s+/g, " ").trim() ?? "",
+          })),
+      );
+      const multi = multiGroup.find((m) => m.sessionId === sessionMulti);
+      const lone = multiGroup.find((m) => m.sessionId === sessionLone);
+      expect(multi).toBeDefined();
+      expect(multi!.countText).toBe("×3");
+      expect(multi!.convHashes.sort()).toEqual([bMulti1, bMulti2, bMulti3].sort());
+      expect(multi!.actor).toBe(actor);
+      // Meta row should mention "old" and "req" — actor first, then age, then req count.
+      expect(multi!.metaText).toContain(actor);
+      expect(multi!.metaText).toContain("old");
+      expect(multi!.metaText).toContain("req");
+      // Single-conv session has no count chip and no conversation rows.
+      expect(lone).toBeDefined();
+      expect(lone!.countText).toBe("");
+      expect(lone!.convHashes).toEqual([]);
+
+      // 3. Column alignment: every dot in the cell shares the same x-center,
+      //    every identifier shares the same x-left edge, and every right cell
+      //    shares the same x-right edge — within a small tolerance.
+      const alignment = await page.$eval(
+        "#key-cards .ops-table tbody tr:first-child td:nth-child(5)",
+        (cell) => {
+          const dots = [...cell.querySelectorAll(".cell-dot")];
+          const ids = [...cell.querySelectorAll(".cell-id, .cell-hash")];
+          const rights = [...cell.querySelectorAll(".cell-right")];
+          const dotCenters = dots.map((d) => {
+            const r = (d as HTMLElement).getBoundingClientRect();
+            return r.left + r.width / 2;
+          });
+          const idLefts = ids.map((e) => (e as HTMLElement).getBoundingClientRect().left);
+          const rightRights = rights.map((e) => (e as HTMLElement).getBoundingClientRect().right);
+          const spread = (vals: number[]) => Math.max(...vals) - Math.min(...vals);
+          return {
+            dots: dots.length,
+            ids: ids.length,
+            rights: rights.length,
+            dotSpread: spread(dotCenters),
+            idSpread: spread(idLefts),
+            rightSpread: spread(rightRights),
+          };
+        },
+      );
+      expect(alignment.dots).toBeGreaterThan(2); // at least session + 3 conversations
+      expect(alignment.ids).toBeGreaterThan(2);
+      expect(alignment.rights).toBeGreaterThan(2);
+      expect(alignment.dotSpread).toBeLessThan(2); // sub-pixel tolerance
+      expect(alignment.idSpread).toBeLessThan(2);
+      expect(alignment.rightSpread).toBeLessThan(2);
+
+      // 4. No JS errors during render.
+      const errors: string[] = [];
+      page.on("pageerror", (e) => errors.push(e.message));
+      // Force a re-render by simulating a 1s tick equivalent (the dashboard
+      // also auto-ticks; this just exercises the path explicitly).
+      await page.evaluate(() => (window as unknown as { renderKeys: () => void }).renderKeys());
+      expect(errors).toEqual([]);
     } finally {
       proxy.stop();
       upstream.stop();

@@ -121,6 +121,11 @@ function startServer(): void {
           headers: { "content-type": "application/javascript" },
         });
       }
+      if (url.pathname === "/dashboard/vue.global.prod.js") {
+        return new Response(Bun.file(join(import.meta.dir, "../public/vue.global.prod.js")), {
+          headers: { "content-type": "application/javascript" },
+        });
+      }
       if (url.pathname === "/favicon.ico") {
         return new Response(null, { status: 204 });
       }
