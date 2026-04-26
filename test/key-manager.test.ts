@@ -344,7 +344,9 @@ describe("Key CRUD", () => {
     km.getKeyForConversation("user-1:session-x:1111111111111111", "session-x");
     km.getKeyForConversation("user-1:session-x:2222222222222222", "session-x");
     km.getKeyForConversation("user-1:session-x:3333333333333333", "session-x");
-    // Plus a second session with no augmenting hash (legacy / non-/v1/messages).
+    // Plus a second session with no augmenting hash — represents non-/v1/messages
+    // traffic (count_tokens probes, etc.) that still pins for routing but should
+    // be hidden from the dashboard sessions table.
     km.getKeyForConversation("user-1:session-y", "session-y");
 
     const entry = km.listKeys().find((k) => k.label === "a")!;
@@ -367,10 +369,9 @@ describe("Key CRUD", () => {
       expect(conv.requestCount).toBeGreaterThan(0);
     }
 
-    expect(ys).toBeDefined();
-    expect(ys!.conversations.length).toBe(1);
-    expect(ys!.conversations[0]!.hash).toBeNull();
-    expect(ys!.actor).toBe("user-1");
+    // session-y was pinned (affinity exists for routing) but its 2-part key
+    // means it's not a real conversation turn — filtered from the dashboard.
+    expect(ys).toBeUndefined();
   });
 
   test("listKeys() tracks recent sessions active in the last 2 minutes", () => {
@@ -384,10 +385,12 @@ describe("Key CRUD", () => {
       km.addKey(VALID_KEY_2, "b");
 
       // Bucket-of-3 routing fills A first, so use 4 sessions to land on both.
-      expect(km.getKeyForConversation("user-1:session-a", "session-a").entry?.key).toBe(VALID_KEY_1);
-      expect(km.getKeyForConversation("user-1:session-b", "session-b").entry?.key).toBe(VALID_KEY_1);
-      expect(km.getKeyForConversation("user-1:session-c", "session-c").entry?.key).toBe(VALID_KEY_1);
-      expect(km.getKeyForConversation("user-1:session-d", "session-d").entry?.key).toBe(VALID_KEY_2);
+      // 3-part conversationKeys (with hash suffix) so they show up in recentSessions
+      // — the dashboard hides 2-part keys (count_tokens, etc.).
+      expect(km.getKeyForConversation("user-1:session-a:aaaaaaaaaaaaaaaa", "session-a").entry?.key).toBe(VALID_KEY_1);
+      expect(km.getKeyForConversation("user-1:session-b:bbbbbbbbbbbbbbbb", "session-b").entry?.key).toBe(VALID_KEY_1);
+      expect(km.getKeyForConversation("user-1:session-c:cccccccccccccccc", "session-c").entry?.key).toBe(VALID_KEY_1);
+      expect(km.getKeyForConversation("user-1:session-d:dddddddddddddddd", "session-d").entry?.key).toBe(VALID_KEY_2);
 
       let keys = km.listKeys().sort((a, b) => String(a.label).localeCompare(String(b.label)));
       expect(keys.map((key) => key.recentSessions.map((session) => session.sessionId).sort())).toEqual([
@@ -399,7 +402,7 @@ describe("Key CRUD", () => {
       keys = km.listKeys().sort((a, b) => String(a.label).localeCompare(String(b.label)));
       expect(keys.map((key) => key.recentSessions)).toEqual([[], []]);
 
-      expect(km.getKeyForConversation("user-1:session-a", "session-a").entry?.key).toBe(VALID_KEY_1);
+      expect(km.getKeyForConversation("user-1:session-a:aaaaaaaaaaaaaaaa", "session-a").entry?.key).toBe(VALID_KEY_1);
       keys = km.listKeys().sort((a, b) => String(a.label).localeCompare(String(b.label)));
       expect(keys.map((key) => key.recentSessions.map((session) => session.sessionId))).toEqual([
         ["session-a"],

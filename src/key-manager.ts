@@ -1832,6 +1832,12 @@ export class KeyManager {
     const grouped = new Map<ApiKey, SessionGroup>();
     for (const affinity of this.conversationAffinities.values()) {
       if (affinity.lastSeenAt < cutoff) continue;
+      // Skip 2-part conversationKeys (no first-message hash). Those come
+      // from non-/v1/messages endpoints — count_tokens probes and other
+      // session-level traffic. They still pin to a key for routing, but
+      // they aren't real conversation turns and shouldn't clutter the
+      // sessions table with phantom 0/0-throughput rows.
+      if (extractFirstMessageHashFromConversationKey(affinity.conversationKey) === null) continue;
       const sessionId = affinity.sessionId ?? affinity.conversationKey;
       const sessions = grouped.get(affinity.key) ?? new Map();
       const list = sessions.get(sessionId) ?? [];

@@ -3401,3 +3401,82 @@ describe("Synthetic claude-cli helper sessions", () => {
     expect(km.listKeys()[0]!.recentSessions).toEqual([]);
   });
 });
+
+describe("Non-/v1/messages session traffic", () => {
+  // count_tokens (and any other /v1/messages sibling endpoint) shares a
+  // session-id with the real call but produces no first-message hash, so
+  // it pins by 2-part conversationKey for routing co-location and stays
+  // out of the dashboard sessions table.
+  test("count_tokens pins by sessionId but is hidden from recentSessions", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    km.addKey(FAKE_KEY_B, "key-b");
+
+    let lastKeySeen: string | null = null;
+    const mock = upstream((req) => {
+      lastKeySeen = req.headers.get("x-api-key");
+      return new Response(JSON.stringify({ input_tokens: 42 }), {
+        status: 200, headers: { "content-type": "application/json" },
+      });
+    });
+    const config = makeConfig(mock.url);
+
+    async function send(path: string, session: string, content: string): Promise<void> {
+      const res = await proxyRequest(makeRequest(path, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-claude-code-session-id": session },
+        body: JSON.stringify({ messages: [{ role: "user", content }] }),
+      }), km, config, st);
+      expect(res.kind).toBe("success");
+    }
+
+    // First count_tokens call lands on some key and pins a 2-part conversationKey.
+    await send("/v1/messages/count_tokens", "session-x", "probe a");
+    const firstKey = lastKeySeen;
+    expect(firstKey).not.toBeNull();
+    const firstDecision = km.getRecentRoutingDecisions()[0]!;
+    expect(firstDecision.conversationKey).toBe("anon:session-x");
+    expect(firstDecision.routingDecision).toBe("conversation_new_assignment");
+
+    // A second count_tokens with the same session hits the same pinned key
+    // — affinity preserved even though there's no first-message hash.
+    await send("/v1/messages/count_tokens", "session-x", "probe b");
+    expect(lastKeySeen).toBe(firstKey);
+    expect(km.getRecentRoutingDecisions()[0]!.routingDecision).toBe("conversation_affinity_hit");
+
+    // ...but the dashboard sessions table doesn't show it (no hash → not a
+    // real conversation turn).
+    for (const k of km.listKeys()) {
+      expect(k.recentSessions).toEqual([]);
+    }
+  });
+
+  test("real /v1/messages turn on the same session does show on the dashboard", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    const mock = upstream(() => new Response(
+      JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ));
+    const config = makeConfig(mock.url);
+
+    async function send(path: string, content: string): Promise<void> {
+      const res = await proxyRequest(makeRequest(path, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-claude-code-session-id": "session-y" },
+        body: JSON.stringify({ messages: [{ role: "user", content }] }),
+      }), km, config, st);
+      expect(res.kind).toBe("success");
+    }
+
+    await send("/v1/messages/count_tokens", "probe");
+    await send("/v1/messages", "real");
+
+    const recent = km.listKeys()[0]!.recentSessions;
+    // Only the real turn shows up — the count_tokens probe is filtered out.
+    expect(recent.length).toBe(1);
+    expect(recent[0]!.conversations.length).toBe(1);
+    expect(recent[0]!.conversations[0]!.hash).not.toBeNull();
+  });
+});

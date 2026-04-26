@@ -696,6 +696,11 @@ function buildConversationKey(
   if (sessionId === null) return null;
   const actor = proxyUser?.label ?? "anon";
   const base = `${actor}:${sessionId}`;
+  // /v1/messages calls produce a 3-part key with the first-message hash so
+  // sub-agents inside one session each get their own affinity. Sibling
+  // endpoints (count_tokens, etc.) produce no hash but still pin to the key
+  // by session — keeps probe + real call co-located. Dashboard listing
+  // filters these 2-part rows out (no hash → not a real conversation).
   return firstMessageHash === null ? base : `${base}:${firstMessageHash}`;
 }
 
