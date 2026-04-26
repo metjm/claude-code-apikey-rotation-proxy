@@ -307,11 +307,6 @@ const SESSION_BUCKET_SIZE = 3;
 // anything older — the data is only useful for recent forensics.
 const ROUTING_DECISION_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
-// How long per-request latency samples are kept. The dashboard chart's
-// longest range is 24h; 7 days gives headroom for week-over-week comparison
-// without bloating the table.
-const REQUEST_LATENCY_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
-
 // When a session's pinned key is on a cooldown shorter than this, the
 // proxy returns a 429 to the client (with retry-after matching the remaining
 // cooldown) instead of remapping to another key. Preserves the prompt cache:
@@ -372,7 +367,6 @@ export class KeyManager {
       try {
         this.cleanupOldTimeseries();
         this.cleanupOldRoutingDecisions();
-        this.cleanupOldRequestLatencies();
         this.cleanupExpiredConversationAffinities(true);
         this.prunePastResetCapacityWindows();
       } catch (error) {
@@ -563,7 +557,9 @@ export class KeyManager {
       -- Per-request latency samples for the dashboard's global TTFT /
       -- ms-per-output-token chart. Only streamed /v1/messages turns get
       -- recorded; sibling endpoints (count_tokens) and non-streaming paths
-      -- have no meaningful TTFT and are skipped.
+      -- have no meaningful TTFT and are skipped. Kept indefinitely — the
+      -- chart's longest range is 24h today, but operators want the raw
+      -- history available for week- and month-scale comparisons later.
       CREATE TABLE IF NOT EXISTS request_latencies (
         ended_at INTEGER NOT NULL,
         started_at INTEGER NOT NULL,
@@ -1679,11 +1675,6 @@ export class KeyManager {
   private cleanupOldRoutingDecisions(): void {
     const cutoff = Date.now() - ROUTING_DECISION_RETENTION_MS;
     this.db.run("DELETE FROM routing_decisions WHERE decided_at < ?", [cutoff]);
-  }
-
-  private cleanupOldRequestLatencies(): void {
-    const cutoff = Date.now() - REQUEST_LATENCY_RETENTION_MS;
-    this.db.run("DELETE FROM request_latencies WHERE ended_at < ?", [cutoff]);
   }
 
   /** Record a single completed /v1/messages turn for the global latency
