@@ -505,38 +505,45 @@ describe("Dashboard sessions cell (Vue render)", () => {
       expect(lone!.countText).toBe("");
       expect(lone!.convHashes).toEqual([]);
 
-      // 3. Column alignment: every dot in the cell shares the same x-center,
-      //    every identifier shares the same x-left edge, and every right cell
-      //    shares the same x-right edge — within a small tolerance.
+      // 3. Column alignment: identifiers share the same x-left edge and
+      //    every right cell shares the same x-right edge across the session
+      //    row and its sub-conversation rows — within a small tolerance.
+      //    Session identity is now carried by a tinted background, not a
+      //    leading colored dot, so we no longer assert dot positions.
       const alignment = await page.$eval(
         "#key-cards .ops-table tbody tr:first-child td:nth-child(5)",
         (cell) => {
-          const dots = [...cell.querySelectorAll(".cell-dot")];
           const ids = [...cell.querySelectorAll(".cell-id, .cell-hash")];
           const rights = [...cell.querySelectorAll(".cell-right")];
-          const dotCenters = dots.map((d) => {
-            const r = (d as HTMLElement).getBoundingClientRect();
-            return r.left + r.width / 2;
-          });
           const idLefts = ids.map((e) => (e as HTMLElement).getBoundingClientRect().left);
           const rightRights = rights.map((e) => (e as HTMLElement).getBoundingClientRect().right);
           const spread = (vals: number[]) => Math.max(...vals) - Math.min(...vals);
+          // Each session-group must paint a non-transparent tinted background
+          // — that's the new identity affordance replacing the dot.
+          const groups = [...cell.querySelectorAll(".session-group")] as HTMLElement[];
+          const tints = groups.map((g) => window.getComputedStyle(g).backgroundColor);
           return {
-            dots: dots.length,
             ids: ids.length,
             rights: rights.length,
-            dotSpread: spread(dotCenters),
             idSpread: spread(idLefts),
             rightSpread: spread(rightRights),
+            tints,
           };
         },
       );
-      expect(alignment.dots).toBeGreaterThan(2); // at least session + 3 conversations
-      expect(alignment.ids).toBeGreaterThan(2);
+      expect(alignment.ids).toBeGreaterThan(2); // session + 3 conversations
       expect(alignment.rights).toBeGreaterThan(2);
-      expect(alignment.dotSpread).toBeLessThan(2); // sub-pixel tolerance
-      expect(alignment.idSpread).toBeLessThan(2);
+      expect(alignment.idSpread).toBeLessThan(2); // sub-pixel tolerance
       expect(alignment.rightSpread).toBeLessThan(2);
+      // Both session groups in this cell (lone + multi) must have a visible
+      // background tint — and the tints must differ so the two sessions read
+      // as visually distinct.
+      expect(alignment.tints.length).toBe(2);
+      for (const tint of alignment.tints) {
+        expect(tint).not.toBe("rgba(0, 0, 0, 0)");
+        expect(tint).not.toBe("transparent");
+      }
+      expect(alignment.tints[0]).not.toBe(alignment.tints[1]);
 
       // 4. No JS errors during render.
       const errors: string[] = [];

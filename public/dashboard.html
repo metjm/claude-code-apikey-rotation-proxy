@@ -132,7 +132,7 @@
   .table-metrics strong { color: var(--text-bright); font-weight: 600; }
   .sessions-list {
     display: grid;
-    grid-template-columns: 14px minmax(0, 1fr) auto;
+    grid-template-columns: minmax(0, 1fr) auto;
     column-gap: 7px;
     row-gap: 0;
     font-size: 10px;
@@ -160,35 +160,24 @@
     font-size: 10px;
     font-style: italic;
   }
+  /* Session identity is now carried by the group's tinted background and a
+     stronger left-border accent (both derived deterministically from the
+     sessionId). Removes the leading colored dot that confused readers when
+     paired with sub-conversation dots. */
   .session-group {
     display: grid;
     grid-column: 1 / -1;
     grid-template-columns: subgrid;
     row-gap: 1px;
     align-items: center;
-    padding: 3px 4px 4px;
+    padding: 4px 6px 5px 8px;
+    border-left: 2px solid var(--session-accent, transparent);
     border-radius: 3px;
+    background: var(--session-bg, transparent);
     transition: background 120ms ease;
   }
-  .session-group + .session-group { margin-top: 1px; }
-  .session-group:hover { background: rgba(88,166,255,0.05); }
-  .cell-dot {
-    display: flex;
-    justify-content: center;
-    align-items: center;
-  }
-  .cell-dot .dot {
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    background: var(--dot, var(--text-dim));
-    display: block;
-  }
-  .cell-dot--conv .dot {
-    width: 6px;
-    height: 6px;
-    opacity: 0.85;
-  }
+  .session-group + .session-group { margin-top: 2px; }
+  .session-group:hover { filter: brightness(1.1); }
   .cell-id,
   .cell-hash {
     font-variant-numeric: tabular-nums;
@@ -198,7 +187,16 @@
     min-width: 0;
   }
   .cell-id { color: var(--text-bright); }
-  .cell-hash { color: var(--text); }
+  /* Conversation rows are visually anchored under the session row by a small
+     left indent; they carry the session's accent without needing a dot. */
+  .cell-hash { color: var(--text); padding-left: 10px; position: relative; }
+  .cell-hash::before {
+    content: "↳";
+    position: absolute;
+    left: 0;
+    color: var(--text-dim);
+    font-size: 9px;
+  }
   .id-tail { color: var(--text-dim); }
   .cell-right {
     display: flex;
@@ -210,7 +208,7 @@
     justify-self: end;
   }
   .cell-meta-row {
-    grid-column: 2 / -1;
+    grid-column: 1 / -1;
     display: flex;
     align-items: center;
     gap: 5px;
@@ -253,7 +251,7 @@
      left of each slot, output (green) on the right. Log scale so a big
      spike doesn't flatten the smaller bars next to it. */
   .thr-row {
-    grid-column: 2 / -1;
+    grid-column: 1 / -1;
     display: flex;
     align-items: center;
     gap: 6px;
@@ -1063,6 +1061,23 @@ function colorForId(id) {
   let h = 0;
   for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) | 0;
   return 'hsl(' + (((h % 360) + 360) % 360) + ', 70%, 62%)';
+}
+// Deterministic low-opacity tint sharing the same hue as colorForId, for
+// session-group backgrounds. Shaped to read as "subtle identity" rather
+// than a foreground colour fill.
+function bgColorForId(id) {
+  if (!id) return 'transparent';
+  let h = 0;
+  for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) | 0;
+  const hue = ((h % 360) + 360) % 360;
+  return 'hsla(' + hue + ', 50%, 50%, 0.10)';
+}
+function accentColorForId(id) {
+  if (!id) return 'transparent';
+  let h = 0;
+  for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) | 0;
+  const hue = ((h % 360) + 360) % 360;
+  return 'hsla(' + hue + ', 60%, 60%, 0.7)';
 }
 // Split an identifier into a bright head and a dim tail for the Vue templates,
 // so each segment can be rendered with its own class without v-html. When the
@@ -1908,7 +1923,12 @@ function ensureKeysApp() {
             }))
           : [];
       },
-      sessionDotStyle() { return { '--dot': colorForId(this.session.sessionId) }; },
+      sessionGroupStyle() {
+        return {
+          '--session-bg': bgColorForId(this.session.sessionId),
+          '--session-accent': accentColorForId(this.session.sessionId),
+        };
+      },
       idHead() { return idHead(this.session.sessionId, 8, 4); },
       idTailText() { return idTail(this.session.sessionId, 8, 4); },
       // For single-conv sessions there's no separate sub-row — the session
@@ -1921,7 +1941,6 @@ function ensureKeysApp() {
       },
     },
     methods: {
-      convDotStyle(c) { return { '--dot': c.hash ? colorForId(c.hash) : 'var(--text-dim)' }; },
       convIdHead(c) { return idHead(c.hash || '(no hash)', 8, 8); },
       convIdTail(c) { return idTail(c.hash || '(no hash)', 8, 8); },
       ageTitle(iso) { return iso ? 'First seen ' + iso : ''; },
@@ -1931,8 +1950,7 @@ function ensureKeysApp() {
       fmtNum: fmtNum,
     },
     template: `
-      <div class="session-group">
-        <span class="cell-dot" :style="sessionDotStyle"><span class="dot"></span></span>
+      <div class="session-group" :style="sessionGroupStyle">
         <span class="cell-id" :title="session.sessionId">{{ idHead }}<span v-if="idTailText" class="id-tail">{{ idTailText }}</span></span>
         <span class="cell-right">
           <span v-if="hasMultipleConvs" class="session-count">×{{ convs.length }}</span>
@@ -1947,7 +1965,6 @@ function ensureKeysApp() {
         </span>
         <throughput-chart v-if="!hasMultipleConvs" :conv-key="singleConvKey"></throughput-chart>
         <template v-for="c in convsToRender" :key="c.vueKey">
-          <span class="cell-dot cell-dot--conv" :style="convDotStyle(c)"><span class="dot"></span></span>
           <span class="cell-hash" :title="c.hash || '(no hash)'">{{ convIdHead(c) }}<span class="id-tail">{{ convIdTail(c) }}</span></span>
           <span class="cell-right">
             <span :title="ageTitle(c.firstSeenAt)">{{ fmtAge(c.firstSeenAt) }}</span>
