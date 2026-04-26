@@ -14,15 +14,17 @@ describe("computeFirstMessageHash", () => {
     expect(computeFirstMessageHash(null, "/v1/messages")).toBeNull();
   });
 
-  test("returns null when path is not under /v1/messages", () => {
+  test("returns null when path is not /v1/messages", () => {
     const body = bodyOf({ messages: [{ role: "user", content: "hi" }] });
     expect(computeFirstMessageHash(body, "/v1/complete")).toBeNull();
   });
 
-  test("matches /v1/messages and its sub-paths (e.g. count_tokens)", () => {
+  test("matches only the exact /v1/messages path — sibling paths like count_tokens are skipped", () => {
     const body = bodyOf({ messages: [{ role: "user", content: "hi" }] });
     expect(computeFirstMessageHash(body, "/v1/messages")).not.toBeNull();
-    expect(computeFirstMessageHash(body, "/v1/messages/count_tokens")).not.toBeNull();
+    // count_tokens is a non-streaming probe — no real throughput, no pin.
+    expect(computeFirstMessageHash(body, "/v1/messages/count_tokens")).toBeNull();
+    expect(computeFirstMessageHash(body, "/v1/messages/")).toBeNull();
   });
 
   test("returns null for unparseable body", () => {

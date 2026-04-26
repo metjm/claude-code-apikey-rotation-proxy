@@ -8,7 +8,11 @@ export function computeFirstMessageHash(
   path: string,
 ): string | null {
   if (body === null) return null;
-  if (!path.startsWith("/v1/messages")) return null;
+  // Only the exact /v1/messages endpoint represents a real conversation
+  // turn. Sibling paths like /v1/messages/count_tokens are non-streaming
+  // probes that share `messages[0]` with the real call but produce no
+  // throughput — pinning them creates phantom 0/0 rows on the dashboard.
+  if (path !== "/v1/messages") return null;
 
   let parsed: unknown;
   try {
