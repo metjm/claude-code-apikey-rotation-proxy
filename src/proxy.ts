@@ -515,6 +515,7 @@ export async function proxyRequest(
         schemaTracker,
         url.pathname,
         traceId,
+        sessionId,
       );
       markActiveRequestWaitingForFirstChunk(traceId);
       const waitContext = buildActiveRequestContext(traceId, Date.now());
@@ -618,7 +619,7 @@ export async function proxyRequest(
       );
     } else if (upstream.body !== null) {
       const text = await upstream.text();
-      extractTokensFromJson(text, entry, keyManager, proxyUser);
+      extractTokensFromJson(text, entry, keyManager, proxyUser, sessionId);
       const bodyChanges = schemaTracker.recordResponseJson(url.pathname, text);
       if (bodyChanges.length > 0) {
         emitWithKeys({
@@ -1628,7 +1629,8 @@ function extractTokensFromJson(
   text: string,
   entry: import("./types.ts").ApiKeyEntry,
   keyManager: KeyManager,
-  proxyUser?: ProxyTokenEntry | null,
+  proxyUser: ProxyTokenEntry | null | undefined,
+  sessionId: string | null,
 ): void {
   try {
     const parsed = JSON.parse(text) as AnthropicResponse;
@@ -1642,7 +1644,7 @@ function extractTokensFromJson(
       log("info", "Token usage", { label: entry.label, user: proxyUser?.label, input, output, cacheRead, cacheCreation });
       emitWithKeys({
         type: "tokens", ts: new Date().toISOString(), label: entry.label,
-        user: proxyUser?.label, input, output,
+        user: proxyUser?.label, sessionId, input, output, cacheRead, cacheCreation,
       }, keyManager.listKeys());
     }
   } catch {
@@ -1658,6 +1660,7 @@ function createTokenTrackingObserver(
   schemaTracker: SchemaTracker,
   endpoint: string,
   traceId: string,
+  sessionId: string | null,
 ): StreamObserver {
   const decoder = new TextDecoder();
   let buffer = "";
@@ -1665,8 +1668,42 @@ function createTokenTrackingObserver(
   let outputTokens = 0;
   let cacheReadTokens = 0;
   let cacheCreationTokens = 0;
+  let inputReported = 0;
+  let outputReported = 0;
+  let cacheReadReported = 0;
+  let cacheCreationReported = 0;
+  let throttleTimer: ReturnType<typeof setTimeout> | null = null;
   let finalized = false;
   registerActiveStream(traceId, entry.label, proxyUser?.label, endpoint);
+
+  // Emits the delta between cumulative counts and what's already been
+  // reported, so the dashboard can plot per-session throughput bars without
+  // double-counting. Throttled by scheduleEmit() so message_delta bursts
+  // collapse into one SSE event per ~250ms.
+  function emitDelta(): void {
+    const inDelta = inputTokens - inputReported;
+    const outDelta = outputTokens - outputReported;
+    const crDelta = cacheReadTokens - cacheReadReported;
+    const ccDelta = cacheCreationTokens - cacheCreationReported;
+    if (inDelta === 0 && outDelta === 0 && crDelta === 0 && ccDelta === 0) return;
+    inputReported = inputTokens;
+    outputReported = outputTokens;
+    cacheReadReported = cacheReadTokens;
+    cacheCreationReported = cacheCreationTokens;
+    emitWithKeys({
+      type: "tokens", ts: new Date().toISOString(), label: entry.label,
+      user: proxyUser?.label, sessionId,
+      input: inDelta, output: outDelta, cacheRead: crDelta, cacheCreation: ccDelta,
+      partial: true,
+    }, keyManager.listKeys());
+  }
+  function scheduleEmit(): void {
+    if (throttleTimer !== null) return;
+    throttleTimer = setTimeout(() => {
+      throttleTimer = null;
+      if (!finalized) emitDelta();
+    }, 250);
+  }
 
   function observeChunk(chunk: Uint8Array): void {
     if (finalized) return;
@@ -1688,9 +1725,11 @@ function createTokenTrackingObserver(
           inputTokens += event.message.usage.input_tokens ?? 0;
           cacheReadTokens += event.message.usage.cache_read_input_tokens ?? 0;
           cacheCreationTokens += event.message.usage.cache_creation_input_tokens ?? 0;
+          scheduleEmit();
         }
         if (event.type === "message_delta" && event.usage) {
           outputTokens += event.usage.output_tokens ?? 0;
+          scheduleEmit();
         }
 
         const eventChanges = schemaTracker.recordStreamEvent(endpoint, event.type ?? "unknown", event);
@@ -1710,6 +1749,7 @@ function createTokenTrackingObserver(
     if (finalized) return;
     finalized = true;
     buffer = "";
+    if (throttleTimer !== null) { clearTimeout(throttleTimer); throttleTimer = null; }
     closeActiveStream(traceId, inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens);
     clearActiveRequest(traceId);
     keyManager.recordSuccess(entry, inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens);
@@ -1723,18 +1763,15 @@ function createTokenTrackingObserver(
         cacheRead: cacheReadTokens,
         cacheCreation: cacheCreationTokens,
       });
-      emitWithKeys({
-        type: "tokens", ts: new Date().toISOString(), label: entry.label,
-        user: proxyUser?.label, input: inputTokens, output: outputTokens,
-        cacheRead: cacheReadTokens, cacheCreation: cacheCreationTokens,
-      }, keyManager.listKeys());
     }
+    emitDelta();
   }
 
   function abandon(reason: string): void {
     if (finalized) return;
     finalized = true;
     buffer = "";
+    if (throttleTimer !== null) { clearTimeout(throttleTimer); throttleTimer = null; }
     abandonActiveStream(traceId, reason, inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens);
     clearActiveRequest(traceId);
   }

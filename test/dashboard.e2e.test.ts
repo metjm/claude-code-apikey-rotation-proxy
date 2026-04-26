@@ -8,6 +8,7 @@ import { KeyManager } from "../src/key-manager.ts";
 import { SchemaTracker } from "../src/schema-tracker.ts";
 import { handleAdminRoute } from "../src/admin.ts";
 import { proxyRequest } from "../src/proxy.ts";
+import { emitWithKeys } from "../src/events.ts";
 import type { ApiKeyEntry, ProxyConfig, ProxyTokenEntry } from "../src/types.ts";
 import { unixMs } from "../src/types.ts";
 
@@ -550,4 +551,101 @@ describe("Dashboard sessions cell (Vue render)", () => {
       cleanupTempDir(dataDir);
     }
   });
+
+  test("renders a per-session live throughput chart that updates as tokens arrive", async () => {
+    const dataDir = makeTempDir();
+    const upstream = startMockUpstream();
+    const proxy = startProxy({ dataDir, upstream: upstream.url, adminToken: ADMIN_TOKEN });
+
+    try {
+      proxy.km.addKey(VALID_KEY_1, "key-a");
+      const sessionId = "30000000-0000-0000-0000-000000000003";
+      proxy.km.getKeyForConversation(`till@trainly:${sessionId}:hash-feedabe1`, sessionId);
+
+      const page = await openDashboard(browser, proxy.url, ADMIN_TOKEN);
+      await page.waitForSelector(".session-group .thr-canvas", { timeout: 15_000 });
+
+      // Push token events through the real events bus — the dashboard's SSE
+      // subscribes to the same bus, so this exercises the same path a live
+      // proxy would. Two events: an "incoming" burst (input + cache_read) and
+      // an "outgoing" burst.
+      emitWithKeys(
+        {
+          type: "tokens",
+          ts: new Date().toISOString(),
+          label: "key-a",
+          sessionId,
+          input: 800,
+          output: 0,
+          cacheRead: 200,
+          cacheCreation: 0,
+          partial: true,
+        },
+        proxy.km.listKeys(),
+      );
+      emitWithKeys(
+        {
+          type: "tokens",
+          ts: new Date().toISOString(),
+          label: "key-a",
+          sessionId,
+          input: 0,
+          output: 350,
+          cacheRead: 0,
+          cacheCreation: 0,
+          partial: true,
+        },
+        proxy.km.listKeys(),
+      );
+
+      // Wait for the chart's legend to reflect the totals (1.0k incoming /
+      // 350 outgoing). The fmtNum helper renders >=1000 as "1.0k".
+      await page.waitForFunction(
+        (sid: string) => {
+          const group = [...document.querySelectorAll(".session-group")].find(
+            (el) => el.querySelector(".cell-id")?.getAttribute("title") === sid,
+          );
+          if (!group) return false;
+          const inEl = group.querySelector(".thr-in") as HTMLElement | null;
+          const outEl = group.querySelector(".thr-out") as HTMLElement | null;
+          if (!inEl || !outEl) return false;
+          return inEl.textContent?.includes("1.0k") === true
+            && outEl.textContent?.includes("350") === true;
+        },
+        { timeout: 5_000 },
+        sessionId,
+      );
+
+      // Canvas pixel sanity: we drew something — check it's not all transparent
+      // and that both blue (input) and green (output) pixels are present.
+      const pixelStats = await page.$eval(
+        ".session-group .thr-canvas",
+        (canvas) => {
+          const ctx = (canvas as HTMLCanvasElement).getContext("2d")!;
+          const { width, height } = canvas as HTMLCanvasElement;
+          const data = ctx.getImageData(0, 0, width, height).data;
+          let blue = 0, green = 0, opaque = 0;
+          for (let i = 0; i < data.length; i += 4) {
+            const r = data[i], g = data[i + 1], b = data[i + 2], a = data[i + 3];
+            if (a === 0) continue;
+            opaque++;
+            // Anthropic-blue ≈ #58a6ff (88,166,255) — high blue, lower red.
+            if (b > 200 && r < 130) blue++;
+            // Green ≈ #3fb950 (63,185,80) — high green, lower others.
+            if (g > 150 && r < 100 && b < 120) green++;
+          }
+          return { blue, green, opaque };
+        },
+      );
+      expect(pixelStats.opaque).toBeGreaterThan(0);
+      expect(pixelStats.blue).toBeGreaterThan(0);
+      expect(pixelStats.green).toBeGreaterThan(0);
+
+      await page.close();
+    } finally {
+      proxy.stop();
+      upstream.stop();
+      cleanupTempDir(dataDir);
+    }
+  }, 60_000);
 });

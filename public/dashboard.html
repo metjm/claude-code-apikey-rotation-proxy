@@ -248,6 +248,61 @@
     background: rgba(88,166,255,0.13);
     color: var(--blue);
   }
+  /* Per-session live throughput chart. 150px wide canvas with input bars
+     (blue) growing up from the centre baseline and output bars (green)
+     growing down — sliding left at one bucket per second. */
+  .thr-row {
+    grid-column: 2 / -1;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+    margin-top: 2px;
+    color: var(--text-dim);
+    font-size: 9px;
+  }
+  .thr-canvas-wrap {
+    position: relative;
+    width: 150px;
+    height: 30px;
+    background: linear-gradient(180deg, rgba(88,166,255,0.04) 0%, rgba(88,166,255,0) 50%, rgba(63,185,80,0) 50%, rgba(63,185,80,0.04) 100%);
+    border-radius: 3px;
+    overflow: hidden;
+    flex: 0 0 auto;
+  }
+  .thr-canvas-wrap::after {
+    content: "";
+    position: absolute; left: 0; right: 0; top: 50%;
+    height: 1px;
+    background: rgba(139,148,158,0.18);
+    pointer-events: none;
+  }
+  .thr-canvas { display: block; width: 150px; height: 30px; }
+  .thr-meta {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-variant-numeric: tabular-nums;
+    color: var(--text-dim);
+    line-height: 1;
+    white-space: nowrap;
+  }
+  .thr-meta b { color: var(--text); font-weight: 600; }
+  .thr-in  { color: var(--blue); }
+  .thr-out { color: var(--green); }
+  .thr-idle { color: var(--text-dim); font-style: italic; }
+  .thr-pulse {
+    display: inline-block;
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--green);
+    box-shadow: 0 0 4px var(--green);
+    animation: thr-pulse 1.1s ease-out infinite;
+  }
+  @keyframes thr-pulse {
+    0%   { transform: scale(0.7); opacity: 1; }
+    70%  { transform: scale(1.4); opacity: 0; }
+    100% { transform: scale(1.4); opacity: 0; }
+  }
   .table-controls { display: flex; flex-direction: column; gap: 4px; align-items: flex-start; }
   .key-priority-select {
     min-width: 96px; background: var(--bg3); color: var(--text); border: 1px solid var(--border);
@@ -814,6 +869,36 @@ let colorIdx = 0;
 // restart. Shown as a "spill" indicator so operators can see whether
 // tier 2/3 keys are actually receiving traffic.
 let requestsByTier = {};
+
+// Per-session live throughput. throughputState.bySession[id] is an append-only
+// list of {ts,in,out} samples; the chart buckets them per-second. tick is
+// bumped every 250ms so charts redraw and slide left even while idle.
+const THROUGHPUT_WINDOW_MS = 30_000;
+const THROUGHPUT_RETAIN_MS = 60_000;
+const throughputState = Vue.reactive({ bySession: {}, tick: 0 });
+
+function recordThroughputDelta(sessionId, sample) {
+  if (!sessionId) return;
+  const arr = throughputState.bySession[sessionId] || (throughputState.bySession[sessionId] = []);
+  arr.push(sample);
+  if (arr.length > 2000) arr.splice(0, arr.length - 2000);
+}
+
+function startThroughputTicker() {
+  if (window.__throughputTickerStarted) return;
+  window.__throughputTickerStarted = true;
+  setInterval(() => {
+    const cutoff = Date.now() - THROUGHPUT_RETAIN_MS;
+    for (const id of Object.keys(throughputState.bySession)) {
+      const arr = throughputState.bySession[id];
+      let drop = 0;
+      while (drop < arr.length && arr[drop].ts < cutoff) drop++;
+      if (drop > 0) arr.splice(0, drop);
+      if (arr.length === 0) delete throughputState.bySession[id];
+    }
+    throughputState.tick = (throughputState.tick + 1) & 0xffff;
+  }, 250);
+}
 
 // Demo mode: ?pace-demo=1 overlays a synthetic fixture covering every tone
 // bucket and reset-soon case. Used for visual QA of the pace viz without
@@ -1632,8 +1717,130 @@ let keysVm = null;
 function ensureKeysApp() {
   if (keysVm) return keysVm;
 
+  // Per-session live throughput. Input grows up (blue), output grows down
+  // (green); bars step left every second. Width 150px matches the request.
+  const ThroughputChartComponent = {
+    props: {
+      sessionId: { type: String, required: true },
+    },
+    computed: {
+      buckets() {
+        // Read tick so every periodic pruning pass invalidates this computed
+        // — that's what keeps the chart sliding when the session is idle.
+        // eslint-disable-next-line no-unused-expressions
+        throughputState.tick;
+        const samples = throughputState.bySession[this.sessionId] || [];
+        const BUCKET_MS = 1000;
+        const N = THROUGHPUT_WINDOW_MS / BUCKET_MS;
+        const buckets = new Array(N);
+        for (let i = 0; i < N; i++) buckets[i] = { in: 0, out: 0 };
+        const now = Date.now();
+        for (let i = 0; i < samples.length; i++) {
+          const s = samples[i];
+          const offset = Math.floor((now - s.ts) / BUCKET_MS);
+          if (offset < 0 || offset >= N) continue;
+          const idx = N - 1 - offset;
+          buckets[idx].in += s.in || 0;
+          buckets[idx].out += s.out || 0;
+        }
+        return buckets;
+      },
+      windowTotals() {
+        const buckets = this.buckets;
+        let sIn = 0, sOut = 0;
+        for (let i = 0; i < buckets.length; i++) {
+          sIn += buckets[i].in;
+          sOut += buckets[i].out;
+        }
+        return { in: sIn, out: sOut };
+      },
+      isLive() {
+        // eslint-disable-next-line no-unused-expressions
+        throughputState.tick;
+        const arr = throughputState.bySession[this.sessionId] || [];
+        if (arr.length === 0) return false;
+        return (Date.now() - arr[arr.length - 1].ts) < 3500;
+      },
+    },
+    watch: {
+      buckets() { this.$nextTick(() => this.draw()); },
+    },
+    mounted() { this.draw(); },
+    methods: {
+      draw() {
+        const canvas = this.$refs.canvas;
+        if (!canvas) return;
+        const cssW = 150, cssH = 30;
+        const dpr = window.devicePixelRatio || 1;
+        if (canvas.width !== cssW * dpr || canvas.height !== cssH * dpr) {
+          canvas.width = cssW * dpr;
+          canvas.height = cssH * dpr;
+        }
+        const ctx = canvas.getContext('2d');
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.clearRect(0, 0, cssW, cssH);
+
+        const buckets = this.buckets;
+        const N = buckets.length;
+        const slot = cssW / N;
+        const gap = 1;
+        const barW = Math.max(1, slot - gap);
+
+        // Smoothed peak: a single spike doesn't permanently squash later
+        // bars; a sustained drop lets the y-scale relax over a few seconds.
+        let cur = 0;
+        for (let i = 0; i < N; i++) {
+          if (buckets[i].in  > cur) cur = buckets[i].in;
+          if (buckets[i].out > cur) cur = buckets[i].out;
+        }
+        const decay = 0.92;
+        this.peak = Math.max(cur, this.peak * decay);
+        const scale = this.peak > 0 ? this.peak : 1;
+
+        const mid = cssH / 2;
+        const halfH = mid - 1;
+
+        for (let i = 0; i < N; i++) {
+          const x = Math.floor(i * slot) + 0.5;
+          const inV = buckets[i].in;
+          const outV = buckets[i].out;
+          if (inV > 0) {
+            const h = Math.max(1, Math.round((inV / scale) * halfH));
+            ctx.fillStyle = '#58a6ff';
+            ctx.fillRect(x, mid - h, barW, h);
+          }
+          if (outV > 0) {
+            const h = Math.max(1, Math.round((outV / scale) * halfH));
+            ctx.fillStyle = '#3fb950';
+            ctx.fillRect(x, mid, barW, h);
+          }
+        }
+      },
+    },
+    template: `
+      <div class="thr-row" :title="'Live token throughput for this session — last ' + (THROUGHPUT_WINDOW_MS/1000) + 's. Blue = incoming (input + cache), green = outgoing.'">
+        <div class="thr-canvas-wrap">
+          <canvas class="thr-canvas" ref="canvas" width="150" height="30"></canvas>
+        </div>
+        <span class="thr-meta">
+          <span class="thr-pulse" v-if="isLive"></span>
+          <span class="thr-in"><b>{{ fmtNum(windowTotals.in) }}</b>↓</span>
+          <span class="thr-out"><b>{{ fmtNum(windowTotals.out) }}</b>↑</span>
+        </span>
+      </div>
+    `,
+    data() {
+      return {
+        peak: 0,
+        THROUGHPUT_WINDOW_MS: THROUGHPUT_WINDOW_MS,
+        fmtNum: fmtNum,
+      };
+    },
+  };
+
   const SessionGroupComponent = {
     props: { session: { type: Object, required: true } },
+    components: { 'throughput-chart': ThroughputChartComponent },
     computed: {
       convs() {
         return Array.isArray(this.session.conversations) ? this.session.conversations : [];
@@ -1680,6 +1887,7 @@ function ensureKeysApp() {
           <span class="cell-sep">·</span>
           <span title="Routing decisions on this key in last 15m"><b>{{ fmtNum(session.totalRequests || 0) }}</b> req</span>
         </span>
+        <throughput-chart :session-id="session.sessionId"></throughput-chart>
         <template v-for="c in convsToRender" :key="c.vueKey">
           <span class="cell-dot cell-dot--conv" :style="convDotStyle(c)"><span class="dot"></span></span>
           <span class="cell-hash" :title="c.hash || '(no hash)'">{{ convIdHead(c) }}<span class="id-tail">{{ convIdTail(c) }}</span></span>
@@ -1852,7 +2060,7 @@ function ensureKeysApp() {
           </div>
         </td>
         <td>
-          <sessions-cell :sessions="k.recentSessions15m"></sessions-cell>
+          <sessions-cell :sessions="k.recentSessions"></sessions-cell>
         </td>
         <td>
           <div class="table-controls">
@@ -2107,6 +2315,16 @@ function connectSSE() {
       }
       if (event.currentBucket) {
         updateChartLastBucket(event.currentBucket);
+      }
+      // Streaming: backend emits ~250ms-throttled deltas during the response.
+      // Non-streaming: one cumulative event at request completion. Both are
+      // additive into the per-second buckets the chart renders.
+      if (event.type === 'tokens' && event.sessionId) {
+        const incoming = (event.input || 0) + (event.cacheRead || 0) + (event.cacheCreation || 0);
+        const outgoing = event.output || 0;
+        if (incoming > 0 || outgoing > 0) {
+          recordThroughputDelta(event.sessionId, { ts: Date.now(), in: incoming, out: outgoing });
+        }
       }
       // Log non-heartbeat events
       if (event.type !== 'keys') {
@@ -2753,6 +2971,7 @@ let chartsRefreshInterval = null;
 let forecastRefreshInterval = null;
 function init() {
   connectSSE();
+  startThroughputTicker();
   refreshKeys();
   refreshTokens();
   loadCharts();

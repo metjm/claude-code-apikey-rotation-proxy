@@ -927,6 +927,56 @@ describe("Token Tracking - Non-Streaming", () => {
     expect(tokenEvents[0]!.input).toBe(10);
     expect(tokenEvents[0]!.output).toBe(20);
   });
+
+  test("tokens event carries sessionId from request header (non-streaming)", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    const mock = upstream(() =>
+      new Response(
+        JSON.stringify({ usage: { input_tokens: 11, output_tokens: 22 } }),
+        { headers: { "content-type": "application/json" } },
+      ),
+    );
+
+    const config = makeConfig(mock.url);
+    const [, events] = await collectEvents(() =>
+      proxyRequest(
+        makeRequest("/v1/messages", {
+          method: "POST",
+          headers: { "x-claude-code-session-id": "sess-abc" },
+        }),
+        km,
+        config,
+        st,
+      ),
+    );
+
+    const tokenEvents = events.filter((e) => e.type === "tokens");
+    expect(tokenEvents.length).toBe(1);
+    expect(tokenEvents[0]!.sessionId).toBe("sess-abc");
+  });
+
+  test("tokens event has null sessionId when no session header is present", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    const mock = upstream(() =>
+      new Response(
+        JSON.stringify({ usage: { input_tokens: 1, output_tokens: 2 } }),
+        { headers: { "content-type": "application/json" } },
+      ),
+    );
+
+    const config = makeConfig(mock.url);
+    const [, events] = await collectEvents(() =>
+      proxyRequest(makeRequest("/v1/messages"), km, config, st),
+    );
+
+    const tokenEvents = events.filter((e) => e.type === "tokens");
+    expect(tokenEvents.length).toBe(1);
+    expect(tokenEvents[0]!.sessionId).toBe(null);
+  });
 });
 
 // ────────────────────────────────────────────────────────────────────
@@ -2423,6 +2473,64 @@ describe("Edge Cases", () => {
     expect(tokenEvents[0]!.input).toBe(50);
     expect(tokenEvents[0]!.output).toBe(25);
     expect(tokenEvents[0]!.user).toBe("alice");
+  });
+
+  test("streaming tokens event carries sessionId so the dashboard can route the throughput chart", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    const sseData = [
+      'data: {"type":"message_start","message":{"usage":{"input_tokens":5}}}\n\n',
+      'data: {"type":"message_delta","usage":{"output_tokens":7}}\n\n',
+    ];
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream({
+      start(controller) {
+        for (const chunk of sseData) {
+          controller.enqueue(encoder.encode(chunk));
+        }
+        controller.close();
+      },
+    });
+
+    const mock = upstream(() =>
+      new Response(stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }),
+    );
+
+    const config = makeConfig(mock.url);
+    const events: ProxyEvent[] = [];
+    const unsub = subscribe((e) => events.push(e));
+
+    const result = await proxyRequest(
+      makeRequest("/v1/messages", {
+        method: "POST",
+        headers: { "x-claude-code-session-id": "sess-stream-1" },
+      }),
+      km,
+      config,
+      st,
+    );
+    expect(result.kind).toBe("success");
+    if (result.kind === "success") {
+      await result.response.text();
+    }
+    unsub();
+
+    const tokenEvents = events.filter((e) => e.type === "tokens");
+    expect(tokenEvents.length).toBeGreaterThan(0);
+    for (const ev of tokenEvents) {
+      expect(ev.sessionId).toBe("sess-stream-1");
+    }
+    // Deltas across all emitted token events must equal the cumulative
+    // counts the upstream advertised — i.e. exactly one bar's worth of
+    // input + output reaches the dashboard, no double counting.
+    const totalInput = tokenEvents.reduce((s, ev) => s + ((ev.input as number) || 0), 0);
+    const totalOutput = tokenEvents.reduce((s, ev) => s + ((ev.output as number) || 0), 0);
+    expect(totalInput).toBe(5);
+    expect(totalOutput).toBe(7);
   });
 
   test("properly increments totalRequests on key for each attempt", async () => {
