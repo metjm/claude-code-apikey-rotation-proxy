@@ -326,10 +326,10 @@ describe("Capacity admin payloads", () => {
 
       const res = await handleAdminRoute(makeReq("GET", "/admin/stats"), km, makeConfig(), st);
       const body = await jsonBody(res!) as {
-        keys: Array<{ label: string; recentSessions15m: Array<{ sessionId: string }> }>;
+        keys: Array<{ label: string; recentSessions: Array<{ sessionId: string }> }>;
       };
 
-      const keyed = new Map(body.keys.map((key) => [String(key.label), key.recentSessions15m.map((session) => session.sessionId).sort()]));
+      const keyed = new Map(body.keys.map((key) => [String(key.label), key.recentSessions.map((session) => session.sessionId).sort()]));
       expect(keyed.get("cap-admin-a")).toEqual(["session-a", "session-b", "session-c"]);
       expect(keyed.get("cap-admin-b")).toEqual(["session-d"]);
     } finally {

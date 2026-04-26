@@ -652,7 +652,7 @@ describe("events", () => {
           priority: 2,
           allowedDays: [0, 1, 2, 3, 4, 5, 6],
           recentErrors: 0,
-          recentSessions15m: [],
+          recentSessions: [],
         },
       ];
 

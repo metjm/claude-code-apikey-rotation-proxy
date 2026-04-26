@@ -142,7 +142,7 @@ function makeCapacityKey(
     },
     capacityHealth: "healthy" as const,
     recentErrors: 0,
-    recentSessions15m: [],
+    recentSessions: [],
   };
 }
 

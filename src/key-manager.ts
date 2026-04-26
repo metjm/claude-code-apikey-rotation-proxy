@@ -270,6 +270,7 @@ function parseBucketToSlot(bucket: string): { dow: number; hour: number } | null
 
 const CONVERSATION_AFFINITY_TTL_MS = 60 * 60 * 1000;
 const RECENT_SESSION_WINDOW_MS = 15 * 60 * 1000;
+const DASHBOARD_RECENT_SESSION_WINDOW_MS = 2 * 60 * 1000;
 const PRIMARY_CAPACITY_WINDOW_NAMES = new Set(["unified", "unified-5h", "unified-7d"]);
 
 // Sentinel priority for keys the user has paused. Disabled keys are retained
@@ -1228,7 +1229,7 @@ export class KeyManager {
     const currentDay = new Date().getDay();
     const recentErrs = this.recentErrorsByDimension("key_label", "user_label", "__all__");
     const recentSessionsByKey = this.listRecentConversationSessionsByKey(
-      unixMs(Date.now() - RECENT_SESSION_WINDOW_MS),
+      unixMs(Date.now() - DASHBOARD_RECENT_SESSION_WINDOW_MS),
     );
     return this.keys.map(
       (k): MaskedKeyEntry => ({
@@ -1248,7 +1249,7 @@ export class KeyManager {
         priority: k.priority,
         allowedDays: k.allowedDays,
         recentErrors: recentErrs.get(k.label) ?? 0,
-        recentSessions15m: recentSessionsByKey.get(k.key) ?? [],
+        recentSessions: recentSessionsByKey.get(k.key) ?? [],
       })
     );
   }

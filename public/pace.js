@@ -538,7 +538,7 @@
         },
         capacityHealth: 'healthy',
         recentErrors: 0,
-        recentSessions15m: [],
+        recentSessions: [],
       };
     }
     function win(name, util, resetIn) {

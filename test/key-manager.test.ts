@@ -333,7 +333,7 @@ describe("Key CRUD", () => {
     );
     expect(entry.label).toBe("label-a");
     expect(entry.stats.totalRequests).toBe(0);
-    expect(entry.recentSessions15m).toEqual([]);
+    expect(entry.recentSessions).toEqual([]);
   });
 
   test("listKeys() groups multiple conversations under one session-id and exposes their hashes", () => {
@@ -348,7 +348,7 @@ describe("Key CRUD", () => {
     km.getKeyForConversation("user-1:session-y", "session-y");
 
     const entry = km.listKeys().find((k) => k.label === "a")!;
-    const sessions = entry.recentSessions15m;
+    const sessions = entry.recentSessions;
     const xs = sessions.find((s) => s.sessionId === "session-x");
     const ys = sessions.find((s) => s.sessionId === "session-y");
 
@@ -373,7 +373,7 @@ describe("Key CRUD", () => {
     expect(ys!.actor).toBe("user-1");
   });
 
-  test("listKeys() tracks recent sessions active in the last 15 minutes", () => {
+  test("listKeys() tracks recent sessions active in the last 2 minutes", () => {
     const km = create();
     const originalNow = Date.now;
     let fakeNow = 1_000_000;
@@ -390,18 +390,18 @@ describe("Key CRUD", () => {
       expect(km.getKeyForConversation("user-1:session-d", "session-d").entry?.key).toBe(VALID_KEY_2);
 
       let keys = km.listKeys().sort((a, b) => String(a.label).localeCompare(String(b.label)));
-      expect(keys.map((key) => key.recentSessions15m.map((session) => session.sessionId).sort())).toEqual([
+      expect(keys.map((key) => key.recentSessions.map((session) => session.sessionId).sort())).toEqual([
         ["session-a", "session-b", "session-c"],
         ["session-d"],
       ]);
 
-      fakeNow += 16 * 60 * 1000;
+      fakeNow += 3 * 60 * 1000;
       keys = km.listKeys().sort((a, b) => String(a.label).localeCompare(String(b.label)));
-      expect(keys.map((key) => key.recentSessions15m)).toEqual([[], []]);
+      expect(keys.map((key) => key.recentSessions)).toEqual([[], []]);
 
       expect(km.getKeyForConversation("user-1:session-a", "session-a").entry?.key).toBe(VALID_KEY_1);
       keys = km.listKeys().sort((a, b) => String(a.label).localeCompare(String(b.label)));
-      expect(keys.map((key) => key.recentSessions15m.map((session) => session.sessionId))).toEqual([
+      expect(keys.map((key) => key.recentSessions.map((session) => session.sessionId))).toEqual([
         ["session-a"],
         [],
       ]);
