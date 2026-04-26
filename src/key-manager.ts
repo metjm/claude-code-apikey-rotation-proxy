@@ -341,9 +341,16 @@ export class KeyManager {
   // Not persisted — resets on restart. Serves as live observability for the
   // routing policy ("is traffic actually flowing through Normal/Fallback?").
   private readonly requestsByTier: Map<number, number> = new Map();
+  // Drives the dashboard sessions filter only — has no effect on routing
+  // (which is decided by whatever conversationKey shape the proxy passes
+  // in). Set true when the proxy is in per-conversation pinning mode so
+  // the dashboard hides 2-part keys (count_tokens probes etc.); leave false
+  // for session-level pinning where every entry is 2-part and should show.
+  private perConversationPinning = false;
 
-  constructor(dataDir: string) {
+  constructor(dataDir: string, opts?: { perConversationPinning?: boolean }) {
     this.dbPath = process.env["DB_PATH"] ?? join(dataDir, "state.db");
+    this.perConversationPinning = opts?.perConversationPinning ?? false;
     mkdirSync(dirname(this.dbPath), { recursive: true });
 
     this.db = new Database(this.dbPath, { create: true });
@@ -1832,12 +1839,13 @@ export class KeyManager {
     const grouped = new Map<ApiKey, SessionGroup>();
     for (const affinity of this.conversationAffinities.values()) {
       if (affinity.lastSeenAt < cutoff) continue;
-      // Skip 2-part conversationKeys (no first-message hash). Those come
-      // from non-/v1/messages endpoints — count_tokens probes and other
-      // session-level traffic. They still pin to a key for routing, but
-      // they aren't real conversation turns and shouldn't clutter the
-      // sessions table with phantom 0/0-throughput rows.
-      if (extractFirstMessageHashFromConversationKey(affinity.conversationKey) === null) continue;
+      // In per-conversation pinning mode, skip 2-part conversationKeys
+      // (no first-message hash) — those come from non-/v1/messages
+      // endpoints (count_tokens probes etc.) and would clutter the table
+      // with phantom 0/0-throughput rows. In session-level mode every
+      // entry is 2-part and represents a real session, so keep them all.
+      if (this.perConversationPinning
+          && extractFirstMessageHashFromConversationKey(affinity.conversationKey) === null) continue;
       const sessionId = affinity.sessionId ?? affinity.conversationKey;
       const sessions = grouped.get(affinity.key) ?? new Map();
       const list = sessions.get(sessionId) ?? [];

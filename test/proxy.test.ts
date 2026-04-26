@@ -31,9 +31,12 @@ function createTestSchemaTracker(tmpDir: string): SchemaTracker {
   return new SchemaTracker(dbPath);
 }
 
-function createTestSetup(): TestSetup {
+function createTestSetup(opts?: { perConversationPinning?: boolean }): TestSetup {
   const tmpDir = mkdtempSync(join(tmpdir(), "proxy-test-"));
-  const km = new KeyManager(tmpDir);
+  // KeyManager mode mirrors makeConfig's default — see comment there.
+  const km = new KeyManager(tmpDir, {
+    perConversationPinning: opts?.perConversationPinning ?? true,
+  });
   const st = createTestSchemaTracker(tmpDir);
   return {
     km,
@@ -75,6 +78,10 @@ function makeConfig(upstream: string, overrides?: Partial<ProxyConfig>): ProxyCo
     streamIdleTimeoutMs: 120_000,
     maxFirstChunkRetries: 2,
     webhookUrl: null,
+    // Default test config exercises per-conversation pinning (the toggle-on
+    // case) since most existing tests assert hash-based routing of sub-agents.
+    // Tests for session-only default product behavior override this.
+    perConversationPinning: true,
     ...overrides,
   };
 }
@@ -123,8 +130,8 @@ afterEach(() => {
 });
 
 /** Convenience: create setup + track for cleanup. */
-function setup(): TestSetup {
-  const s = createTestSetup();
+function setup(opts?: { perConversationPinning?: boolean }): TestSetup {
+  const s = createTestSetup(opts);
   setups.push(s);
   return s;
 }
@@ -3449,6 +3456,49 @@ describe("Non-/v1/messages session traffic", () => {
     for (const k of km.listKeys()) {
       expect(k.recentSessions).toEqual([]);
     }
+  });
+
+  // Session-only pinning is the product default. Sub-agents within one
+  // session share a key (no hash-based split). Every session with affinity
+  // shows on the dashboard regardless of which path it used.
+  test("session-only mode (default): all calls in a session pin to one key, dashboard shows the session", async () => {
+    const { km, st } = setup({ perConversationPinning: false });
+    km.addKey(FAKE_KEY_A, "key-a");
+    km.addKey(FAKE_KEY_B, "key-b");
+
+    const seenKeys: string[] = [];
+    const mock = upstream((req) => {
+      seenKeys.push(req.headers.get("x-api-key") ?? "");
+      return new Response(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }), {
+        status: 200, headers: { "content-type": "application/json" },
+      });
+    });
+    const config = makeConfig(mock.url, { perConversationPinning: false });
+
+    async function send(path: string, content: string): Promise<void> {
+      const res = await proxyRequest(makeRequest(path, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-claude-code-session-id": "session-z" },
+        body: JSON.stringify({ messages: [{ role: "user", content }] }),
+      }), km, config, st);
+      expect(res.kind).toBe("success");
+    }
+
+    // Three different first messages — under per-conv mode they'd split
+    // across keys. Under session-only mode they all stick to the first.
+    await send("/v1/messages", "parent prompt");
+    await send("/v1/messages", "sub-agent A");
+    await send("/v1/messages", "sub-agent B");
+    await send("/v1/messages/count_tokens", "probe");
+
+    expect(new Set(seenKeys).size).toBe(1);
+
+    // Dashboard shows the session as one row (one 2-part affinity entry).
+    const recent = km.listKeys().flatMap((k) => k.recentSessions);
+    expect(recent.length).toBe(1);
+    expect(recent[0]!.sessionId).toBe("session-z");
+    expect(recent[0]!.conversations.length).toBe(1);
+    expect(recent[0]!.conversations[0]!.hash).toBeNull();
   });
 
   test("real /v1/messages turn on the same session does show on the dashboard", async () => {

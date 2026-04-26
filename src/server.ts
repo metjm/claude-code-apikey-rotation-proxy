@@ -78,7 +78,9 @@ Environment:
 
 function startServer(): void {
   const config = loadConfig();
-  const keyManager = new KeyManager(config.dataDir);
+  const keyManager = new KeyManager(config.dataDir, {
+    perConversationPinning: config.perConversationPinning,
+  });
   const schemaTracker = new SchemaTracker(keyManager.dbPath, config.webhookUrl);
 
   let shuttingDown = false;

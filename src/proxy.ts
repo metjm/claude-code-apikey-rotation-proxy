@@ -265,7 +265,15 @@ export async function proxyRequest(
     };
   }
   const requestBodyState = snapshotRequestBodyState(req, requestBody);
-  const firstMessageHash = computeFirstMessageHash(requestBody, url.pathname);
+  // With per-conversation pinning off (default) every call in a session
+  // shares one key — drop the message hash so buildConversationKey produces
+  // a session-only 2-part key. With it on, /v1/messages calls get the
+  // 3-part hashed form and sub-agents within a session can split across
+  // keys. Sibling endpoints (count_tokens, etc.) always get the 2-part
+  // form regardless of mode (computeFirstMessageHash returns null for them).
+  const firstMessageHash = config.perConversationPinning
+    ? computeFirstMessageHash(requestBody, url.pathname)
+    : null;
   const conversationKey = buildConversationKey(proxyUser, sessionId, firstMessageHash);
 
   let attempts = 0;

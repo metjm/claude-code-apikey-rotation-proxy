@@ -16,7 +16,9 @@ import { loadConfig } from "./config.ts";
 import { KeyManager } from "./key-manager.ts";
 
 const config = loadConfig();
-const keyManager = new KeyManager(config.dataDir);
+const keyManager = new KeyManager(config.dataDir, {
+  perConversationPinning: config.perConversationPinning,
+});
 
 const [command, ...args] = process.argv.slice(2);
 

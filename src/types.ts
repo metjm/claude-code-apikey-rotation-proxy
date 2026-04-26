@@ -227,6 +227,11 @@ export interface ProxyConfig {
   readonly streamIdleTimeoutMs: number;
   readonly maxFirstChunkRetries: number;
   readonly webhookUrl: string | null;
+  /** When true, /v1/messages calls within a session pin per-conversation (by
+   *  first-message hash) so sub-agents can land on different keys. When false
+   *  (the default), every call in a session shares one key — simpler,
+   *  matches pre-conversation-pinning behavior. */
+  readonly perConversationPinning: boolean;
 }
 
 // ── Timeseries statistics ────────────────────────────────────────

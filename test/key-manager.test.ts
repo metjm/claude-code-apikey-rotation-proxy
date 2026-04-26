@@ -61,9 +61,13 @@ afterEach(() => {
   }
 });
 
-/** Create a KeyManager for testing. */
-function create(dataDir?: string): KeyManager {
-  const manager = new KeyManager(dataDir ?? tempDir);
+/** Create a KeyManager for testing. Default to per-conversation pinning so
+ *  hash-suffix-bearing tests exercise the dashboard filter — tests for the
+ *  default session-only product behavior override via the opts arg. */
+function create(dataDir?: string, opts?: { perConversationPinning?: boolean }): KeyManager {
+  const manager = new KeyManager(dataDir ?? tempDir, {
+    perConversationPinning: opts?.perConversationPinning ?? true,
+  });
   managers.push(manager);
   return manager;
 }
