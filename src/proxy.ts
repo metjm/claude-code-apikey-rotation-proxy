@@ -1126,15 +1126,21 @@ function recordActiveStreamEvent(traceId: string): void {
   stream.eventCount++;
 }
 
+interface ClosedStreamTimings {
+  openedAt: number;
+  firstChunkAt: number | null;
+  endedAt: number;
+}
+
 function closeActiveStream(
   traceId: string,
   inputTokens: number,
   outputTokens: number,
   cacheReadTokens: number,
   cacheCreationTokens: number,
-): void {
+): ClosedStreamTimings | null {
   const stream = activeStreams.get(traceId);
-  if (!stream) return;
+  if (!stream) return null;
 
   const now = Date.now();
   activeStreams.delete(traceId);
@@ -1157,6 +1163,7 @@ function closeActiveStream(
     activeStreamsRemaining: activeStreams.size,
   });
   maybeLogActiveStreamSnapshot(now);
+  return { openedAt: stream.openedAt, firstChunkAt: stream.firstChunkAt, endedAt: now };
 }
 
 function abandonActiveStream(
@@ -1775,7 +1782,7 @@ function createTokenTrackingObserver(
     finalized = true;
     buffer = "";
     if (throttleTimer !== null) { clearTimeout(throttleTimer); throttleTimer = null; }
-    closeActiveStream(traceId, inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens);
+    const timings = closeActiveStream(traceId, inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens);
     clearActiveRequest(traceId);
     keyManager.recordSuccess(entry, inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens);
     if (proxyUser) keyManager.recordTokenSuccess(proxyUser, inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens);
@@ -1790,6 +1797,24 @@ function createTokenTrackingObserver(
       });
     }
     emitDelta();
+    // Per-request lifecycle for the dashboard latency overlay. Only fires for
+    // streamed /v1/messages turns — count_tokens and other non-streaming
+    // siblings take a different code path and don't pass through this finish.
+    if (timings !== null && sessionId !== null) {
+      emitWithKeys({
+        type: "request_done",
+        ts: new Date().toISOString(),
+        label: entry.label,
+        user: proxyUser?.label,
+        sessionId,
+        conversationHash,
+        path: endpoint,
+        startedAt: timings.openedAt,
+        firstChunkAt: timings.firstChunkAt,
+        endedAt: timings.endedAt,
+        output: outputTokens,
+      }, keyManager.listKeys());
+    }
   }
 
   function abandon(reason: string): void {

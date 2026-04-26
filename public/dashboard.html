@@ -281,8 +281,10 @@
     white-space: nowrap;
   }
   .thr-meta b { color: var(--text); font-weight: 600; }
-  .thr-in  { color: var(--blue); }
-  .thr-out { color: var(--green); }
+  .thr-in     { color: var(--blue); }
+  .thr-out    { color: var(--green); }
+  .thr-ttft   { color: var(--red); }
+  .thr-ms-tok { color: var(--yellow); }
   .thr-idle { color: var(--text-dim); font-style: italic; }
   .thr-pulse {
     display: inline-block;
@@ -876,6 +878,11 @@ const THROUGHPUT_WINDOW_MS = 30_000;
 const THROUGHPUT_RETAIN_MS = 60_000;
 const THROUGHPUT_PEAK_DECAY = 0.95;
 const throughputState = Vue.reactive({ byConv: {}, tick: 0, peakIn: 0, peakOut: 0 });
+// Per-request lifecycle (start, first chunk, end) used to overlay latency
+// lines on the chart and feed the avg-TTFT / ms-per-output-token legend.
+// Only /v1/messages streamed turns produce entries. Pruned by the same 1Hz
+// pass that prunes throughputState.byConv so the two stay in lockstep.
+const requestState = Vue.reactive({ byConv: {}, tick: 0 });
 
 function throughputConvKey(sessionId, conversationHash) {
   if (!sessionId) return null;
@@ -893,6 +900,14 @@ function recordThroughputDelta(sessionId, conversationHash, sample) {
   // ticker refines this with a properly bucketed scan plus EMA decay.
   if (sample.in  > throughputState.peakIn)  throughputState.peakIn  = sample.in;
   if (sample.out > throughputState.peakOut) throughputState.peakOut = sample.out;
+}
+
+function recordRequestDone(sessionId, conversationHash, entry) {
+  const key = throughputConvKey(sessionId, conversationHash);
+  if (!key) return;
+  const arr = requestState.byConv[key] || (requestState.byConv[key] = []);
+  arr.push(entry);
+  if (arr.length > 200) arr.splice(0, arr.length - 200);
 }
 
 function recomputeGlobalThroughputPeaks() {
@@ -944,6 +959,13 @@ function startThroughputTicker() {
       if (drop > 0) arr.splice(0, drop);
       if (arr.length === 0) delete throughputState.byConv[id];
     }
+    for (const id of Object.keys(requestState.byConv)) {
+      const arr = requestState.byConv[id];
+      let drop = 0;
+      while (drop < arr.length && arr[drop].endedAt < cutoff) drop++;
+      if (drop > 0) arr.splice(0, drop);
+      if (arr.length === 0) delete requestState.byConv[id];
+    }
     recomputeGlobalThroughputPeaks();
   }, 1000);
   // Smooth left-slide: bump the reactive tick on every animation frame so
@@ -951,6 +973,7 @@ function startThroughputTicker() {
   // when the tab is hidden, so we don't burn CPU off-screen.
   function frame() {
     throughputState.tick = (throughputState.tick + 1) & 0xffff;
+    requestState.tick = (requestState.tick + 1) & 0xffff;
     requestAnimationFrame(frame);
   }
   requestAnimationFrame(frame);
@@ -1837,6 +1860,33 @@ function ensureKeysApp() {
         if (arr.length === 0) return false;
         return (Date.now() - arr[arr.length - 1].ts) < 3500;
       },
+      // Mean time-to-first-token and mean ms per output token across recent
+      // /v1/messages requests on this conversation. Both are nullable when
+      // there's no data — template hides the chip rather than printing 0.
+      // ms-per-token uses (endedAt - firstChunkAt) so it reflects only the
+      // streaming phase, not the wait for the first chunk.
+      latencyStats() {
+        // eslint-disable-next-line no-unused-expressions
+        requestState.tick;
+        const arr = requestState.byConv[this.convKey] || [];
+        if (arr.length === 0) return { avgTtft: null, avgMsPerOutTok: null };
+        let ttftSum = 0, ttftCount = 0;
+        let outToks = 0, outTimeMs = 0;
+        for (const r of arr) {
+          if (r.firstChunkAt !== null && r.firstChunkAt !== undefined) {
+            ttftSum += r.firstChunkAt - r.startedAt;
+            ttftCount++;
+            if (r.output > 0 && r.endedAt > r.firstChunkAt) {
+              outToks += r.output;
+              outTimeMs += r.endedAt - r.firstChunkAt;
+            }
+          }
+        }
+        return {
+          avgTtft: ttftCount > 0 ? Math.round(ttftSum / ttftCount) : null,
+          avgMsPerOutTok: outToks > 0 ? Math.round(outTimeMs / outToks) : null,
+        };
+      },
     },
     watch: {
       buckets() { this.$nextTick(() => this.draw()); },
@@ -1863,7 +1913,11 @@ function ensureKeysApp() {
         // a 5px slot we lay out 2px in + 1px gap + 2px out = 5px exactly.
         const inBarW  = Math.max(1, Math.floor((slotW - 1) / 2));
         const outBarW = Math.max(1, Math.floor((slotW - 1) / 2));
-        const fullH = cssH - 1; // 1px headroom so bars don't kiss the top edge
+        // Top 6px of the canvas is the latency strip (one row for time-to-
+        // first-token in red, one for the full request span in yellow);
+        // bars draw from the bottom up to cssH - LATENCY_STRIP_H.
+        const LATENCY_STRIP_H = 6;
+        const fullH = cssH - LATENCY_STRIP_H - 1; // 1px headroom
 
         // Continuous left-slide. Bucketing rounds sample age down to whole
         // seconds, so without this every bar would sit still for ~1s and
@@ -1906,10 +1960,41 @@ function ensureKeysApp() {
             ctx.fillRect(slotX + inBarW + 1, cssH - h, outBarW, h);
           }
         }
+
+        // Latency strip: red row = time-to-first-token (start → first chunk),
+        // yellow row = full request duration (start → end). Stacked so a slow
+        // start with fast output reads as a long red prefix on a slightly
+        // longer yellow bar. Pixel positions come from the same now-relative
+        // mapping the bars use, so lines slide left in lockstep.
+        const requests = requestState.byConv[this.convKey] || [];
+        const nowMs = Date.now();
+        const winMs = THROUGHPUT_WINDOW_MS;
+        const TTFT_Y = 1;
+        const DUR_Y  = 4;
+        function tToX(t) { return cssW - ((nowMs - t) / winMs) * cssW; }
+        for (const r of requests) {
+          const sx = tToX(r.startedAt);
+          const ex = tToX(r.endedAt);
+          // Skip requests whose entire span is off the left edge.
+          if (ex < 0) continue;
+          // Yellow: full duration. Min 1px so a sub-30ms request stays visible.
+          ctx.fillStyle = '#d29922';
+          const yX1 = Math.max(0, sx);
+          const yX2 = Math.min(cssW, ex);
+          if (yX2 > yX1) ctx.fillRect(yX1, DUR_Y, Math.max(1, yX2 - yX1), 1);
+          // Red: TTFT prefix. Drawn after yellow so it stays crisp on overlap.
+          if (r.firstChunkAt !== null && r.firstChunkAt !== undefined) {
+            ctx.fillStyle = '#f85149';
+            const fx = tToX(r.firstChunkAt);
+            const rX1 = Math.max(0, sx);
+            const rX2 = Math.min(cssW, fx);
+            if (rX2 > rX1) ctx.fillRect(rX1, TTFT_Y, Math.max(1, rX2 - rX1), 1);
+          }
+        }
       },
     },
     template: `
-      <div class="thr-row" :title="'Live token throughput for this conversation — last ' + (THROUGHPUT_WINDOW_MS/1000) + 's. Blue = incoming (input + cache), green = outgoing — both grow up from the bottom. Log scale, normalized independently against the loudest input/output across all charts.'">
+      <div class="thr-row" :title="'Live token throughput for this conversation — last ' + (THROUGHPUT_WINDOW_MS/1000) + 's. Blue = incoming (input + cache), green = outgoing — both grow up from the bottom. Log scale, normalized independently against the loudest input/output across all charts. Top strip: red = time to first token, yellow = full request span.'">
         <div class="thr-canvas-wrap">
           <canvas class="thr-canvas" ref="canvas" width="150" height="30"></canvas>
         </div>
@@ -1917,6 +2002,8 @@ function ensureKeysApp() {
           <span class="thr-pulse" v-if="isLive"></span>
           <span class="thr-in"><b>{{ fmtNum(windowTotals.in) }}</b>↓</span>
           <span class="thr-out"><b>{{ fmtNum(windowTotals.out) }}</b>↑</span>
+          <span class="thr-ttft" v-if="latencyStats.avgTtft !== null" title="Average time to first token over recent requests"><b>{{ latencyStats.avgTtft }}</b>ms ttft</span>
+          <span class="thr-ms-tok" v-if="latencyStats.avgMsPerOutTok !== null" title="Average ms per output token (streaming phase only)"><b>{{ latencyStats.avgMsPerOutTok }}</b>ms/t</span>
         </span>
       </div>
     `,
@@ -2429,6 +2516,17 @@ function connectSSE() {
         if (incoming > 0 || outgoing > 0) {
           recordThroughputDelta(event.sessionId, event.conversationHash || null, { ts: Date.now(), in: incoming, out: outgoing });
         }
+      }
+      // Per-request lifecycle for the latency overlay. startedAt /
+      // firstChunkAt / endedAt come from the proxy as Date.now()-style
+      // numeric ms; we keep them numeric for fast subtraction at draw time.
+      if (event.type === 'request_done' && event.sessionId) {
+        recordRequestDone(event.sessionId, event.conversationHash || null, {
+          startedAt: event.startedAt,
+          firstChunkAt: event.firstChunkAt,
+          endedAt: event.endedAt,
+          output: event.output || 0,
+        });
       }
       // Log non-heartbeat events
       if (event.type !== 'keys') {
