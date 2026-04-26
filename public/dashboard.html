@@ -915,10 +915,33 @@ function recordThroughputDelta(sessionId, conversationHash, sample) {
   if (sample.out > throughputState.peakOut) throughputState.peakOut = sample.out;
 }
 
+// In-flight entries get pushed on request_first_chunk with endedAt = null and
+// updated in place when the matching request_done arrives (matched by traceId).
+// If a done event arrives without a prior first-chunk event (rare — empty
+// streams that finalize without ever calling observeChunk) we just push it
+// as a complete entry. Order on the array is push-order, which roughly tracks
+// startedAt — close enough for the latency strip's render loop.
+function recordRequestStarted(sessionId, conversationHash, entry) {
+  const key = throughputConvKey(sessionId, conversationHash);
+  if (!key) return;
+  const arr = requestState.byConv[key] || (requestState.byConv[key] = []);
+  arr.push(entry);
+  if (arr.length > 200) arr.splice(0, arr.length - 200);
+}
+
 function recordRequestDone(sessionId, conversationHash, entry) {
   const key = throughputConvKey(sessionId, conversationHash);
   if (!key) return;
   const arr = requestState.byConv[key] || (requestState.byConv[key] = []);
+  if (entry.traceId) {
+    for (let i = arr.length - 1; i >= 0; i--) {
+      if (arr[i].traceId === entry.traceId) {
+        arr[i].endedAt = entry.endedAt;
+        arr[i].output = entry.output;
+        return;
+      }
+    }
+  }
   arr.push(entry);
   if (arr.length > 200) arr.splice(0, arr.length - 200);
 }
@@ -1889,7 +1912,10 @@ function ensureKeysApp() {
           if (r.firstChunkAt !== null && r.firstChunkAt !== undefined) {
             ttftSum += r.firstChunkAt - r.startedAt;
             ttftCount++;
-            if (r.output > 0 && r.endedAt > r.firstChunkAt) {
+            // ms/tok requires a finished request — in-flight rows have
+            // endedAt = null and no final output count yet.
+            if (r.endedAt !== null && r.endedAt !== undefined
+                && r.output > 0 && r.endedAt > r.firstChunkAt) {
               outToks += r.output;
               outTimeMs += r.endedAt - r.firstChunkAt;
             }
@@ -1974,11 +2000,12 @@ function ensureKeysApp() {
           }
         }
 
-        // Latency strip: red row = time-to-first-token (start → first chunk),
-        // yellow row = full request duration (start → end). Stacked so a slow
-        // start with fast output reads as a long red prefix on a slightly
-        // longer yellow bar. Pixel positions come from the same now-relative
-        // mapping the bars use, so lines slide left in lockstep.
+        // Latency strip: red row = time-to-first-token (start → first chunk,
+        // arrives live via request_first_chunk), yellow row = full request
+        // duration (start → end, locks at request_done; for in-flight
+        // requests it grows leftward edge → "now" each frame). Pixel
+        // positions come from the same now-relative mapping the bars use,
+        // so the strip slides left in lockstep.
         const requests = requestState.byConv[this.convKey] || [];
         const nowMs = Date.now();
         const winMs = THROUGHPUT_WINDOW_MS;
@@ -1986,11 +2013,15 @@ function ensureKeysApp() {
         const DUR_Y  = 4;
         function tToX(t) { return cssW - ((nowMs - t) / winMs) * cssW; }
         for (const r of requests) {
+          // For in-flight requests use "now" as the right edge so the yellow
+          // bar visibly grows until the done event lands.
+          const yellowEnd = r.endedAt !== null && r.endedAt !== undefined ? r.endedAt : nowMs;
           const sx = tToX(r.startedAt);
-          const ex = tToX(r.endedAt);
+          const ex = tToX(yellowEnd);
           // Skip requests whose entire span is off the left edge.
           if (ex < 0) continue;
-          // Yellow: full duration. Min 1px so a sub-30ms request stays visible.
+          // Yellow: full (or so-far) duration. Min 1px so a sub-30ms request
+          // still paints something visible.
           ctx.fillStyle = '#d29922';
           const yX1 = Math.max(0, sx);
           const yX2 = Math.min(cssW, ex);
@@ -2533,8 +2564,18 @@ function connectSSE() {
       // Per-request lifecycle for the latency overlay. startedAt /
       // firstChunkAt / endedAt come from the proxy as Date.now()-style
       // numeric ms; we keep them numeric for fast subtraction at draw time.
+      if (event.type === 'request_first_chunk' && event.sessionId) {
+        recordRequestStarted(event.sessionId, event.conversationHash || null, {
+          traceId: event.traceId,
+          startedAt: event.startedAt,
+          firstChunkAt: event.firstChunkAt,
+          endedAt: null,  // still in flight; yellow line grows until done
+          output: 0,
+        });
+      }
       if (event.type === 'request_done' && event.sessionId) {
         recordRequestDone(event.sessionId, event.conversationHash || null, {
+          traceId: event.traceId,
           startedAt: event.startedAt,
           firstChunkAt: event.firstChunkAt,
           endedAt: event.endedAt,

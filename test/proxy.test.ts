@@ -2561,7 +2561,7 @@ describe("Edge Cases", () => {
     expect(totalOutput).toBe(7);
   });
 
-  test("streaming /v1/messages emits a request_done event with start/firstChunk/end timings for the dashboard latency overlay", async () => {
+  test("streaming /v1/messages emits request_first_chunk live + request_done at finish, both with matching traceId", async () => {
     const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
 
@@ -2597,21 +2597,80 @@ describe("Edge Cases", () => {
     unsub();
     const after = Date.now();
 
+    const firstChunkEvents = events.filter((e) => e.type === "request_first_chunk");
     const doneEvents = events.filter((e) => e.type === "request_done");
+    expect(firstChunkEvents.length).toBe(1);
     expect(doneEvents.length).toBe(1);
-    const ev = doneEvents[0]!;
-    expect(ev.sessionId).toBe("sess-latency");
-    expect(ev.path).toBe("/v1/messages");
-    expect(ev.output).toBe(11);
-    expect(typeof ev.startedAt).toBe("number");
-    expect(typeof ev.endedAt).toBe("number");
-    expect(typeof ev.firstChunkAt).toBe("number");
-    expect(ev.startedAt as number).toBeGreaterThanOrEqual(before);
-    expect(ev.endedAt as number).toBeLessThanOrEqual(after);
-    // start <= firstChunk <= end (firstChunk is when the first stream byte
-    // landed, used as the boundary between TTFT and the streaming phase).
-    expect(ev.firstChunkAt as number).toBeGreaterThanOrEqual(ev.startedAt as number);
-    expect(ev.endedAt as number).toBeGreaterThanOrEqual(ev.firstChunkAt as number);
+
+    const fc = firstChunkEvents[0]!;
+    const done = doneEvents[0]!;
+    // Same traceId on both so the dashboard can correlate the in-flight
+    // entry it pushed on first_chunk with the completion update.
+    expect(fc.traceId).toBeTruthy();
+    expect(done.traceId).toBe(fc.traceId);
+    // first_chunk arrives strictly before done (sanity: the chunk handler
+    // ran inside observeChunk; finish() happens later).
+    expect(new Date(fc.ts as string).getTime()).toBeLessThanOrEqual(
+      new Date(done.ts as string).getTime(),
+    );
+
+    // Done event's timings are consistent with first_chunk's.
+    expect(done.sessionId).toBe("sess-latency");
+    expect(done.path).toBe("/v1/messages");
+    expect(done.output).toBe(11);
+    expect(done.startedAt).toBe(fc.startedAt);
+    expect(done.firstChunkAt).toBe(fc.firstChunkAt);
+    expect(done.startedAt as number).toBeGreaterThanOrEqual(before);
+    expect(done.endedAt as number).toBeLessThanOrEqual(after);
+    expect(done.firstChunkAt as number).toBeGreaterThanOrEqual(done.startedAt as number);
+    expect(done.endedAt as number).toBeGreaterThanOrEqual(done.firstChunkAt as number);
+  });
+
+  test("request_done startedAt equals when the proxy fired the upstream fetch, not when upstream sent headers", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    // Insert a gap between fetch-fire and upstream response so the two
+    // candidate "start" timestamps are clearly separable.
+    const UPSTREAM_HEADER_DELAY_MS = 80;
+    const mock = upstream(async () => {
+      await new Promise((r) => setTimeout(r, UPSTREAM_HEADER_DELAY_MS));
+      const stream = new ReadableStream({
+        start(controller) {
+          const enc = new TextEncoder();
+          controller.enqueue(enc.encode(
+            'data: {"type":"message_start","message":{"usage":{"input_tokens":1}}}\n\n',
+          ));
+          controller.close();
+        },
+      });
+      return new Response(stream, {
+        status: 200, headers: { "content-type": "text/event-stream" },
+      });
+    });
+
+    const config = makeConfig(mock.url);
+    const events: ProxyEvent[] = [];
+    const unsub = subscribe((e) => events.push(e));
+
+    const fireTime = Date.now();
+    const result = await proxyRequest(makeRequest("/v1/messages", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-claude-code-session-id": "sess-start-anchor" },
+      body: JSON.stringify({ stream: true, messages: [{ role: "user", content: "x" }] }),
+    }), km, config, st);
+    expect(result.kind).toBe("success");
+    if (result.kind === "success") await result.response.text();
+    unsub();
+
+    const done = events.find((e) => e.type === "request_done")!;
+    expect(done).toBeTruthy();
+    // startedAt must be near the fire time, NOT delayed by the upstream's
+    // header latency — i.e. the gap between firstChunkAt and startedAt
+    // must include the artificial delay.
+    expect(done.startedAt as number).toBeLessThanOrEqual(fireTime + 30);
+    expect((done.firstChunkAt as number) - (done.startedAt as number))
+      .toBeGreaterThanOrEqual(UPSTREAM_HEADER_DELAY_MS - 10);
   });
 
   test("non-streaming /v1/messages does not emit request_done (latency overlay only covers streamed turns)", async () => {

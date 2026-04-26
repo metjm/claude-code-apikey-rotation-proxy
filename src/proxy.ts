@@ -105,7 +105,13 @@ type ActiveStreamState = {
   readonly label: string;
   readonly user: string | undefined;
   readonly path: string;
-  readonly openedAt: number;
+  // Wall-clock timestamp of when we fired the upstream fetch — i.e. the
+  // start of the request from the user's perspective. Used as the anchor
+  // for TTFT (firstChunkAt - requestSentAt) and total duration. Note this
+  // is set BEFORE upstream returns; the stream itself doesn't open until
+  // the response object lands, but for latency reporting we want the
+  // earlier wall-clock moment.
+  readonly requestSentAt: number;
   firstChunkAt: number | null;
   lastChunkAt: number | null;
   maxSilenceGapMs: number;
@@ -525,6 +531,7 @@ export async function proxyRequest(
         traceId,
         sessionId,
         firstMessageHash,
+        fetchStartedAt,
       );
       markActiveRequestWaitingForFirstChunk(traceId);
       const waitContext = buildActiveRequestContext(traceId, Date.now());
@@ -981,14 +988,14 @@ function maybeLogActiveStreamSnapshot(now: number): void {
   lastActiveStreamSnapshotAt = now;
 
   const streams = [...activeStreams.values()]
-    .sort((a, b) => a.openedAt - b.openedAt)
+    .sort((a, b) => a.requestSentAt - b.requestSentAt)
     .map((stream) => ({
       traceId: stream.traceId,
       label: stream.label,
       user: stream.user,
       path: stream.path,
-      ageMs: now - stream.openedAt,
-      firstChunkDelayMs: stream.firstChunkAt === null ? null : stream.firstChunkAt - stream.openedAt,
+      ageMs: now - stream.requestSentAt,
+      firstChunkDelayMs: stream.firstChunkAt === null ? null : stream.firstChunkAt - stream.requestSentAt,
       sinceLastChunkMs: stream.lastChunkAt === null ? null : now - stream.lastChunkAt,
       maxSilenceGapMs: getStreamMaxSilenceGapMs(stream, now),
       waitingForFirstChunk: stream.firstChunkAt === null,
@@ -1010,6 +1017,7 @@ function registerActiveStream(
   label: string,
   user: string | undefined,
   path: string,
+  requestSentAt: number,
 ): void {
   const now = Date.now();
   activeStreams.set(traceId, {
@@ -1017,7 +1025,7 @@ function registerActiveStream(
     label,
     user,
     path,
-    openedAt: now,
+    requestSentAt,
     firstChunkAt: null,
     lastChunkAt: null,
     maxSilenceGapMs: 0,
@@ -1074,7 +1082,7 @@ function recordActiveStreamChunk(traceId: string, chunkBytes: number): void {
       "first_chunk",
       now,
     );
-    const firstChunkDelayMs = now - stream.openedAt;
+    const firstChunkDelayMs = now - stream.requestSentAt;
     const recentlyActiveStreams = countRecentlyActiveStreams(now);
     const requestContext = buildActiveRequestContext(traceId, now);
     log("info", "Stream first chunk", {
@@ -1127,7 +1135,7 @@ function recordActiveStreamEvent(traceId: string): void {
 }
 
 interface ClosedStreamTimings {
-  openedAt: number;
+  requestSentAt: number;
   firstChunkAt: number | null;
   endedAt: number;
 }
@@ -1149,8 +1157,8 @@ function closeActiveStream(
     label: stream.label,
     user: stream.user,
     path: stream.path,
-    durationMs: now - stream.openedAt,
-    firstChunkDelayMs: stream.firstChunkAt === null ? null : stream.firstChunkAt - stream.openedAt,
+    durationMs: now - stream.requestSentAt,
+    firstChunkDelayMs: stream.firstChunkAt === null ? null : stream.firstChunkAt - stream.requestSentAt,
     sinceLastChunkMs: stream.lastChunkAt === null ? null : now - stream.lastChunkAt,
     maxSilenceGapMs: getStreamMaxSilenceGapMs(stream, now),
     chunkCount: stream.chunkCount,
@@ -1163,7 +1171,7 @@ function closeActiveStream(
     activeStreamsRemaining: activeStreams.size,
   });
   maybeLogActiveStreamSnapshot(now);
-  return { openedAt: stream.openedAt, firstChunkAt: stream.firstChunkAt, endedAt: now };
+  return { requestSentAt: stream.requestSentAt, firstChunkAt: stream.firstChunkAt, endedAt: now };
 }
 
 function abandonActiveStream(
@@ -1197,8 +1205,8 @@ function abandonActiveStream(
     user: stream.user,
     path: stream.path,
     reason,
-    durationMs: now - stream.openedAt,
-    firstChunkDelayMs: stream.firstChunkAt === null ? null : stream.firstChunkAt - stream.openedAt,
+    durationMs: now - stream.requestSentAt,
+    firstChunkDelayMs: stream.firstChunkAt === null ? null : stream.firstChunkAt - stream.requestSentAt,
     sinceLastChunkMs: stream.lastChunkAt === null ? null : now - stream.lastChunkAt,
     maxSilenceGapMs: getStreamMaxSilenceGapMs(stream, now),
     chunkCount: stream.chunkCount,
@@ -1693,6 +1701,7 @@ function createTokenTrackingObserver(
   traceId: string,
   sessionId: string | null,
   conversationHash: string | null,
+  requestSentAt: number,
 ): StreamObserver {
   const decoder = new TextDecoder();
   let buffer = "";
@@ -1706,7 +1715,8 @@ function createTokenTrackingObserver(
   let cacheCreationReported = 0;
   let throttleTimer: ReturnType<typeof setTimeout> | null = null;
   let finalized = false;
-  registerActiveStream(traceId, entry.label, proxyUser?.label, endpoint);
+  let firstChunkEmitted = false;
+  registerActiveStream(traceId, entry.label, proxyUser?.label, endpoint, requestSentAt);
 
   // Emits the delta between cumulative counts and what's already been
   // reported, so the dashboard can plot per-session throughput bars without
@@ -1740,6 +1750,28 @@ function createTokenTrackingObserver(
   function observeChunk(chunk: Uint8Array): void {
     if (finalized) return;
     recordActiveStreamChunk(traceId, chunk.byteLength);
+    // Live latency: notify the dashboard the moment the first byte lands so
+    // the red TTFT line paints in real time instead of waiting until the
+    // stream finishes. Guarded by firstChunkEmitted because observeChunk
+    // fires for every chunk; only the first one carries this signal.
+    if (!firstChunkEmitted && sessionId !== null) {
+      const stream = activeStreams.get(traceId);
+      if (stream !== undefined && stream.firstChunkAt !== null) {
+        firstChunkEmitted = true;
+        emitWithKeys({
+          type: "request_first_chunk",
+          ts: new Date().toISOString(),
+          label: entry.label,
+          user: proxyUser?.label,
+          sessionId,
+          conversationHash,
+          path: endpoint,
+          traceId,
+          startedAt: stream.requestSentAt,
+          firstChunkAt: stream.firstChunkAt,
+        }, keyManager.listKeys());
+      }
+    }
 
     buffer += decoder.decode(chunk, { stream: true });
     const lines = buffer.split("\n");
@@ -1809,13 +1841,14 @@ function createTokenTrackingObserver(
         sessionId,
         conversationHash,
         path: endpoint,
-        startedAt: timings.openedAt,
+        traceId,
+        startedAt: timings.requestSentAt,
         firstChunkAt: timings.firstChunkAt,
         endedAt: timings.endedAt,
         output: outputTokens,
       }, keyManager.listKeys());
       keyManager.recordRequestLatency(
-        timings.openedAt,
+        timings.requestSentAt,
         timings.firstChunkAt,
         timings.endedAt,
         outputTokens,
