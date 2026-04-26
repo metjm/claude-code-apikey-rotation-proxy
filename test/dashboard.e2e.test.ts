@@ -724,7 +724,7 @@ describe("Dashboard sessions cell (Vue render)", () => {
     }
   }, 60_000);
 
-  test("normalizes bar heights against the global max so quiet conversations read smaller than loud ones", async () => {
+  test("log scale keeps quiet bars visible alongside loud ones, but loud still reads taller", async () => {
     const dataDir = makeTempDir();
     const upstream = startMockUpstream();
     const proxy = startProxy({ dataDir, upstream: upstream.url, adminToken: ADMIN_TOKEN });
@@ -745,14 +745,14 @@ describe("Dashboard sessions cell (Vue render)", () => {
       );
 
       const keys = proxy.km.listKeys();
-      // 10× ratio. With shared global scale on input, the loud bar is
-      // full-height and the quiet bar lands around 10% of that. Output
-      // scales independently; since loud has no output, scaleOut comes
-      // from quiet's 500.
+      // 100× linear input ratio. On a *linear* scale the quiet bar would
+      // be 1% of the loud bar (one pixel) and the whole point of the
+      // chart would be lost. On a log scale the quiet bar should still
+      // be a meaningful fraction of the loud bar's height.
       emitWithKeys(
         { type: "tokens", ts: new Date().toISOString(), label: "key-a",
           sessionId: loudSession, conversationHash: loudHash,
-          input: 10000, output: 0, cacheRead: 0, cacheCreation: 0, partial: true },
+          input: 100000, output: 0, cacheRead: 0, cacheCreation: 0, partial: true },
         keys,
       );
       emitWithKeys(
@@ -769,7 +769,7 @@ describe("Dashboard sessions cell (Vue render)", () => {
           const a = ofId(loud), b = ofId(quiet);
           if (!a || !b) return false;
           const txt = (el: Element | null) => el?.textContent ?? "";
-          return txt(a.querySelector(".thr-in")).includes("10")
+          return txt(a.querySelector(".thr-in")).includes("100k")
             && txt(b.querySelector(".thr-in")).includes("1.0k");
         },
         { timeout: 5_000 },
@@ -809,8 +809,12 @@ describe("Dashboard sessions cell (Vue render)", () => {
 
       expect(tallest.loud).toBeGreaterThan(0);
       expect(tallest.quiet).toBeGreaterThan(0);
-      // Loud must be visibly taller than quiet — input bars share scaleIn.
-      expect(tallest.loud).toBeGreaterThan(tallest.quiet * 3);
+      // Loud is taller — direction is preserved.
+      expect(tallest.loud).toBeGreaterThan(tallest.quiet);
+      // But the quiet bar is still a meaningful fraction of the loud one
+      // (anything > ~5% proves the log scale isn't behaving linearly —
+      // 1% input ratio on a linear scale would round to 1px).
+      expect(tallest.quiet).toBeGreaterThan(tallest.loud * 0.25);
 
       await page.close();
     } finally {

@@ -248,9 +248,10 @@
     background: rgba(88,166,255,0.13);
     color: var(--blue);
   }
-  /* Per-session live throughput chart. 150px wide canvas with input bars
-     (blue) growing up from the centre baseline and output bars (green)
-     growing down — sliding left at one bucket per second. */
+  /* Per-conversation live throughput chart. 150px wide canvas with twin
+     bars per second growing up from the bottom — input (blue) on the
+     left of each slot, output (green) on the right. Log scale so a big
+     spike doesn't flatten the smaller bars next to it. */
   .thr-row {
     grid-column: 2 / -1;
     display: flex;
@@ -265,17 +266,11 @@
     position: relative;
     width: 150px;
     height: 30px;
-    background: linear-gradient(180deg, rgba(88,166,255,0.04) 0%, rgba(88,166,255,0) 50%, rgba(63,185,80,0) 50%, rgba(63,185,80,0.04) 100%);
+    background: linear-gradient(180deg, rgba(139,148,158,0) 0%, rgba(139,148,158,0.07) 100%);
+    border-bottom: 1px solid rgba(139,148,158,0.22);
     border-radius: 3px;
     overflow: hidden;
     flex: 0 0 auto;
-  }
-  .thr-canvas-wrap::after {
-    content: "";
-    position: absolute; left: 0; right: 0; top: 50%;
-    height: 1px;
-    background: rgba(139,148,158,0.18);
-    pointer-events: none;
   }
   .thr-canvas { display: block; width: 150px; height: 30px; }
   .thr-meta {
@@ -1831,39 +1826,49 @@ function ensureKeysApp() {
 
         const buckets = this.buckets;
         const N = buckets.length;
-        const slot = cssW / N;
-        const gap = 1;
-        const barW = Math.max(1, slot - gap);
+        const slotW = cssW / N; // 5px at 150/30
+        // Twin bars per slot: input on the left, output on the right. With
+        // a 5px slot we lay out 2px in + 1px gap + 2px out = 5px exactly.
+        const inBarW  = Math.max(1, Math.floor((slotW - 1) / 2));
+        const outBarW = Math.max(1, Math.floor((slotW - 1) / 2));
+        const fullH = cssH - 1; // 1px headroom so bars don't kiss the top edge
 
-        // Global peaks shared across every chart. Input bars are normalized
-        // against the loudest input across all sessions; output bars against
-        // the loudest output. Independent so input vs output don't suppress
-        // each other when one channel dominates.
-        const scaleIn  = throughputState.peakIn  > 0 ? throughputState.peakIn  : 1;
-        const scaleOut = throughputState.peakOut > 0 ? throughputState.peakOut : 1;
+        // Independent log-normalized scales:
+        //   h(v) = log(1 + v) / log(1 + peak) × fullH
+        // log1p keeps small values (1, 5, 50) visible alongside spikes
+        // (50k input bursts), and the +1 makes h(0) = 0 cleanly. peakIn
+        // drives only blue bars, peakOut drives only green — cache-heavy
+        // input doesn't squash output rendering.
+        const peakIn  = throughputState.peakIn;
+        const peakOut = throughputState.peakOut;
+        const denomIn  = peakIn  > 0 ? Math.log1p(peakIn)  : 1;
+        const denomOut = peakOut > 0 ? Math.log1p(peakOut) : 1;
 
-        const mid = cssH / 2;
-        const halfH = mid - 1;
+        function logHeight(v, denom) {
+          if (v <= 0) return 0;
+          const h = Math.round((Math.log1p(v) / denom) * fullH);
+          return Math.max(1, Math.min(fullH, h));
+        }
 
         for (let i = 0; i < N; i++) {
-          const x = Math.floor(i * slot) + 0.5;
+          const slotX = Math.floor(i * slotW);
           const inV = buckets[i].in;
           const outV = buckets[i].out;
           if (inV > 0) {
-            const h = Math.max(1, Math.min(halfH, Math.round((inV / scaleIn) * halfH)));
+            const h = logHeight(inV, denomIn);
             ctx.fillStyle = '#58a6ff';
-            ctx.fillRect(x, mid - h, barW, h);
+            ctx.fillRect(slotX, cssH - h, inBarW, h);
           }
           if (outV > 0) {
-            const h = Math.max(1, Math.min(halfH, Math.round((outV / scaleOut) * halfH)));
+            const h = logHeight(outV, denomOut);
             ctx.fillStyle = '#3fb950';
-            ctx.fillRect(x, mid, barW, h);
+            ctx.fillRect(slotX + inBarW + 1, cssH - h, outBarW, h);
           }
         }
       },
     },
     template: `
-      <div class="thr-row" :title="'Live token throughput for this conversation — last ' + (THROUGHPUT_WINDOW_MS/1000) + 's. Blue = incoming (input + cache), green = outgoing. Bars normalized against the loudest input/output across all charts.'">
+      <div class="thr-row" :title="'Live token throughput for this conversation — last ' + (THROUGHPUT_WINDOW_MS/1000) + 's. Blue = incoming (input + cache), green = outgoing — both grow up from the bottom. Log scale, normalized independently against the loudest input/output across all charts.'">
         <div class="thr-canvas-wrap">
           <canvas class="thr-canvas" ref="canvas" width="150" height="30"></canvas>
         </div>
