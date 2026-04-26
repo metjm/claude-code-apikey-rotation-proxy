@@ -3319,3 +3319,85 @@ describe("Affinity cooldown server-side wait", () => {
     expect(fakeKeyBCalled).toBe(true);
   });
 });
+
+describe("Synthetic claude-cli helper sessions", () => {
+  // claude-cli stamps an all-zero-prefix UUID for one-shot helper calls
+  // (e.g. generate_session_title → Haiku). They have no prompt cache to
+  // preserve and shouldn't pin to a key, show in the dashboard sessions
+  // table, or count toward round-robin assignment.
+  const SYNTHETIC_SESSION = "00000000-0000-4000-8000-a51e390d86a8";
+
+  test("synthetic session bypasses conversation pinning and dashboard sessions", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    km.addKey(FAKE_KEY_B, "key-b");
+
+    const mock = upstream(() => new Response(
+      JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ));
+    const config = makeConfig(mock.url);
+
+    async function send(session: string, content: string): Promise<void> {
+      const res = await proxyRequest(makeRequest("/v1/messages", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-claude-code-session-id": session,
+        },
+        body: JSON.stringify({ messages: [{ role: "user", content }] }),
+      }), km, config, st);
+      expect(res.kind).toBe("success");
+    }
+
+    await send(SYNTHETIC_SESSION, "title gen 1");
+    await send(SYNTHETIC_SESSION, "title gen 2");
+    await send(SYNTHETIC_SESSION, "title gen 3");
+
+    // Routed via the no-conversation fallback, never through affinity logic.
+    const decisions = km.getRecentRoutingDecisions();
+    expect(decisions.length).toBe(3);
+    for (const d of decisions) {
+      expect(d.routingDecision).toBe("global_sticky_fallback");
+      expect(d.conversationKey).toBe(null);
+      expect(d.sessionId).toBe(null);
+    }
+
+    // No affinity entries created → recentSessions stays empty across all keys.
+    for (const k of km.listKeys()) {
+      expect(k.recentSessions).toEqual([]);
+    }
+
+    // A real session afterwards is unaffected — pins fresh, gets counted.
+    await send("real-session", "real first turn");
+    const real = km.getRecentRoutingDecisions()[0]!;
+    expect(real.routingDecision).toBe("conversation_new_assignment");
+    expect(real.conversationKey).not.toBe(null);
+    const totalRecent = km.listKeys().reduce((n, k) => n + k.recentSessions.length, 0);
+    expect(totalRecent).toBe(1);
+  });
+
+  test("any all-zero-prefix UUID is treated as synthetic", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    const mock = upstream(() => new Response(
+      JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ));
+    const config = makeConfig(mock.url);
+
+    const res = await proxyRequest(makeRequest("/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-claude-code-session-id": "00000000-0000-4000-8000-deadbeefcafe",
+      },
+      body: JSON.stringify({ messages: [{ role: "user", content: "x" }] }),
+    }), km, config, st);
+    expect(res.kind).toBe("success");
+
+    expect(km.getRecentRoutingDecisions()[0]!.routingDecision).toBe("global_sticky_fallback");
+    expect(km.listKeys()[0]!.recentSessions).toEqual([]);
+  });
+});

@@ -675,9 +675,17 @@ function isKeyAvailableNow(entry: ApiKeyEntry): boolean {
   return entry.availableAt <= currentTime && entry.allowedDays.includes(currentDay);
 }
 
+/** UUIDs claude-cli stamps for one-shot helper calls (e.g. generate_session_title)
+ *  that are not tied to a real conversation. They share an all-zero prefix that
+ *  proper random v4 UUIDs effectively never produce. Treat them as no-session
+ *  so they bypass conversation affinity and the dashboard sessions table. */
+const SYNTHETIC_CC_HELPER_SESSION_PATTERN = /^0{8}-0{4}-/;
+
 function normalizeConversationSessionId(raw: string | null): string | null {
   const normalized = raw?.trim() ?? "";
-  return normalized === "" ? null : normalized;
+  if (normalized === "") return null;
+  if (SYNTHETIC_CC_HELPER_SESSION_PATTERN.test(normalized)) return null;
+  return normalized;
 }
 
 function buildConversationKey(
