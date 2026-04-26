@@ -1706,8 +1706,10 @@ export class KeyManager {
    *  aligned to wall-clock-anchored buckets of `bucketMs`. Returns one row
    *  per bucket, oldest first; empty buckets get null avgs (and count=0)
    *  so the dashboard line chart can break the line at gaps. ms-per-tok
-   *  uses sum(time)/sum(tokens) per bucket — token-weighted average,
-   *  matching the per-conversation chip in the throughput panel. */
+   *  uses sum(total_time)/sum(tokens) per bucket where total_time covers
+   *  the full request span (started_at → ended_at) — TTFT is included so
+   *  the metric reflects user-perceived per-token cost, not the streaming
+   *  phase in isolation. */
   getRequestLatencyTimeseries(rangeMs: number, bucketMs: number): Array<{
     bucketStart: number;
     count: number;
@@ -1721,7 +1723,7 @@ export class KeyManager {
       n: number;
       ttft_sum: number | null;
       ttft_count: number;
-      stream_time_sum: number | null;
+      total_time_sum: number | null;
       out_tokens_sum: number;
     }, [number, number]>(`
       SELECT
@@ -1729,10 +1731,8 @@ export class KeyManager {
         COUNT(*) AS n,
         SUM(CASE WHEN first_chunk_at IS NOT NULL THEN first_chunk_at - started_at END) AS ttft_sum,
         SUM(CASE WHEN first_chunk_at IS NOT NULL THEN 1 ELSE 0 END) AS ttft_count,
-        SUM(CASE WHEN first_chunk_at IS NOT NULL AND output_tokens > 0
-                 THEN ended_at - first_chunk_at END) AS stream_time_sum,
-        SUM(CASE WHEN first_chunk_at IS NOT NULL AND output_tokens > 0
-                 THEN output_tokens ELSE 0 END) AS out_tokens_sum
+        SUM(CASE WHEN output_tokens > 0 THEN ended_at - started_at END) AS total_time_sum,
+        SUM(CASE WHEN output_tokens > 0 THEN output_tokens ELSE 0 END) AS out_tokens_sum
       FROM request_latencies
       WHERE ended_at >= ?
       GROUP BY bucket_start
@@ -1761,8 +1761,8 @@ export class KeyManager {
         count: r.n,
         avgTtftMs: r.ttft_count > 0 && r.ttft_sum !== null
           ? Math.round(r.ttft_sum / r.ttft_count) : null,
-        avgMsPerOutputToken: r.out_tokens_sum > 0 && r.stream_time_sum !== null
-          ? Math.round(r.stream_time_sum / r.out_tokens_sum) : null,
+        avgMsPerOutputToken: r.out_tokens_sum > 0 && r.total_time_sum !== null
+          ? Math.round(r.total_time_sum / r.out_tokens_sum) : null,
       });
     }
     return out;

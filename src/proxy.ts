@@ -402,6 +402,24 @@ export async function proxyRequest(
 
     let upstream: Response;
     const fetchStartedAt = Date.now();
+    // Tell the dashboard the request is in-flight the moment we fire upstream
+    // so the red TTFT line starts growing during the pre-first-byte wait
+    // rather than snapping into existence after a chunk lands. Multiple
+    // attempts share traceId; the dashboard upserts by traceId, so the
+    // earliest startedAt sticks across retries.
+    if (sessionId !== null) {
+      emitWithKeys({
+        type: "request_started",
+        ts: new Date().toISOString(),
+        label: entry.label,
+        user: proxyUser?.label,
+        sessionId,
+        conversationHash: firstMessageHash,
+        path: url.pathname,
+        traceId,
+        startedAt: fetchStartedAt,
+      }, keyManager.listKeys());
+    }
     const abortController = new AbortController();
     try {
       upstream = await fetchUpstream(upstreamUrl, req.method, headers, requestBody, abortController.signal);

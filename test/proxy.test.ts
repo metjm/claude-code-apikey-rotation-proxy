@@ -2561,6 +2561,71 @@ describe("Edge Cases", () => {
     expect(totalOutput).toBe(7);
   });
 
+  test("request_started fires before upstream returns so the dashboard can render the red TTFT line growing", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    const UPSTREAM_HEADER_DELAY_MS = 60;
+    let startedEventTime: number | null = null;
+    const events: ProxyEvent[] = [];
+    const unsub = subscribe((e) => {
+      events.push(e);
+      if (startedEventTime === null && e.type === "request_started") {
+        startedEventTime = Date.now();
+      }
+    });
+
+    let upstreamResponseSentAt: number | null = null;
+    const mock = upstream(async () => {
+      await new Promise((r) => setTimeout(r, UPSTREAM_HEADER_DELAY_MS));
+      upstreamResponseSentAt = Date.now();
+      const stream = new ReadableStream({
+        start(controller) {
+          const enc = new TextEncoder();
+          controller.enqueue(enc.encode(
+            'data: {"type":"message_start","message":{"usage":{"input_tokens":1}}}\n\n',
+          ));
+          controller.close();
+        },
+      });
+      return new Response(stream, {
+        status: 200, headers: { "content-type": "text/event-stream" },
+      });
+    });
+
+    const config = makeConfig(mock.url);
+    const result = await proxyRequest(makeRequest("/v1/messages", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-claude-code-session-id": "sess-rs" },
+      body: JSON.stringify({ stream: true, messages: [{ role: "user", content: "x" }] }),
+    }), km, config, st);
+    expect(result.kind).toBe("success");
+    if (result.kind === "success") await result.response.text();
+    unsub();
+
+    const started = events.filter((e) => e.type === "request_started");
+    expect(started.length).toBe(1);
+    expect(started[0]!.sessionId).toBe("sess-rs");
+    expect(started[0]!.path).toBe("/v1/messages");
+    expect(typeof started[0]!.startedAt).toBe("number");
+    expect(started[0]!.traceId).toBeTruthy();
+
+    // The whole point: started must fire BEFORE upstream sends its response.
+    // Without that the dashboard can't paint the wait-for-first-byte segment.
+    expect(startedEventTime).not.toBeNull();
+    expect(upstreamResponseSentAt).not.toBeNull();
+    expect(startedEventTime!).toBeLessThan(upstreamResponseSentAt!);
+
+    // Started, first_chunk and done all share traceId so the dashboard
+    // upserts a single in-flight entry across the three events.
+    const fc = events.find((e) => e.type === "request_first_chunk");
+    const done = events.find((e) => e.type === "request_done");
+    expect(fc).toBeTruthy();
+    expect(done).toBeTruthy();
+    expect(fc!.traceId).toBe(started[0]!.traceId);
+    expect(done!.traceId).toBe(started[0]!.traceId);
+  });
+
   test("streaming /v1/messages emits request_first_chunk live + request_done at finish, both with matching traceId", async () => {
     const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");

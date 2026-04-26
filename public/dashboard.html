@@ -915,35 +915,25 @@ function recordThroughputDelta(sessionId, conversationHash, sample) {
   if (sample.out > throughputState.peakOut) throughputState.peakOut = sample.out;
 }
 
-// In-flight entries get pushed on request_first_chunk with endedAt = null and
-// updated in place when the matching request_done arrives (matched by traceId).
-// If a done event arrives without a prior first-chunk event (rare — empty
-// streams that finalize without ever calling observeChunk) we just push it
-// as a complete entry. Order on the array is push-order, which roughly tracks
-// startedAt — close enough for the latency strip's render loop.
-function recordRequestStarted(sessionId, conversationHash, entry) {
+// Find an existing in-flight entry by traceId, or create one. Lifecycle:
+// request_started pushes the entry with firstChunkAt/endedAt = null;
+// request_first_chunk fills firstChunkAt; request_done fills endedAt + output.
+// The chart's draw loop renders red from start to (firstChunkAt OR now) and
+// yellow from start to (endedAt OR now), so both lines grow live and lock
+// the moment their respective events arrive.
+function findOrCreateRequestEntry(sessionId, conversationHash, traceId, startedAt) {
   const key = throughputConvKey(sessionId, conversationHash);
-  if (!key) return;
+  if (!key) return null;
   const arr = requestState.byConv[key] || (requestState.byConv[key] = []);
-  arr.push(entry);
-  if (arr.length > 200) arr.splice(0, arr.length - 200);
-}
-
-function recordRequestDone(sessionId, conversationHash, entry) {
-  const key = throughputConvKey(sessionId, conversationHash);
-  if (!key) return;
-  const arr = requestState.byConv[key] || (requestState.byConv[key] = []);
-  if (entry.traceId) {
+  if (traceId) {
     for (let i = arr.length - 1; i >= 0; i--) {
-      if (arr[i].traceId === entry.traceId) {
-        arr[i].endedAt = entry.endedAt;
-        arr[i].output = entry.output;
-        return;
-      }
+      if (arr[i].traceId === traceId) return arr[i];
     }
   }
+  const entry = { traceId, startedAt, firstChunkAt: null, endedAt: null, output: 0 };
   arr.push(entry);
   if (arr.length > 200) arr.splice(0, arr.length - 200);
+  return entry;
 }
 
 function recomputeGlobalThroughputPeaks() {
@@ -1907,23 +1897,24 @@ function ensureKeysApp() {
         const arr = requestState.byConv[this.convKey] || [];
         if (arr.length === 0) return { avgTtft: null, avgMsPerOutTok: null };
         let ttftSum = 0, ttftCount = 0;
-        let outToks = 0, outTimeMs = 0;
+        let outToks = 0, totalTimeMs = 0;
         for (const r of arr) {
           if (r.firstChunkAt !== null && r.firstChunkAt !== undefined) {
             ttftSum += r.firstChunkAt - r.startedAt;
             ttftCount++;
-            // ms/tok requires a finished request — in-flight rows have
-            // endedAt = null and no final output count yet.
-            if (r.endedAt !== null && r.endedAt !== undefined
-                && r.output > 0 && r.endedAt > r.firstChunkAt) {
-              outToks += r.output;
-              outTimeMs += r.endedAt - r.firstChunkAt;
-            }
+          }
+          // ms/output-token uses the full request span (start → end) so
+          // TTFT is reflected in user-perceived per-token cost. Skips
+          // in-flight rows (endedAt null) and zero-output requests.
+          if (r.endedAt !== null && r.endedAt !== undefined
+              && r.output > 0 && r.endedAt > r.startedAt) {
+            outToks += r.output;
+            totalTimeMs += r.endedAt - r.startedAt;
           }
         }
         return {
           avgTtft: ttftCount > 0 ? Math.round(ttftSum / ttftCount) : null,
-          avgMsPerOutTok: outToks > 0 ? Math.round(outTimeMs / outToks) : null,
+          avgMsPerOutTok: outToks > 0 ? Math.round(totalTimeMs / outToks) : null,
         };
       },
     },
@@ -2013,26 +2004,36 @@ function ensureKeysApp() {
         const DUR_Y  = 4;
         function tToX(t) { return cssW - ((nowMs - t) / winMs) * cssW; }
         for (const r of requests) {
-          // For in-flight requests use "now" as the right edge so the yellow
-          // bar visibly grows until the done event lands.
-          const yellowEnd = r.endedAt !== null && r.endedAt !== undefined ? r.endedAt : nowMs;
-          const sx = tToX(r.startedAt);
-          const ex = tToX(yellowEnd);
-          // Skip requests whose entire span is off the left edge.
-          if (ex < 0) continue;
-          // Yellow: full (or so-far) duration. Min 1px so a sub-30ms request
-          // still paints something visible.
-          ctx.fillStyle = '#d29922';
-          const yX1 = Math.max(0, sx);
-          const yX2 = Math.min(cssW, ex);
-          if (yX2 > yX1) ctx.fillRect(yX1, DUR_Y, Math.max(1, yX2 - yX1), 1);
-          // Red: TTFT prefix. Drawn after yellow so it stays crisp on overlap.
-          if (r.firstChunkAt !== null && r.firstChunkAt !== undefined) {
+          // Two adjacent bars, no overlap:
+          //   red    = startedAt → (firstChunkAt || now)  — TTFT, grows
+          //            until first byte lands then locks
+          //   yellow = (firstChunkAt || -∞) → (endedAt || now) — streaming
+          //            phase only; doesn't appear until after first chunk,
+          //            then grows until done lands then locks
+          // ms/output-token elsewhere still divides the whole request span
+          // by output tokens — the chart split is purely visual.
+          const redEnd     = r.firstChunkAt ?? nowMs;
+          const yellowStart = r.firstChunkAt ?? null;
+          const yellowEnd   = r.endedAt ?? nowMs;
+          // Red.
+          const rsx = tToX(r.startedAt);
+          const rex = tToX(redEnd);
+          if (rex >= 0) {
             ctx.fillStyle = '#f85149';
-            const fx = tToX(r.firstChunkAt);
-            const rX1 = Math.max(0, sx);
-            const rX2 = Math.min(cssW, fx);
+            const rX1 = Math.max(0, rsx);
+            const rX2 = Math.min(cssW, rex);
             if (rX2 > rX1) ctx.fillRect(rX1, TTFT_Y, Math.max(1, rX2 - rX1), 1);
+          }
+          // Yellow — only paints once the streaming phase has begun.
+          if (yellowStart !== null) {
+            const ysx = tToX(yellowStart);
+            const yex = tToX(yellowEnd);
+            if (yex >= 0) {
+              ctx.fillStyle = '#d29922';
+              const yX1 = Math.max(0, ysx);
+              const yX2 = Math.min(cssW, yex);
+              if (yX2 > yX1) ctx.fillRect(yX1, DUR_Y, Math.max(1, yX2 - yX1), 1);
+            }
           }
         }
       },
@@ -2561,26 +2562,40 @@ function connectSSE() {
           recordThroughputDelta(event.sessionId, event.conversationHash || null, { ts: Date.now(), in: incoming, out: outgoing });
         }
       }
-      // Per-request lifecycle for the latency overlay. startedAt /
-      // firstChunkAt / endedAt come from the proxy as Date.now()-style
-      // numeric ms; we keep them numeric for fast subtraction at draw time.
+      // Per-request lifecycle for the latency overlay. Three events arrive
+      // per request: started (when we fire upstream — pushes the entry),
+      // first_chunk (locks the red line), done (locks the yellow line).
+      // All three share traceId for in-place updates. Timestamps are
+      // Date.now()-style numeric ms; kept numeric for fast subtraction at
+      // draw time.
+      if (event.type === 'request_started' && event.sessionId) {
+        findOrCreateRequestEntry(
+          event.sessionId, event.conversationHash || null,
+          event.traceId, event.startedAt,
+        );
+      }
       if (event.type === 'request_first_chunk' && event.sessionId) {
-        recordRequestStarted(event.sessionId, event.conversationHash || null, {
-          traceId: event.traceId,
-          startedAt: event.startedAt,
-          firstChunkAt: event.firstChunkAt,
-          endedAt: null,  // still in flight; yellow line grows until done
-          output: 0,
-        });
+        const entry = findOrCreateRequestEntry(
+          event.sessionId, event.conversationHash || null,
+          event.traceId, event.startedAt,
+        );
+        if (entry) entry.firstChunkAt = event.firstChunkAt;
       }
       if (event.type === 'request_done' && event.sessionId) {
-        recordRequestDone(event.sessionId, event.conversationHash || null, {
-          traceId: event.traceId,
-          startedAt: event.startedAt,
-          firstChunkAt: event.firstChunkAt,
-          endedAt: event.endedAt,
-          output: event.output || 0,
-        });
+        const entry = findOrCreateRequestEntry(
+          event.sessionId, event.conversationHash || null,
+          event.traceId, event.startedAt,
+        );
+        if (entry) {
+          // started/first_chunk events may have been missed (e.g. dashboard
+          // opened mid-request) — fill any gaps from done's payload.
+          if (entry.firstChunkAt === null && event.firstChunkAt !== null
+              && event.firstChunkAt !== undefined) {
+            entry.firstChunkAt = event.firstChunkAt;
+          }
+          entry.endedAt = event.endedAt;
+          entry.output = event.output || 0;
+        }
       }
       // Log non-heartbeat events
       if (event.type !== 'keys') {

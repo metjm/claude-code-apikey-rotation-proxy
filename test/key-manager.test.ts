@@ -3425,15 +3425,17 @@ describe("Short-Cooldown Affinity Passthrough", () => {
 });
 
 describe("Request latency timeseries", () => {
-  test("buckets reflect token-weighted ms-per-output and arithmetic-mean TTFT", () => {
+  test("buckets reflect token-weighted ms-per-output (full span) and arithmetic-mean TTFT", () => {
     const km = create();
     const now = Date.now();
-    // Two requests in the same minute bucket. ms/tok averages by tokens
-    // (sum streaming time / sum output tokens), TTFT averages per-request.
-    //   r1: ttft=200ms, stream 600ms over 30 tokens → 20 ms/tok
-    //   r2: ttft=400ms, stream 900ms over 90 tokens → 10 ms/tok
-    // Expected ms/tok = (600+900) / (30+90) = 12.5 → rounded 13.
-    // Expected TTFT  = (200 + 400) / 2 = 300.
+    // Two requests in the same minute bucket. ms/output-token uses the
+    // full request span (started_at → ended_at) divided by output tokens
+    // — TTFT is intentionally included so the metric reflects user-
+    // perceived per-token cost, not the streaming phase in isolation.
+    //   r1: total 800ms over 30 tokens
+    //   r2: total 1300ms over 90 tokens
+    // Token-weighted: (800 + 1300) / (30 + 90) = 17.5 → rounded 18.
+    // TTFT (start→firstChunk) averaged per-request: (200 + 400) / 2 = 300.
     km.recordRequestLatency(now - 800,        now - 600,        now,            30, "k", "u");
     km.recordRequestLatency(now - 1300,       now - 900,        now,            90, "k", "u");
     const buckets = km.getRequestLatencyTimeseries(60_000, 60_000);
@@ -3441,7 +3443,7 @@ describe("Request latency timeseries", () => {
     expect(filled.length).toBe(1);
     expect(filled[0]!.count).toBe(2);
     expect(filled[0]!.avgTtftMs).toBe(300);
-    expect(filled[0]!.avgMsPerOutputToken).toBe(13);
+    expect(filled[0]!.avgMsPerOutputToken).toBe(18);
   });
 
   test("empty buckets return null avgs so the chart can break the line at gaps", () => {

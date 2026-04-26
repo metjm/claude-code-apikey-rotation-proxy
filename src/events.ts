@@ -1,7 +1,7 @@
 import type { MaskedKeyEntry } from "./types.ts";
 
 export interface ProxyEvent {
-  type: "request" | "response" | "tokens" | "request_first_chunk" | "request_done" | "rate_limit" | "error" | "keys" | "schema_change";
+  type: "request" | "response" | "tokens" | "request_started" | "request_first_chunk" | "request_done" | "rate_limit" | "error" | "keys" | "schema_change";
   ts: string;
   label?: string;
   [key: string]: unknown;
