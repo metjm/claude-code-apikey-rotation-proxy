@@ -565,6 +565,9 @@ export class KeyManager {
         started_at INTEGER NOT NULL,
         first_chunk_at INTEGER,
         output_tokens INTEGER NOT NULL DEFAULT 0,
+        input_tokens INTEGER NOT NULL DEFAULT 0,
+        cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+        cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
         key_label TEXT,
         user_label TEXT
       );
@@ -585,6 +588,9 @@ export class KeyManager {
     migrate("api_key_capacity_state", "response_count");
     migrate("api_key_capacity_state", "normalized_header_count");
     migrate("capacity_window_timeseries", "utilization_samples");
+    migrate("request_latencies", "input_tokens");
+    migrate("request_latencies", "cache_read_tokens");
+    migrate("request_latencies", "cache_creation_tokens");
     try { this.db.exec("DELETE FROM api_key_capacity_windows WHERE window_name = 'unified-overage'"); } catch {}
     try { this.db.exec("ALTER TABLE conversation_affinities ADD COLUMN session_id TEXT"); } catch {}
     try {
@@ -1686,14 +1692,22 @@ export class KeyManager {
     firstChunkAt: number | null,
     endedAt: number,
     outputTokens: number,
+    inputTokens: number,
+    cacheReadTokens: number,
+    cacheCreationTokens: number,
     keyLabel: string | null,
     userLabel: string | null,
   ): void {
     try {
       this.db.run(
-        `INSERT INTO request_latencies (ended_at, started_at, first_chunk_at, output_tokens, key_label, user_label)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-        [endedAt, startedAt, firstChunkAt, outputTokens, keyLabel, userLabel],
+        `INSERT INTO request_latencies
+           (ended_at, started_at, first_chunk_at, output_tokens,
+            input_tokens, cache_read_tokens, cache_creation_tokens,
+            key_label, user_label)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [endedAt, startedAt, firstChunkAt, outputTokens,
+         inputTokens, cacheReadTokens, cacheCreationTokens,
+         keyLabel, userLabel],
       );
     } catch (error) {
       log("warn", "Failed to persist request latency", {
@@ -1702,19 +1716,26 @@ export class KeyManager {
     }
   }
 
-  /** Bucketed average TTFT and ms-per-output-token over the last `rangeMs`,
-   *  aligned to wall-clock-anchored buckets of `bucketMs`. Returns one row
-   *  per bucket, oldest first; empty buckets get null avgs (and count=0)
-   *  so the dashboard line chart can break the line at gaps. ms-per-tok
-   *  uses sum(total_time)/sum(tokens) per bucket where total_time covers
-   *  the full request span (started_at → ended_at) — TTFT is included so
-   *  the metric reflects user-perceived per-token cost, not the streaming
-   *  phase in isolation. */
+  /** Bucketed averages over the last `rangeMs`, aligned to wall-clock
+   *  buckets of `bucketMs`. One row per bucket, oldest first; empty
+   *  buckets return null avgs (and count=0) so the dashboard line chart
+   *  can break the line at gaps.
+   *
+   *  - avgTtftMs: arithmetic mean of (firstChunkAt − startedAt).
+   *  - avgMsPerOutputToken: token-weighted, full request span ÷ output
+   *    tokens — TTFT is included so the metric reflects user-perceived
+   *    per-token cost.
+   *  - avgUsPerInputToken: token-weighted, TTFT ÷ total input tokens
+   *    (input + cache_read + cache_creation). Reported in microseconds
+   *    because typical values are well under a millisecond per token at
+   *    realistic prompt sizes — surfaces how the wait-for-first-byte
+   *    scales with prompt length. */
   getRequestLatencyTimeseries(rangeMs: number, bucketMs: number): Array<{
     bucketStart: number;
     count: number;
     avgTtftMs: number | null;
     avgMsPerOutputToken: number | null;
+    avgUsPerInputToken: number | null;
   }> {
     const now = Date.now();
     const earliestEnded = now - rangeMs;
@@ -1725,6 +1746,8 @@ export class KeyManager {
       ttft_count: number;
       total_time_sum: number | null;
       out_tokens_sum: number;
+      ttft_for_input_sum: number | null;
+      in_tokens_sum: number;
     }, [number, number]>(`
       SELECT
         (ended_at / ?) * ? AS bucket_start,
@@ -1732,7 +1755,14 @@ export class KeyManager {
         SUM(CASE WHEN first_chunk_at IS NOT NULL THEN first_chunk_at - started_at END) AS ttft_sum,
         SUM(CASE WHEN first_chunk_at IS NOT NULL THEN 1 ELSE 0 END) AS ttft_count,
         SUM(CASE WHEN output_tokens > 0 THEN ended_at - started_at END) AS total_time_sum,
-        SUM(CASE WHEN output_tokens > 0 THEN output_tokens ELSE 0 END) AS out_tokens_sum
+        SUM(CASE WHEN output_tokens > 0 THEN output_tokens ELSE 0 END) AS out_tokens_sum,
+        SUM(CASE WHEN first_chunk_at IS NOT NULL
+                  AND (input_tokens + cache_read_tokens + cache_creation_tokens) > 0
+                 THEN first_chunk_at - started_at END) AS ttft_for_input_sum,
+        SUM(CASE WHEN first_chunk_at IS NOT NULL
+                  AND (input_tokens + cache_read_tokens + cache_creation_tokens) > 0
+                 THEN input_tokens + cache_read_tokens + cache_creation_tokens
+                 ELSE 0 END) AS in_tokens_sum
       FROM request_latencies
       WHERE ended_at >= ?
       GROUP BY bucket_start
@@ -1749,11 +1779,15 @@ export class KeyManager {
       count: number;
       avgTtftMs: number | null;
       avgMsPerOutputToken: number | null;
+      avgUsPerInputToken: number | null;
     }> = [];
     for (let b = earliestBucket; b <= lastBucket; b += bucketMs) {
       const r = byBucket.get(b);
       if (r === undefined) {
-        out.push({ bucketStart: b, count: 0, avgTtftMs: null, avgMsPerOutputToken: null });
+        out.push({
+          bucketStart: b, count: 0,
+          avgTtftMs: null, avgMsPerOutputToken: null, avgUsPerInputToken: null,
+        });
         continue;
       }
       out.push({
@@ -1763,6 +1797,10 @@ export class KeyManager {
           ? Math.round(r.ttft_sum / r.ttft_count) : null,
         avgMsPerOutputToken: r.out_tokens_sum > 0 && r.total_time_sum !== null
           ? Math.round(r.total_time_sum / r.out_tokens_sum) : null,
+        // ms × 1000 / tokens = µs/token. Round to 1 decimal so a typical
+        // 0.5–10 µs/tok signal stays readable on the chart's auto-scale.
+        avgUsPerInputToken: r.in_tokens_sum > 0 && r.ttft_for_input_sum !== null
+          ? Math.round((r.ttft_for_input_sum * 1000 / r.in_tokens_sum) * 10) / 10 : null,
       });
     }
     return out;

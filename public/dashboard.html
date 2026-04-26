@@ -2843,13 +2843,15 @@ async function loadLatencyChart() {
   // Server already fills empty buckets with null avgs so the chart can break
   // the line at gaps via spanGaps:false. Keep nulls as-is for the chart.
   const labels = buckets.map(b => fmtLatencyTick(b.bucketStart, range));
-  const ttftData = buckets.map(b => b.avgTtftMs);
-  const tokData  = buckets.map(b => b.avgMsPerOutputToken);
+  const ttftData      = buckets.map(b => b.avgTtftMs);
+  const msPerOutData  = buckets.map(b => b.avgMsPerOutputToken);
+  const usPerInData   = buckets.map(b => b.avgUsPerInputToken);
 
   if (latencyChart) {
     latencyChart.data.labels = labels;
     latencyChart.data.datasets[0].data = ttftData;
-    latencyChart.data.datasets[1].data = tokData;
+    latencyChart.data.datasets[1].data = msPerOutData;
+    latencyChart.data.datasets[2].data = usPerInData;
     latencyChart.update('none');
     return;
   }
@@ -2865,15 +2867,23 @@ async function loadLatencyChart() {
           borderColor: '#f85149',
           backgroundColor: 'rgba(248,81,73,0.08)',
           tension: 0.25, pointRadius: 0, spanGaps: false,
-          yAxisID: 'y',
+          yAxisID: 'yMs',
         },
         {
           label: 'avg ms per output token',
-          data: tokData,
+          data: msPerOutData,
           borderColor: '#d29922',
           backgroundColor: 'rgba(210,153,34,0.08)',
           tension: 0.25, pointRadius: 0, spanGaps: false,
           yAxisID: 'yMs',
+        },
+        {
+          label: 'avg µs per input token (incl. cached)',
+          data: usPerInData,
+          borderColor: '#58a6ff',
+          backgroundColor: 'rgba(88,166,255,0.08)',
+          tension: 0.25, pointRadius: 0, spanGaps: false,
+          yAxisID: 'yUs',
         },
       ],
     },
@@ -2882,8 +2892,11 @@ async function loadLatencyChart() {
       interaction: { mode: 'index', intersect: false },
       scales: {
         x: { ticks: { maxRotation: 0, autoSkip: true, maxTicksLimit: 12 } },
-        y:   { beginAtZero: true, position: 'left',  title: { display: true, text: 'TTFT (ms)' } },
-        yMs: { beginAtZero: true, position: 'right', title: { display: true, text: 'ms/token' }, grid: { drawOnChartArea: false } },
+        // TTFT and ms/output share the left axis (both in ms — commensurable).
+        // µs/input takes the right axis because typical values are 1-10 µs/tok,
+        // ~3 orders of magnitude smaller than the ms-scale lines.
+        yMs: { beginAtZero: true, position: 'left',  title: { display: true, text: 'ms (TTFT, ms/output-tok)' } },
+        yUs: { beginAtZero: true, position: 'right', title: { display: true, text: 'µs/input-tok' }, grid: { drawOnChartArea: false } },
       },
       plugins: { legend: { position: 'bottom', labels: { boxWidth: 12 } } },
     },

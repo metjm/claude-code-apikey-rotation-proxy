@@ -3436,14 +3436,40 @@ describe("Request latency timeseries", () => {
     //   r2: total 1300ms over 90 tokens
     // Token-weighted: (800 + 1300) / (30 + 90) = 17.5 → rounded 18.
     // TTFT (start→firstChunk) averaged per-request: (200 + 400) / 2 = 300.
-    km.recordRequestLatency(now - 800,        now - 600,        now,            30, "k", "u");
-    km.recordRequestLatency(now - 1300,       now - 900,        now,            90, "k", "u");
+    km.recordRequestLatency(now - 800,  now - 600, now, 30, 0, 0, 0, "k", "u");
+    km.recordRequestLatency(now - 1300, now - 900, now, 90, 0, 0, 0, "k", "u");
     const buckets = km.getRequestLatencyTimeseries(60_000, 60_000);
     const filled = buckets.filter((b) => b.count > 0);
     expect(filled.length).toBe(1);
     expect(filled[0]!.count).toBe(2);
     expect(filled[0]!.avgTtftMs).toBe(300);
     expect(filled[0]!.avgMsPerOutputToken).toBe(18);
+  });
+
+  test("avgUsPerInputToken uses TTFT divided by total input tokens (input + cache_read + cache_creation)", () => {
+    const km = create();
+    const now = Date.now();
+    // r1: TTFT 200ms, input 50_000 + cache_read 50_000 + cache_creation 0
+    //     → 100k total input. 200ms × 1000 / 100_000 = 2 µs/tok.
+    // r2: TTFT 400ms, input 0 + cache_read 100_000 + cache_creation 100_000
+    //     → 200k total input. 400ms × 1000 / 200_000 = 2 µs/tok.
+    // Token-weighted aggregate: (200_000 + 400_000) / (100_000 + 200_000)
+    //                         = 600_000 / 300_000 = 2 µs/tok.
+    km.recordRequestLatency(now - 1000, now - 800, now, 10, 50_000,      50_000, 0,       "k", null);
+    km.recordRequestLatency(now - 1500, now - 1100, now, 10, 0,           100_000, 100_000, "k", null);
+    const filled = km.getRequestLatencyTimeseries(60_000, 60_000).filter((b) => b.count > 0);
+    expect(filled.length).toBe(1);
+    expect(filled[0]!.avgUsPerInputToken).toBe(2);
+  });
+
+  test("requests with zero input tokens leave avgUsPerInputToken null even if other metrics are populated", () => {
+    const km = create();
+    const now = Date.now();
+    km.recordRequestLatency(now - 500, now - 200, now, 5, 0, 0, 0, "k", null);
+    const filled = km.getRequestLatencyTimeseries(60_000, 60_000).filter((b) => b.count > 0);
+    expect(filled.length).toBe(1);
+    expect(filled[0]!.avgTtftMs).toBe(300);
+    expect(filled[0]!.avgUsPerInputToken).toBeNull();
   });
 
   test("empty buckets return null avgs so the chart can break the line at gaps", () => {
@@ -3454,18 +3480,20 @@ describe("Request latency timeseries", () => {
       expect(b.count).toBe(0);
       expect(b.avgTtftMs).toBeNull();
       expect(b.avgMsPerOutputToken).toBeNull();
+      expect(b.avgUsPerInputToken).toBeNull();
     }
   });
 
-  test("requests without firstChunkAt count toward volume but not TTFT or ms/tok", () => {
+  test("requests without firstChunkAt count toward volume but not TTFT, ms/tok, or µs/input-tok", () => {
     const km = create();
     const now = Date.now();
-    km.recordRequestLatency(now - 500, null, now, 0, "k", null);
+    km.recordRequestLatency(now - 500, null, now, 0, 12_345, 0, 0, "k", null);
     const buckets = km.getRequestLatencyTimeseries(60_000, 60_000);
     const filled = buckets.filter((b) => b.count > 0);
     expect(filled.length).toBe(1);
     expect(filled[0]!.count).toBe(1);
     expect(filled[0]!.avgTtftMs).toBeNull();
     expect(filled[0]!.avgMsPerOutputToken).toBeNull();
+    expect(filled[0]!.avgUsPerInputToken).toBeNull();
   });
 });

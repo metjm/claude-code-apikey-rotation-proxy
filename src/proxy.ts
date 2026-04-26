@@ -1870,6 +1870,9 @@ function createTokenTrackingObserver(
         timings.firstChunkAt,
         timings.endedAt,
         outputTokens,
+        inputTokens,
+        cacheReadTokens,
+        cacheCreationTokens,
         entry.label,
         proxyUser?.label ?? null,
       );
