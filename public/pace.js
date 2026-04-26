@@ -221,35 +221,23 @@
     return earliest === Infinity ? null : earliest;
   }
 
-  // sortKeysForDisplay: priority-preserving display sort.
+  // sortKeysForDisplay: stable, fully-static display sort.
   //   1. priority ASC  — preferred (1) before normal (2) before fallback (3).
   //      Mirrors key-manager.ts selectLeastLoadedAvailableKey (Math.min on
   //      priority, fully exhausting the preferred tier before touching the
   //      next). This is LOAD-BEARING — do not let urgency override priority.
-  //   2. worstToneRank DESC — within tier, keys in trouble float to the top.
-  //      Quantized to tone buckets (not raw pace ratio) so rows don't jitter
-  //      as pace ratios tick every second.
-  //   3. earliestResetAt ASC — within same tier+tone, keys about to refresh
-  //      surface first (they'll be next to receive traffic).
-  //   4. label ASC — deterministic final tiebreaker.
-  function sortKeysForDisplay(keys, now) {
+  //   2. label ASC — alphabetical within tier.
+  // Rows must NEVER reorder based on live signals (tone, resetAt, util) —
+  // operators want to scan the same row for the same key every second; a
+  // sort that shuffles when a key crosses a pace threshold is jittery and
+  // disorienting in real traffic. The `now` argument is kept for API
+  // compatibility but is unused.
+  function sortKeysForDisplay(keys, now) {  // eslint-disable-line no-unused-vars
     var arr = Array.isArray(keys) ? keys.slice() : [];
-    var nowMs = Number(now);
     return arr.sort(function (a, b) {
       var pa = Number((a && a.priority) || 2);
       var pb = Number((b && b.priority) || 2);
       if (pa !== pb) return pa - pb;
-
-      var ta = worstToneRank(a, nowMs);
-      var tb = worstToneRank(b, nowMs);
-      if (ta !== tb) return tb - ta; // worst tone first
-
-      var ra = earliestResetAt(a);
-      var rb = earliestResetAt(b);
-      if (ra !== null && rb !== null && ra !== rb) return ra - rb;
-      if (ra !== null && rb === null) return -1;
-      if (ra === null && rb !== null) return 1;
-
       return String(a && a.label || '').localeCompare(String(b && b.label || ''));
     });
   }

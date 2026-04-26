@@ -417,43 +417,47 @@ describe("computePoolAggregate", () => {
 // ── sortKeysForDisplay ─────────────────────────────────────────────────────
 
 describe("sortKeysForDisplay", () => {
-  test("priority preservation: priority 1 DIM sorts BEFORE priority 2 RED", () => {
-    // The load-bearing assertion: preferred keys always precede normal keys,
-    // regardless of pace tone. Mirrors key-manager.ts selectLeastLoadedAvailableKey
-    // which exhausts priority tier 1 fully before priority 2.
-    const dimPreferred = mkKey("p1-dim", 1, [
-      mkWindow("unified-5h", 0.05, NOW + FIVE_H * 0.5), // dim, behind pace
+  test("priority preservation: priority 1 sorts BEFORE priority 2 regardless of live signal", () => {
+    // The load-bearing assertion: preferred keys always precede normal keys.
+    // Mirrors key-manager.ts selectLeastLoadedAvailableKey which exhausts
+    // priority tier 1 fully before priority 2.
+    const p1 = mkKey("p1-dim", 1, [
+      mkWindow("unified-5h", 0.05, NOW + FIVE_H * 0.5),
     ]);
-    const redNormal = mkKey("p2-red", 2, [
-      mkWindow("unified-5h", 0.95, NOW + FIVE_H * 0.7), // red, burning hot
+    const p2 = mkKey("p2-red", 2, [
+      mkWindow("unified-5h", 0.95, NOW + FIVE_H * 0.7),
     ]);
-    const sorted = PaceMath.sortKeysForDisplay([redNormal, dimPreferred], NOW);
+    const sorted = PaceMath.sortKeysForDisplay([p2, p1], NOW);
     expect(sorted[0].label).toBe("p1-dim");
     expect(sorted[1].label).toBe("p2-red");
   });
 
   test("priority preservation: all tiers correctly bucketed", () => {
     const p1 = mkKey("a-p1", 1, [mkWindow("unified-5h", 0.05, NOW + FIVE_H / 2)]);
-    const p2 = mkKey("b-p2", 2, [mkWindow("unified-5h", 0.9, NOW + FIVE_H * 0.7)]); // red
-    const p3 = mkKey("c-p3", 3, [mkWindow("unified-5h", 0.9, NOW + FIVE_H * 0.7)]); // red
+    const p2 = mkKey("b-p2", 2, [mkWindow("unified-5h", 0.9, NOW + FIVE_H * 0.7)]);
+    const p3 = mkKey("c-p3", 3, [mkWindow("unified-5h", 0.9, NOW + FIVE_H * 0.7)]);
     const sorted = PaceMath.sortKeysForDisplay([p3, p2, p1], NOW);
     expect(sorted.map((k) => k.label)).toEqual(["a-p1", "b-p2", "c-p3"]);
   });
 
-  test("within tier: worst tone floats to top", () => {
-    const green = mkKey("green", 1, [mkWindow("unified-5h", 0.5, NOW + FIVE_H / 2)]);
-    const red   = mkKey("red",   1, [mkWindow("unified-5h", 0.9, NOW + FIVE_H * 0.7)]);
-    const sorted = PaceMath.sortKeysForDisplay([green, red], NOW);
-    expect(sorted[0].label).toBe("red");
-    expect(sorted[1].label).toBe("green");
+  test("within tier: rows are alphabetical, NOT reordered by live signal", () => {
+    // Regression: previously the worst-tone key floated to the top within a
+    // tier, which made rows hop around as keys crossed pace thresholds.
+    // Operators want a stable scan position; sort is now purely static.
+    const aGreen = mkKey("alpha", 1, [mkWindow("unified-5h", 0.5, NOW + FIVE_H / 2)]);
+    const bRed   = mkKey("bravo", 1, [mkWindow("unified-5h", 0.9, NOW + FIVE_H * 0.7)]);
+    const sorted = PaceMath.sortKeysForDisplay([bRed, aGreen], NOW);
+    expect(sorted.map((k) => k.label)).toEqual(["alpha", "bravo"]);
   });
 
-  test("within tier + same tone: reset-soon wins", () => {
-    // Both keys in dim tone (behind pace), differ only in resetAt.
-    const soon = mkKey("soon", 1, [mkWindow("unified-5h", 0.05, NOW + FIVE_H * 0.05)]);
-    const late = mkKey("late", 1, [mkWindow("unified-5h", 0.05, NOW + FIVE_H * 0.5)]);
-    const sorted = PaceMath.sortKeysForDisplay([late, soon], NOW);
-    expect(sorted[0].label).toBe("soon");
+  test("within tier: imminent reset does NOT promote a key — alphabetical wins", () => {
+    // Regression: previously the key whose window resets soonest floated to
+    // the top within a tier. That made rows visibly resort as resetAt ticks
+    // past other keys' resetAt values. Now it's purely alphabetical.
+    const soon = mkKey("zeta", 1, [mkWindow("unified-5h", 0.05, NOW + FIVE_H * 0.05)]);
+    const late = mkKey("alpha", 1, [mkWindow("unified-5h", 0.05, NOW + FIVE_H * 0.5)]);
+    const sorted = PaceMath.sortKeysForDisplay([soon, late], NOW);
+    expect(sorted.map((k) => k.label)).toEqual(["alpha", "zeta"]);
   });
 
   test("deterministic final tiebreaker on label", () => {
@@ -475,11 +479,10 @@ describe("sortKeysForDisplay", () => {
     expect(PaceMath.sortKeysForDisplay([], NOW)).toEqual([]);
   });
 
-  test("jitter stability: sort order stable across 60 ticks (1 second apart)", () => {
-    // This is the regression test against rows hopping around. If tones are
-    // bucketed correctly (not raw pace ratios), two keys with the same tone
-    // must never swap places as `now` advances second-by-second for a stable
-    // input set.
+  test("stability: sort order stable across 60 ticks (1 second apart) even with shifting pace", () => {
+    // Regression against rows hopping around. The sort must NEVER reorder
+    // rows as `now` advances, regardless of how the underlying pace tones
+    // and resetAt windows shift relative to `now`.
     const keys = [
       mkKey("p1-red",   1, [mkWindow("unified-5h", 0.9, NOW + FIVE_H * 0.7)]),
       mkKey("p1-green", 1, [mkWindow("unified-5h", 0.5, NOW + FIVE_H / 2)]),
