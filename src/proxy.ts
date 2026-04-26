@@ -516,6 +516,7 @@ export async function proxyRequest(
         url.pathname,
         traceId,
         sessionId,
+        firstMessageHash,
       );
       markActiveRequestWaitingForFirstChunk(traceId);
       const waitContext = buildActiveRequestContext(traceId, Date.now());
@@ -619,7 +620,7 @@ export async function proxyRequest(
       );
     } else if (upstream.body !== null) {
       const text = await upstream.text();
-      extractTokensFromJson(text, entry, keyManager, proxyUser, sessionId);
+      extractTokensFromJson(text, entry, keyManager, proxyUser, sessionId, firstMessageHash);
       const bodyChanges = schemaTracker.recordResponseJson(url.pathname, text);
       if (bodyChanges.length > 0) {
         emitWithKeys({
@@ -1631,6 +1632,7 @@ function extractTokensFromJson(
   keyManager: KeyManager,
   proxyUser: ProxyTokenEntry | null | undefined,
   sessionId: string | null,
+  conversationHash: string | null,
 ): void {
   try {
     const parsed = JSON.parse(text) as AnthropicResponse;
@@ -1644,7 +1646,8 @@ function extractTokensFromJson(
       log("info", "Token usage", { label: entry.label, user: proxyUser?.label, input, output, cacheRead, cacheCreation });
       emitWithKeys({
         type: "tokens", ts: new Date().toISOString(), label: entry.label,
-        user: proxyUser?.label, sessionId, input, output, cacheRead, cacheCreation,
+        user: proxyUser?.label, sessionId, conversationHash,
+        input, output, cacheRead, cacheCreation,
       }, keyManager.listKeys());
     }
   } catch {
@@ -1661,6 +1664,7 @@ function createTokenTrackingObserver(
   endpoint: string,
   traceId: string,
   sessionId: string | null,
+  conversationHash: string | null,
 ): StreamObserver {
   const decoder = new TextDecoder();
   let buffer = "";
@@ -1692,7 +1696,7 @@ function createTokenTrackingObserver(
     cacheCreationReported = cacheCreationTokens;
     emitWithKeys({
       type: "tokens", ts: new Date().toISOString(), label: entry.label,
-      user: proxyUser?.label, sessionId,
+      user: proxyUser?.label, sessionId, conversationHash,
       input: inDelta, output: outDelta, cacheRead: crDelta, cacheCreation: ccDelta,
       partial: true,
     }, keyManager.listKeys());

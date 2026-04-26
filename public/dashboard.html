@@ -870,18 +870,64 @@ let colorIdx = 0;
 // tier 2/3 keys are actually receiving traffic.
 let requestsByTier = {};
 
-// Per-session live throughput. throughputState.bySession[id] is an append-only
-// list of {ts,in,out} samples; the chart buckets them per-second. tick is
-// bumped every 250ms so charts redraw and slide left even while idle.
+// Per-conversation live throughput. throughputState.byConv[key] is an append-
+// only list of {ts,in,out} samples bucketed per-second by the chart. The key
+// is `${sessionId}::${conversationHash || ''}` so a session with three
+// sub-conversations gets three independent charts, and a session with no hash
+// yet still shares one bucket. tick bumps every 250ms so charts redraw and
+// slide left even while idle. peakIn and peakOut are global across every
+// chart so input bars are comparable to other input bars, and output bars to
+// other output bars — independently scaled so cache-heavy input doesn't
+// collapse output rendering.
 const THROUGHPUT_WINDOW_MS = 30_000;
 const THROUGHPUT_RETAIN_MS = 60_000;
-const throughputState = Vue.reactive({ bySession: {}, tick: 0 });
+const THROUGHPUT_PEAK_DECAY = 0.95;
+const throughputState = Vue.reactive({ byConv: {}, tick: 0, peakIn: 0, peakOut: 0 });
 
-function recordThroughputDelta(sessionId, sample) {
-  if (!sessionId) return;
-  const arr = throughputState.bySession[sessionId] || (throughputState.bySession[sessionId] = []);
+function throughputConvKey(sessionId, conversationHash) {
+  if (!sessionId) return null;
+  return sessionId + '::' + (conversationHash || '');
+}
+
+function recordThroughputDelta(sessionId, conversationHash, sample) {
+  const key = throughputConvKey(sessionId, conversationHash);
+  if (!key) return;
+  const arr = throughputState.byConv[key] || (throughputState.byConv[key] = []);
   arr.push(sample);
   if (arr.length > 2000) arr.splice(0, arr.length - 2000);
+  // Bump global peaks immediately so the first sample on a fresh dashboard
+  // doesn't paint at scale=1 (which would clip to a full-height bar). The
+  // ticker refines this with a properly bucketed scan plus EMA decay.
+  if (sample.in  > throughputState.peakIn)  throughputState.peakIn  = sample.in;
+  if (sample.out > throughputState.peakOut) throughputState.peakOut = sample.out;
+}
+
+function recomputeGlobalThroughputPeaks() {
+  const now = Date.now();
+  const BUCKET_MS = 1000;
+  const N = THROUGHPUT_WINDOW_MS / BUCKET_MS;
+  let maxIn = 0, maxOut = 0;
+  for (const id of Object.keys(throughputState.byConv)) {
+    const samples = throughputState.byConv[id];
+    const buckets = new Array(N);
+    for (let i = 0; i < N; i++) buckets[i] = { in: 0, out: 0 };
+    for (let i = 0; i < samples.length; i++) {
+      const s = samples[i];
+      const offset = Math.floor((now - s.ts) / BUCKET_MS);
+      if (offset < 0 || offset >= N) continue;
+      const idx = N - 1 - offset;
+      buckets[idx].in  += s.in  || 0;
+      buckets[idx].out += s.out || 0;
+    }
+    for (let i = 0; i < N; i++) {
+      if (buckets[i].in  > maxIn)  maxIn  = buckets[i].in;
+      if (buckets[i].out > maxOut) maxOut = buckets[i].out;
+    }
+  }
+  // EMA-smoothed: a single spike raises the ceiling instantly; quiet stretches
+  // relax it gradually so cross-chart comparisons stay readable.
+  throughputState.peakIn  = Math.max(maxIn,  throughputState.peakIn  * THROUGHPUT_PEAK_DECAY);
+  throughputState.peakOut = Math.max(maxOut, throughputState.peakOut * THROUGHPUT_PEAK_DECAY);
 }
 
 function startThroughputTicker() {
@@ -889,13 +935,14 @@ function startThroughputTicker() {
   window.__throughputTickerStarted = true;
   setInterval(() => {
     const cutoff = Date.now() - THROUGHPUT_RETAIN_MS;
-    for (const id of Object.keys(throughputState.bySession)) {
-      const arr = throughputState.bySession[id];
+    for (const id of Object.keys(throughputState.byConv)) {
+      const arr = throughputState.byConv[id];
       let drop = 0;
       while (drop < arr.length && arr[drop].ts < cutoff) drop++;
       if (drop > 0) arr.splice(0, drop);
-      if (arr.length === 0) delete throughputState.bySession[id];
+      if (arr.length === 0) delete throughputState.byConv[id];
     }
+    recomputeGlobalThroughputPeaks();
     throughputState.tick = (throughputState.tick + 1) & 0xffff;
   }, 250);
 }
@@ -1717,19 +1764,21 @@ let keysVm = null;
 function ensureKeysApp() {
   if (keysVm) return keysVm;
 
-  // Per-session live throughput. Input grows up (blue), output grows down
-  // (green); bars step left every second. Width 150px matches the request.
+  // Per-conversation live throughput. Input grows up (blue), output grows
+  // down (green); bars step left every second. Width 150px matches the
+  // requested size. Keyed by `${sessionId}::${conversationHash || ''}` so
+  // multi-conv sessions get one chart per sub-conversation.
   const ThroughputChartComponent = {
     props: {
-      sessionId: { type: String, required: true },
+      convKey: { type: String, required: true },
     },
     computed: {
       buckets() {
         // Read tick so every periodic pruning pass invalidates this computed
-        // — that's what keeps the chart sliding when the session is idle.
+        // — that's what keeps the chart sliding when the conversation is idle.
         // eslint-disable-next-line no-unused-expressions
         throughputState.tick;
-        const samples = throughputState.bySession[this.sessionId] || [];
+        const samples = throughputState.byConv[this.convKey] || [];
         const BUCKET_MS = 1000;
         const N = THROUGHPUT_WINDOW_MS / BUCKET_MS;
         const buckets = new Array(N);
@@ -1757,7 +1806,7 @@ function ensureKeysApp() {
       isLive() {
         // eslint-disable-next-line no-unused-expressions
         throughputState.tick;
-        const arr = throughputState.bySession[this.sessionId] || [];
+        const arr = throughputState.byConv[this.convKey] || [];
         if (arr.length === 0) return false;
         return (Date.now() - arr[arr.length - 1].ts) < 3500;
       },
@@ -1786,16 +1835,12 @@ function ensureKeysApp() {
         const gap = 1;
         const barW = Math.max(1, slot - gap);
 
-        // Smoothed peak: a single spike doesn't permanently squash later
-        // bars; a sustained drop lets the y-scale relax over a few seconds.
-        let cur = 0;
-        for (let i = 0; i < N; i++) {
-          if (buckets[i].in  > cur) cur = buckets[i].in;
-          if (buckets[i].out > cur) cur = buckets[i].out;
-        }
-        const decay = 0.92;
-        this.peak = Math.max(cur, this.peak * decay);
-        const scale = this.peak > 0 ? this.peak : 1;
+        // Global peaks shared across every chart. Input bars are normalized
+        // against the loudest input across all sessions; output bars against
+        // the loudest output. Independent so input vs output don't suppress
+        // each other when one channel dominates.
+        const scaleIn  = throughputState.peakIn  > 0 ? throughputState.peakIn  : 1;
+        const scaleOut = throughputState.peakOut > 0 ? throughputState.peakOut : 1;
 
         const mid = cssH / 2;
         const halfH = mid - 1;
@@ -1805,12 +1850,12 @@ function ensureKeysApp() {
           const inV = buckets[i].in;
           const outV = buckets[i].out;
           if (inV > 0) {
-            const h = Math.max(1, Math.round((inV / scale) * halfH));
+            const h = Math.max(1, Math.min(halfH, Math.round((inV / scaleIn) * halfH)));
             ctx.fillStyle = '#58a6ff';
             ctx.fillRect(x, mid - h, barW, h);
           }
           if (outV > 0) {
-            const h = Math.max(1, Math.round((outV / scale) * halfH));
+            const h = Math.max(1, Math.min(halfH, Math.round((outV / scaleOut) * halfH)));
             ctx.fillStyle = '#3fb950';
             ctx.fillRect(x, mid, barW, h);
           }
@@ -1818,7 +1863,7 @@ function ensureKeysApp() {
       },
     },
     template: `
-      <div class="thr-row" :title="'Live token throughput for this session — last ' + (THROUGHPUT_WINDOW_MS/1000) + 's. Blue = incoming (input + cache), green = outgoing.'">
+      <div class="thr-row" :title="'Live token throughput for this conversation — last ' + (THROUGHPUT_WINDOW_MS/1000) + 's. Blue = incoming (input + cache), green = outgoing. Bars normalized against the loudest input/output across all charts.'">
         <div class="thr-canvas-wrap">
           <canvas class="thr-canvas" ref="canvas" width="150" height="30"></canvas>
         </div>
@@ -1831,7 +1876,6 @@ function ensureKeysApp() {
     `,
     data() {
       return {
-        peak: 0,
         THROUGHPUT_WINDOW_MS: THROUGHPUT_WINDOW_MS,
         fmtNum: fmtNum,
       };
@@ -1862,12 +1906,21 @@ function ensureKeysApp() {
       sessionDotStyle() { return { '--dot': colorForId(this.session.sessionId) }; },
       idHead() { return idHead(this.session.sessionId, 8, 4); },
       idTailText() { return idTail(this.session.sessionId, 8, 4); },
+      // For single-conv sessions there's no separate sub-row — the session
+      // row is the conversation. The chart still keys by the conv's hash so
+      // it lines up with the data the backend emits.
+      singleConvKey() {
+        if (this.hasMultipleConvs) return null;
+        const c = this.convs[0];
+        return throughputConvKey(this.session.sessionId, c ? c.hash : null);
+      },
     },
     methods: {
       convDotStyle(c) { return { '--dot': c.hash ? colorForId(c.hash) : 'var(--text-dim)' }; },
       convIdHead(c) { return idHead(c.hash || '(no hash)', 8, 8); },
       convIdTail(c) { return idTail(c.hash || '(no hash)', 8, 8); },
       ageTitle(iso) { return iso ? 'First seen ' + iso : ''; },
+      convKey(c) { return throughputConvKey(this.session.sessionId, c.hash); },
       fmtAge: fmtAge,
       fmtRelative: fmtRelative,
       fmtNum: fmtNum,
@@ -1887,7 +1940,7 @@ function ensureKeysApp() {
           <span class="cell-sep">·</span>
           <span title="Routing decisions on this key in last 15m"><b>{{ fmtNum(session.totalRequests || 0) }}</b> req</span>
         </span>
-        <throughput-chart :session-id="session.sessionId"></throughput-chart>
+        <throughput-chart v-if="!hasMultipleConvs" :conv-key="singleConvKey"></throughput-chart>
         <template v-for="c in convsToRender" :key="c.vueKey">
           <span class="cell-dot cell-dot--conv" :style="convDotStyle(c)"><span class="dot"></span></span>
           <span class="cell-hash" :title="c.hash || '(no hash)'">{{ convIdHead(c) }}<span class="id-tail">{{ convIdTail(c) }}</span></span>
@@ -1898,6 +1951,7 @@ function ensureKeysApp() {
             <span class="cell-sep">·</span>
             <span>{{ fmtRelative(c.lastSeenAt) }}</span>
           </span>
+          <throughput-chart :conv-key="convKey(c)"></throughput-chart>
         </template>
       </div>
     `,
@@ -2318,12 +2372,14 @@ function connectSSE() {
       }
       // Streaming: backend emits ~250ms-throttled deltas during the response.
       // Non-streaming: one cumulative event at request completion. Both are
-      // additive into the per-second buckets the chart renders.
+      // additive into the per-second buckets the chart renders. Bucketed by
+      // (sessionId, conversationHash) so each sub-conversation in a session
+      // gets its own chart.
       if (event.type === 'tokens' && event.sessionId) {
         const incoming = (event.input || 0) + (event.cacheRead || 0) + (event.cacheCreation || 0);
         const outgoing = event.output || 0;
         if (incoming > 0 || outgoing > 0) {
-          recordThroughputDelta(event.sessionId, { ts: Date.now(), in: incoming, out: outgoing });
+          recordThroughputDelta(event.sessionId, event.conversationHash || null, { ts: Date.now(), in: incoming, out: outgoing });
         }
       }
       // Log non-heartbeat events

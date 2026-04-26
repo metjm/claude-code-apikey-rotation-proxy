@@ -552,7 +552,7 @@ describe("Dashboard sessions cell (Vue render)", () => {
     }
   });
 
-  test("renders a per-session live throughput chart that updates as tokens arrive", async () => {
+  test("single-conv session: chart sits inline with the session row, keyed by the conversation hash", async () => {
     const dataDir = makeTempDir();
     const upstream = startMockUpstream();
     const proxy = startProxy({ dataDir, upstream: upstream.url, adminToken: ADMIN_TOKEN });
@@ -560,46 +560,28 @@ describe("Dashboard sessions cell (Vue render)", () => {
     try {
       proxy.km.addKey(VALID_KEY_1, "key-a");
       const sessionId = "30000000-0000-0000-0000-000000000003";
-      proxy.km.getKeyForConversation(`till@trainly:${sessionId}:hash-feedabe1`, sessionId);
+      const hash = "feedabe1deadbeef";
+      proxy.km.getKeyForConversation(`till@trainly:${sessionId}:${hash}`, sessionId);
 
       const page = await openDashboard(browser, proxy.url, ADMIN_TOKEN);
       await page.waitForSelector(".session-group .thr-canvas", { timeout: 15_000 });
 
-      // Push token events through the real events bus — the dashboard's SSE
-      // subscribes to the same bus, so this exercises the same path a live
-      // proxy would. Two events: an "incoming" burst (input + cache_read) and
-      // an "outgoing" burst.
+      // Token event must include conversationHash matching the conv. Only
+      // events with the right (sessionId, conversationHash) pair will land
+      // in this chart's bucket.
       emitWithKeys(
-        {
-          type: "tokens",
-          ts: new Date().toISOString(),
-          label: "key-a",
-          sessionId,
-          input: 800,
-          output: 0,
-          cacheRead: 200,
-          cacheCreation: 0,
-          partial: true,
-        },
+        { type: "tokens", ts: new Date().toISOString(), label: "key-a",
+          sessionId, conversationHash: hash,
+          input: 800, output: 0, cacheRead: 200, cacheCreation: 0, partial: true },
         proxy.km.listKeys(),
       );
       emitWithKeys(
-        {
-          type: "tokens",
-          ts: new Date().toISOString(),
-          label: "key-a",
-          sessionId,
-          input: 0,
-          output: 350,
-          cacheRead: 0,
-          cacheCreation: 0,
-          partial: true,
-        },
+        { type: "tokens", ts: new Date().toISOString(), label: "key-a",
+          sessionId, conversationHash: hash,
+          input: 0, output: 350, cacheRead: 0, cacheCreation: 0, partial: true },
         proxy.km.listKeys(),
       );
 
-      // Wait for the chart's legend to reflect the totals (1.0k incoming /
-      // 350 outgoing). The fmtNum helper renders >=1000 as "1.0k".
       await page.waitForFunction(
         (sid: string) => {
           const group = [...document.querySelectorAll(".session-group")].find(
@@ -616,8 +598,10 @@ describe("Dashboard sessions cell (Vue render)", () => {
         sessionId,
       );
 
-      // Canvas pixel sanity: we drew something — check it's not all transparent
-      // and that both blue (input) and green (output) pixels are present.
+      // A single-conv session should have exactly one chart.
+      const chartCount = await page.$$eval(".session-group .thr-canvas", (els) => els.length);
+      expect(chartCount).toBe(1);
+
       const pixelStats = await page.$eval(
         ".session-group .thr-canvas",
         (canvas) => {
@@ -629,9 +613,7 @@ describe("Dashboard sessions cell (Vue render)", () => {
             const r = data[i], g = data[i + 1], b = data[i + 2], a = data[i + 3];
             if (a === 0) continue;
             opaque++;
-            // Anthropic-blue ≈ #58a6ff (88,166,255) — high blue, lower red.
             if (b > 200 && r < 130) blue++;
-            // Green ≈ #3fb950 (63,185,80) — high green, lower others.
             if (g > 150 && r < 100 && b < 120) green++;
           }
           return { blue, green, opaque };
@@ -640,6 +622,195 @@ describe("Dashboard sessions cell (Vue render)", () => {
       expect(pixelStats.opaque).toBeGreaterThan(0);
       expect(pixelStats.blue).toBeGreaterThan(0);
       expect(pixelStats.green).toBeGreaterThan(0);
+
+      await page.close();
+    } finally {
+      proxy.stop();
+      upstream.stop();
+      cleanupTempDir(dataDir);
+    }
+  }, 60_000);
+
+  test("multi-conv session: one chart per sub-conversation, each fed independently by conversationHash", async () => {
+    const dataDir = makeTempDir();
+    const upstream = startMockUpstream();
+    const proxy = startProxy({ dataDir, upstream: upstream.url, adminToken: ADMIN_TOKEN });
+
+    try {
+      proxy.km.addKey(VALID_KEY_1, "key-a");
+      const sessionId = "50000000-0000-0000-0000-000000000005";
+      const hashA = "aaaaaaaaaaaaaaaa";
+      const hashB = "bbbbbbbbbbbbbbbb";
+      proxy.km.getKeyForConversation(`till@trainly:${sessionId}:${hashA}`, sessionId);
+      proxy.km.getKeyForConversation(`till@trainly:${sessionId}:${hashB}`, sessionId);
+
+      const page = await openDashboard(browser, proxy.url, ADMIN_TOKEN);
+      await page.waitForFunction(
+        () => document.querySelectorAll(".session-group .thr-canvas").length >= 2,
+        { timeout: 15_000 },
+      );
+
+      const keys = proxy.km.listKeys();
+      // Send to conv A only. Conv B's chart must stay quiet.
+      emitWithKeys(
+        { type: "tokens", ts: new Date().toISOString(), label: "key-a",
+          sessionId, conversationHash: hashA,
+          input: 1500, output: 600, cacheRead: 0, cacheCreation: 0, partial: true },
+        keys,
+      );
+
+      // Per-conv legends. Conv A shows the totals; conv B stays at 0/0.
+      await page.waitForFunction(
+        (sid: string, ha: string) => {
+          const group = [...document.querySelectorAll(".session-group")].find(
+            (el) => el.querySelector(".cell-id")?.getAttribute("title") === sid,
+          );
+          if (!group) return false;
+          // Each conversation row has its own .thr-in / .thr-out.
+          const ins  = [...group.querySelectorAll(".thr-in")];
+          const outs = [...group.querySelectorAll(".thr-out")];
+          if (ins.length < 2 || outs.length < 2) return false;
+          // Find the conv row whose .cell-hash title matches hashA — its
+          // chart should be the one carrying the totals.
+          const convRows = [...group.querySelectorAll(".cell-hash")];
+          const hashes = convRows.map((c) => c.getAttribute("title"));
+          if (!hashes.includes(ha)) return false;
+          const aIdx = hashes.indexOf(ha);
+          const aIn  = ins[aIdx]?.textContent  ?? "";
+          const aOut = outs[aIdx]?.textContent ?? "";
+          return aIn.includes("1.5k") && aOut.includes("600");
+        },
+        { timeout: 5_000 },
+        sessionId,
+        hashA,
+      );
+
+      const summary = await page.evaluate((sid: string, ha: string, hb: string) => {
+        const group = [...document.querySelectorAll(".session-group")].find(
+          (el) => el.querySelector(".cell-id")?.getAttribute("title") === sid,
+        ) as HTMLElement | undefined;
+        if (!group) return null;
+        const convRows = [...group.querySelectorAll(".cell-hash")] as HTMLElement[];
+        const ins  = [...group.querySelectorAll(".thr-in")]  as HTMLElement[];
+        const outs = [...group.querySelectorAll(".thr-out")] as HTMLElement[];
+        const hashes = convRows.map((c) => c.getAttribute("title"));
+        const aIdx = hashes.indexOf(ha);
+        const bIdx = hashes.indexOf(hb);
+        return {
+          chartCount: group.querySelectorAll(".thr-canvas").length,
+          convCount:  convRows.length,
+          aIn:  ins[aIdx]?.textContent  ?? "",
+          aOut: outs[aIdx]?.textContent ?? "",
+          bIn:  ins[bIdx]?.textContent  ?? "",
+          bOut: outs[bIdx]?.textContent ?? "",
+        };
+      }, sessionId, hashA, hashB);
+
+      expect(summary).not.toBeNull();
+      // Two conversations → two charts under the multi-conv session row.
+      expect(summary!.chartCount).toBe(2);
+      expect(summary!.convCount).toBe(2);
+      expect(summary!.aIn).toContain("1.5k");
+      expect(summary!.aOut).toContain("600");
+      // Conv B never received an event, so its legend is still at 0.
+      expect(summary!.bIn).toContain("0");
+      expect(summary!.bOut).toContain("0");
+
+      await page.close();
+    } finally {
+      proxy.stop();
+      upstream.stop();
+      cleanupTempDir(dataDir);
+    }
+  }, 60_000);
+
+  test("normalizes bar heights against the global max so quiet conversations read smaller than loud ones", async () => {
+    const dataDir = makeTempDir();
+    const upstream = startMockUpstream();
+    const proxy = startProxy({ dataDir, upstream: upstream.url, adminToken: ADMIN_TOKEN });
+
+    try {
+      proxy.km.addKey(VALID_KEY_1, "key-a");
+      const loudSession  = "40000000-0000-0000-0000-00000000004a";
+      const quietSession = "40000000-0000-0000-0000-00000000004b";
+      const loudHash  = "1111111111111111";
+      const quietHash = "2222222222222222";
+      proxy.km.getKeyForConversation(`till@trainly:${loudSession}:${loudHash}`,  loudSession);
+      proxy.km.getKeyForConversation(`till@trainly:${quietSession}:${quietHash}`, quietSession);
+
+      const page = await openDashboard(browser, proxy.url, ADMIN_TOKEN);
+      await page.waitForFunction(
+        () => document.querySelectorAll(".session-group .thr-canvas").length >= 2,
+        { timeout: 15_000 },
+      );
+
+      const keys = proxy.km.listKeys();
+      // 10× ratio. With shared global scale on input, the loud bar is
+      // full-height and the quiet bar lands around 10% of that. Output
+      // scales independently; since loud has no output, scaleOut comes
+      // from quiet's 500.
+      emitWithKeys(
+        { type: "tokens", ts: new Date().toISOString(), label: "key-a",
+          sessionId: loudSession, conversationHash: loudHash,
+          input: 10000, output: 0, cacheRead: 0, cacheCreation: 0, partial: true },
+        keys,
+      );
+      emitWithKeys(
+        { type: "tokens", ts: new Date().toISOString(), label: "key-a",
+          sessionId: quietSession, conversationHash: quietHash,
+          input: 1000, output: 500, cacheRead: 0, cacheCreation: 0, partial: true },
+        keys,
+      );
+
+      await page.waitForFunction(
+        (loud: string, quiet: string) => {
+          const groups = [...document.querySelectorAll(".session-group")] as HTMLElement[];
+          const ofId = (sid: string) => groups.find((g) => g.querySelector(".cell-id")?.getAttribute("title") === sid);
+          const a = ofId(loud), b = ofId(quiet);
+          if (!a || !b) return false;
+          const txt = (el: Element | null) => el?.textContent ?? "";
+          return txt(a.querySelector(".thr-in")).includes("10")
+            && txt(b.querySelector(".thr-in")).includes("1.0k");
+        },
+        { timeout: 5_000 },
+        loudSession,
+        quietSession,
+      );
+      // Let one ticker pass refine peakIn/peakOut and trigger a repaint.
+      await new Promise((resolve) => setTimeout(resolve, 400));
+
+      const tallest = await page.evaluate((loud: string, quiet: string) => {
+        const groups = [...document.querySelectorAll(".session-group")] as HTMLElement[];
+        const ofId = (sid: string) => groups.find((g) => g.querySelector(".cell-id")?.getAttribute("title") === sid);
+        function tallestBlue(group: HTMLElement | undefined): number {
+          if (!group) return -1;
+          const canvas = group.querySelector(".thr-canvas") as HTMLCanvasElement | null;
+          if (!canvas) return -1;
+          const ctx = canvas.getContext("2d")!;
+          const { width, height } = canvas;
+          const data = ctx.getImageData(0, 0, width, height).data;
+          let best = 0;
+          for (let x = 0; x < width; x++) {
+            let count = 0;
+            for (let y = 0; y < height; y++) {
+              const i = (y * width + x) * 4;
+              const r = data[i], g = data[i + 1], b = data[i + 2], a = data[i + 3];
+              if (a !== 0 && b > 200 && r < 130 && g < 200) count++;
+            }
+            if (count > best) best = count;
+          }
+          return best;
+        }
+        return {
+          loud:  tallestBlue(ofId(loud)),
+          quiet: tallestBlue(ofId(quiet)),
+        };
+      }, loudSession, quietSession);
+
+      expect(tallest.loud).toBeGreaterThan(0);
+      expect(tallest.quiet).toBeGreaterThan(0);
+      // Loud must be visibly taller than quiet — input bars share scaleIn.
+      expect(tallest.loud).toBeGreaterThan(tallest.quiet * 3);
 
       await page.close();
     } finally {

@@ -928,7 +928,7 @@ describe("Token Tracking - Non-Streaming", () => {
     expect(tokenEvents[0]!.output).toBe(20);
   });
 
-  test("tokens event carries sessionId from request header (non-streaming)", async () => {
+  test("tokens event carries sessionId and conversationHash from request (non-streaming)", async () => {
     const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
 
@@ -944,7 +944,13 @@ describe("Token Tracking - Non-Streaming", () => {
       proxyRequest(
         makeRequest("/v1/messages", {
           method: "POST",
-          headers: { "x-claude-code-session-id": "sess-abc" },
+          headers: {
+            "content-type": "application/json",
+            "x-claude-code-session-id": "sess-abc",
+          },
+          body: JSON.stringify({
+            messages: [{ role: "user", content: "first message body" }],
+          }),
         }),
         km,
         config,
@@ -955,9 +961,11 @@ describe("Token Tracking - Non-Streaming", () => {
     const tokenEvents = events.filter((e) => e.type === "tokens");
     expect(tokenEvents.length).toBe(1);
     expect(tokenEvents[0]!.sessionId).toBe("sess-abc");
+    // Hash is 16 hex chars derived from JSON.stringify(messages[0]).
+    expect(tokenEvents[0]!.conversationHash).toMatch(/^[0-9a-f]{16}$/);
   });
 
-  test("tokens event has null sessionId when no session header is present", async () => {
+  test("tokens event has null sessionId and conversationHash when no header or body", async () => {
     const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
 
@@ -976,6 +984,7 @@ describe("Token Tracking - Non-Streaming", () => {
     const tokenEvents = events.filter((e) => e.type === "tokens");
     expect(tokenEvents.length).toBe(1);
     expect(tokenEvents[0]!.sessionId).toBe(null);
+    expect(tokenEvents[0]!.conversationHash).toBe(null);
   });
 });
 
@@ -2475,7 +2484,7 @@ describe("Edge Cases", () => {
     expect(tokenEvents[0]!.user).toBe("alice");
   });
 
-  test("streaming tokens event carries sessionId so the dashboard can route the throughput chart", async () => {
+  test("streaming tokens event carries sessionId and conversationHash so the dashboard can route the throughput chart", async () => {
     const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
 
@@ -2507,7 +2516,14 @@ describe("Edge Cases", () => {
     const result = await proxyRequest(
       makeRequest("/v1/messages", {
         method: "POST",
-        headers: { "x-claude-code-session-id": "sess-stream-1" },
+        headers: {
+          "content-type": "application/json",
+          "x-claude-code-session-id": "sess-stream-1",
+        },
+        body: JSON.stringify({
+          stream: true,
+          messages: [{ role: "user", content: "stream test" }],
+        }),
       }),
       km,
       config,
@@ -2521,8 +2537,13 @@ describe("Edge Cases", () => {
 
     const tokenEvents = events.filter((e) => e.type === "tokens");
     expect(tokenEvents.length).toBeGreaterThan(0);
+    const firstHash = tokenEvents[0]!.conversationHash;
+    expect(firstHash).toMatch(/^[0-9a-f]{16}$/);
     for (const ev of tokenEvents) {
       expect(ev.sessionId).toBe("sess-stream-1");
+      // Every delta must carry the same conversationHash so the dashboard
+      // routes them all to one chart.
+      expect(ev.conversationHash).toBe(firstHash);
     }
     // Deltas across all emitted token events must equal the cumulative
     // counts the upstream advertised — i.e. exactly one bar's worth of
