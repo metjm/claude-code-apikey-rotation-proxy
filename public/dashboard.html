@@ -646,6 +646,19 @@
     <div class="fleet-pressure" id="fleet-pressure"></div>
   </div>
 
+  <div class="panel panel-full" style="min-height:200px;margin-bottom:16px">
+    <div class="panel-header">
+      <span class="panel-title">Response latency</span>
+      <select id="latency-range" class="btn" onchange="loadLatencyChart()" style="appearance:auto;padding-right:8px">
+        <option value="30m">30m</option>
+        <option value="1h">1h</option>
+        <option value="5h">5h</option>
+        <option value="24h">24h</option>
+      </select>
+    </div>
+    <div style="flex:1;position:relative;min-height:160px"><canvas id="chart-latency"></canvas></div>
+  </div>
+
   <div class="panel panel-full">
     <div class="panel-header">
       <span class="panel-title">API Keys</span>
@@ -2754,6 +2767,72 @@ let requestsChart = null;
 let tokensChart = null;
 let capacityChart = null;
 let capacityStatusChart = null;
+let latencyChart = null;
+
+function fmtLatencyTick(timestampMs, range) {
+  const d = new Date(timestampMs);
+  if (range === '24h') {
+    return `${d.toLocaleDateString([], { month: 'short', day: 'numeric' })} ${String(d.getHours()).padStart(2, '0')}:00`;
+  }
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+}
+
+async function loadLatencyChart() {
+  const range = document.getElementById('latency-range').value;
+  let data;
+  try {
+    data = await api('GET', `/admin/latency/timeseries?range=${range}`);
+  } catch { return; }
+  const buckets = data.buckets || [];
+  // Server already fills empty buckets with null avgs so the chart can break
+  // the line at gaps via spanGaps:false. Keep nulls as-is for the chart.
+  const labels = buckets.map(b => fmtLatencyTick(b.bucketStart, range));
+  const ttftData = buckets.map(b => b.avgTtftMs);
+  const tokData  = buckets.map(b => b.avgMsPerOutputToken);
+
+  if (latencyChart) {
+    latencyChart.data.labels = labels;
+    latencyChart.data.datasets[0].data = ttftData;
+    latencyChart.data.datasets[1].data = tokData;
+    latencyChart.update('none');
+    return;
+  }
+
+  latencyChart = new Chart(document.getElementById('chart-latency'), {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [
+        {
+          label: 'avg time to first token (ms)',
+          data: ttftData,
+          borderColor: '#f85149',
+          backgroundColor: 'rgba(248,81,73,0.08)',
+          tension: 0.25, pointRadius: 0, spanGaps: false,
+          yAxisID: 'y',
+        },
+        {
+          label: 'avg ms per output token',
+          data: tokData,
+          borderColor: '#d29922',
+          backgroundColor: 'rgba(210,153,34,0.08)',
+          tension: 0.25, pointRadius: 0, spanGaps: false,
+          yAxisID: 'yMs',
+        },
+      ],
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      scales: {
+        x: { ticks: { maxRotation: 0, autoSkip: true, maxTicksLimit: 12 } },
+        y:   { beginAtZero: true, position: 'left',  title: { display: true, text: 'TTFT (ms)' } },
+        yMs: { beginAtZero: true, position: 'right', title: { display: true, text: 'ms/token' }, grid: { drawOnChartArea: false } },
+      },
+      plugins: { legend: { position: 'bottom', labels: { boxWidth: 12 } } },
+    },
+  });
+}
 
 function formatBucketLabel(bucket, resolution) {
   if (resolution === 'day') return bucket;
@@ -3177,13 +3256,14 @@ function init() {
   refreshKeys();
   refreshTokens();
   loadCharts();
+  loadLatencyChart();
   refreshSchema();
   refreshForecast();
   if (countdownInterval) clearInterval(countdownInterval);
   if (chartsRefreshInterval) clearInterval(chartsRefreshInterval);
   if (forecastRefreshInterval) clearInterval(forecastRefreshInterval);
   countdownInterval = setInterval(() => { renderKeys(); renderHeader(); }, 1000);
-  chartsRefreshInterval = setInterval(() => { loadCharts(); }, 30000);
+  chartsRefreshInterval = setInterval(() => { loadCharts(); loadLatencyChart(); }, 30000);
   forecastRefreshInterval = setInterval(() => { refreshForecast(); }, 15 * 60 * 1000);
 }
 </script>

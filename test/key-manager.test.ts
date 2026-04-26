@@ -3423,3 +3423,47 @@ describe("Short-Cooldown Affinity Passthrough", () => {
     expect(sticky.cooldownRemainingMs).toBeNull();
   });
 });
+
+describe("Request latency timeseries", () => {
+  test("buckets reflect token-weighted ms-per-output and arithmetic-mean TTFT", () => {
+    const km = create();
+    const now = Date.now();
+    // Two requests in the same minute bucket. ms/tok averages by tokens
+    // (sum streaming time / sum output tokens), TTFT averages per-request.
+    //   r1: ttft=200ms, stream 600ms over 30 tokens → 20 ms/tok
+    //   r2: ttft=400ms, stream 900ms over 90 tokens → 10 ms/tok
+    // Expected ms/tok = (600+900) / (30+90) = 12.5 → rounded 13.
+    // Expected TTFT  = (200 + 400) / 2 = 300.
+    km.recordRequestLatency(now - 800,        now - 600,        now,            30, "k", "u");
+    km.recordRequestLatency(now - 1300,       now - 900,        now,            90, "k", "u");
+    const buckets = km.getRequestLatencyTimeseries(60_000, 60_000);
+    const filled = buckets.filter((b) => b.count > 0);
+    expect(filled.length).toBe(1);
+    expect(filled[0]!.count).toBe(2);
+    expect(filled[0]!.avgTtftMs).toBe(300);
+    expect(filled[0]!.avgMsPerOutputToken).toBe(13);
+  });
+
+  test("empty buckets return null avgs so the chart can break the line at gaps", () => {
+    const km = create();
+    const buckets = km.getRequestLatencyTimeseries(5 * 60_000, 60_000);
+    expect(buckets.length).toBeGreaterThanOrEqual(5);
+    for (const b of buckets) {
+      expect(b.count).toBe(0);
+      expect(b.avgTtftMs).toBeNull();
+      expect(b.avgMsPerOutputToken).toBeNull();
+    }
+  });
+
+  test("requests without firstChunkAt count toward volume but not TTFT or ms/tok", () => {
+    const km = create();
+    const now = Date.now();
+    km.recordRequestLatency(now - 500, null, now, 0, "k", null);
+    const buckets = km.getRequestLatencyTimeseries(60_000, 60_000);
+    const filled = buckets.filter((b) => b.count > 0);
+    expect(filled.length).toBe(1);
+    expect(filled[0]!.count).toBe(1);
+    expect(filled[0]!.avgTtftMs).toBeNull();
+    expect(filled[0]!.avgMsPerOutputToken).toBeNull();
+  });
+});

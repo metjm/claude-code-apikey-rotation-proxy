@@ -61,6 +61,10 @@ const routes: ReadonlyMap<string, ReadonlyMap<string, RouteHandler>> = new Map([
     new Map<string, RouteHandler>([["GET", handleCapacityForecast]]),
   ],
   [
+    "/admin/latency/timeseries",
+    new Map<string, RouteHandler>([["GET", handleLatencyTimeseries]]),
+  ],
+  [
     "/admin/health",
     new Map<string, RouteHandler>([["GET", handleHealth]]),
   ],
@@ -471,6 +475,32 @@ function handleCapacityForecast(
     ? keyManager.computeSeasonalRequestFactors(Math.max(1, Math.min(parsed, 4)))
     : keyManager.computeSeasonalRequestFactors();
   return json(table);
+}
+
+// Bucket sizes for the four ranges the dashboard chart offers. Each range
+// gets ~30-60 points so the line stays readable at 600-1200px wide. Empty
+// buckets get null avgs in the response so the chart breaks the line at gaps.
+const LATENCY_RANGE_PRESETS: Record<string, { rangeMs: number; bucketMs: number }> = {
+  "30m": { rangeMs: 30 * 60 * 1000,       bucketMs: 60 * 1000 },        // 30 × 1m
+  "1h":  { rangeMs: 60 * 60 * 1000,       bucketMs: 2 * 60 * 1000 },    // 30 × 2m
+  "5h":  { rangeMs: 5 * 60 * 60 * 1000,   bucketMs: 10 * 60 * 1000 },   // 30 × 10m
+  "24h": { rangeMs: 24 * 60 * 60 * 1000,  bucketMs: 30 * 60 * 1000 },   // 48 × 30m
+};
+
+function handleLatencyTimeseries(
+  req: Request,
+  keyManager: KeyManager,
+): Response {
+  const url = new URL(req.url);
+  const rangeKey = (url.searchParams.get("range") ?? "30m").toLowerCase();
+  const preset = LATENCY_RANGE_PRESETS[rangeKey];
+  if (preset === undefined) {
+    return json({
+      error: `Unknown range "${rangeKey}". Allowed: ${Object.keys(LATENCY_RANGE_PRESETS).join(", ")}`,
+    }, 400);
+  }
+  const buckets = keyManager.getRequestLatencyTimeseries(preset.rangeMs, preset.bucketMs);
+  return json({ range: rangeKey, bucketMs: preset.bucketMs, buckets });
 }
 
 function handleEvents(

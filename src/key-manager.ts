@@ -307,6 +307,11 @@ const SESSION_BUCKET_SIZE = 3;
 // anything older — the data is only useful for recent forensics.
 const ROUTING_DECISION_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
+// How long per-request latency samples are kept. The dashboard chart's
+// longest range is 24h; 7 days gives headroom for week-over-week comparison
+// without bloating the table.
+const REQUEST_LATENCY_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+
 // When a session's pinned key is on a cooldown shorter than this, the
 // proxy returns a 429 to the client (with retry-after matching the remaining
 // cooldown) instead of remapping to another key. Preserves the prompt cache:
@@ -367,6 +372,7 @@ export class KeyManager {
       try {
         this.cleanupOldTimeseries();
         this.cleanupOldRoutingDecisions();
+        this.cleanupOldRequestLatencies();
         this.cleanupExpiredConversationAffinities(true);
         this.prunePastResetCapacityWindows();
       } catch (error) {
@@ -553,6 +559,21 @@ export class KeyManager {
       );
 
       CREATE INDEX IF NOT EXISTS idx_routing_decisions_decided_at ON routing_decisions(decided_at);
+
+      -- Per-request latency samples for the dashboard's global TTFT /
+      -- ms-per-output-token chart. Only streamed /v1/messages turns get
+      -- recorded; sibling endpoints (count_tokens) and non-streaming paths
+      -- have no meaningful TTFT and are skipped.
+      CREATE TABLE IF NOT EXISTS request_latencies (
+        ended_at INTEGER NOT NULL,
+        started_at INTEGER NOT NULL,
+        first_chunk_at INTEGER,
+        output_tokens INTEGER NOT NULL DEFAULT 0,
+        key_label TEXT,
+        user_label TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_request_latencies_ended_at ON request_latencies(ended_at);
     `);
 
     // Migrate existing tables to add cache columns
@@ -1658,6 +1679,102 @@ export class KeyManager {
   private cleanupOldRoutingDecisions(): void {
     const cutoff = Date.now() - ROUTING_DECISION_RETENTION_MS;
     this.db.run("DELETE FROM routing_decisions WHERE decided_at < ?", [cutoff]);
+  }
+
+  private cleanupOldRequestLatencies(): void {
+    const cutoff = Date.now() - REQUEST_LATENCY_RETENTION_MS;
+    this.db.run("DELETE FROM request_latencies WHERE ended_at < ?", [cutoff]);
+  }
+
+  /** Record a single completed /v1/messages turn for the global latency
+   *  chart. Inputs are unix ms; firstChunkAt is null for non-streaming or
+   *  failed-before-first-chunk requests (those don't contribute to TTFT
+   *  averages but still count toward request volume). */
+  recordRequestLatency(
+    startedAt: number,
+    firstChunkAt: number | null,
+    endedAt: number,
+    outputTokens: number,
+    keyLabel: string | null,
+    userLabel: string | null,
+  ): void {
+    try {
+      this.db.run(
+        `INSERT INTO request_latencies (ended_at, started_at, first_chunk_at, output_tokens, key_label, user_label)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [endedAt, startedAt, firstChunkAt, outputTokens, keyLabel, userLabel],
+      );
+    } catch (error) {
+      log("warn", "Failed to persist request latency", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  /** Bucketed average TTFT and ms-per-output-token over the last `rangeMs`,
+   *  aligned to wall-clock-anchored buckets of `bucketMs`. Returns one row
+   *  per bucket, oldest first; empty buckets get null avgs (and count=0)
+   *  so the dashboard line chart can break the line at gaps. ms-per-tok
+   *  uses sum(time)/sum(tokens) per bucket — token-weighted average,
+   *  matching the per-conversation chip in the throughput panel. */
+  getRequestLatencyTimeseries(rangeMs: number, bucketMs: number): Array<{
+    bucketStart: number;
+    count: number;
+    avgTtftMs: number | null;
+    avgMsPerOutputToken: number | null;
+  }> {
+    const now = Date.now();
+    const earliestEnded = now - rangeMs;
+    const rows = this.db.query<{
+      bucket_start: number;
+      n: number;
+      ttft_sum: number | null;
+      ttft_count: number;
+      stream_time_sum: number | null;
+      out_tokens_sum: number;
+    }, [number, number]>(`
+      SELECT
+        (ended_at / ?) * ? AS bucket_start,
+        COUNT(*) AS n,
+        SUM(CASE WHEN first_chunk_at IS NOT NULL THEN first_chunk_at - started_at END) AS ttft_sum,
+        SUM(CASE WHEN first_chunk_at IS NOT NULL THEN 1 ELSE 0 END) AS ttft_count,
+        SUM(CASE WHEN first_chunk_at IS NOT NULL AND output_tokens > 0
+                 THEN ended_at - first_chunk_at END) AS stream_time_sum,
+        SUM(CASE WHEN first_chunk_at IS NOT NULL AND output_tokens > 0
+                 THEN output_tokens ELSE 0 END) AS out_tokens_sum
+      FROM request_latencies
+      WHERE ended_at >= ?
+      GROUP BY bucket_start
+      ORDER BY bucket_start
+    `).all(bucketMs, bucketMs, earliestEnded);
+
+    const byBucket = new Map<number, typeof rows[number]>();
+    for (const r of rows) byBucket.set(r.bucket_start, r);
+
+    const earliestBucket = Math.floor(earliestEnded / bucketMs) * bucketMs;
+    const lastBucket = Math.floor(now / bucketMs) * bucketMs;
+    const out: Array<{
+      bucketStart: number;
+      count: number;
+      avgTtftMs: number | null;
+      avgMsPerOutputToken: number | null;
+    }> = [];
+    for (let b = earliestBucket; b <= lastBucket; b += bucketMs) {
+      const r = byBucket.get(b);
+      if (r === undefined) {
+        out.push({ bucketStart: b, count: 0, avgTtftMs: null, avgMsPerOutputToken: null });
+        continue;
+      }
+      out.push({
+        bucketStart: b,
+        count: r.n,
+        avgTtftMs: r.ttft_count > 0 && r.ttft_sum !== null
+          ? Math.round(r.ttft_sum / r.ttft_count) : null,
+        avgMsPerOutputToken: r.out_tokens_sum > 0 && r.stream_time_sum !== null
+          ? Math.round(r.stream_time_sum / r.out_tokens_sum) : null,
+      });
+    }
+    return out;
   }
 
   // Compact snapshot of every non-disabled key at decision time — what each

@@ -1814,6 +1814,14 @@ function createTokenTrackingObserver(
         endedAt: timings.endedAt,
         output: outputTokens,
       }, keyManager.listKeys());
+      keyManager.recordRequestLatency(
+        timings.openedAt,
+        timings.firstChunkAt,
+        timings.endedAt,
+        outputTokens,
+        entry.label,
+        proxyUser?.label ?? null,
+      );
     }
   }
 
