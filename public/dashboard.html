@@ -899,6 +899,12 @@ function recomputeGlobalThroughputPeaks() {
   const now = Date.now();
   const BUCKET_MS = 1000;
   const N = THROUGHPUT_WINDOW_MS / BUCKET_MS;
+  // Anchor bucketing to wall-clock second boundaries so a sample's bucket
+  // index only changes when the wall-clock second ticks over — same moment
+  // the render-side sub-second shift snaps back to zero. Using `now - s.ts`
+  // here would advance the offset at per-sample anniversaries, which never
+  // coincide with the shift reset and would make bars jitter sideways.
+  const nowBucket = Math.floor(now / BUCKET_MS);
   let maxIn = 0, maxOut = 0;
   for (const id of Object.keys(throughputState.byConv)) {
     const samples = throughputState.byConv[id];
@@ -906,7 +912,7 @@ function recomputeGlobalThroughputPeaks() {
     for (let i = 0; i < N; i++) buckets[i] = { in: 0, out: 0 };
     for (let i = 0; i < samples.length; i++) {
       const s = samples[i];
-      const offset = Math.floor((now - s.ts) / BUCKET_MS);
+      const offset = nowBucket - Math.floor(s.ts / BUCKET_MS);
       if (offset < 0 || offset >= N) continue;
       const idx = N - 1 - offset;
       buckets[idx].in  += s.in  || 0;
@@ -1803,10 +1809,11 @@ function ensureKeysApp() {
         const N = THROUGHPUT_WINDOW_MS / BUCKET_MS;
         const buckets = new Array(N);
         for (let i = 0; i < N; i++) buckets[i] = { in: 0, out: 0 };
-        const now = Date.now();
+        // Anchor to wall-clock second boundaries — see recomputeGlobalThroughputPeaks.
+        const nowBucket = Math.floor(Date.now() / BUCKET_MS);
         for (let i = 0; i < samples.length; i++) {
           const s = samples[i];
-          const offset = Math.floor((now - s.ts) / BUCKET_MS);
+          const offset = nowBucket - Math.floor(s.ts / BUCKET_MS);
           if (offset < 0 || offset >= N) continue;
           const idx = N - 1 - offset;
           buckets[idx].in += s.in || 0;
