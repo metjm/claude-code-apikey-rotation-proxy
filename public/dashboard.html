@@ -926,6 +926,9 @@ function recomputeGlobalThroughputPeaks() {
 function startThroughputTicker() {
   if (window.__throughputTickerStarted) return;
   window.__throughputTickerStarted = true;
+  // Heavy work — sample pruning and global-peak recompute — only needs to
+  // run ~1Hz. The bucket math at draw time interpolates within the second,
+  // so this doesn't have to be high-frequency.
   setInterval(() => {
     const cutoff = Date.now() - THROUGHPUT_RETAIN_MS;
     for (const id of Object.keys(throughputState.byConv)) {
@@ -936,8 +939,15 @@ function startThroughputTicker() {
       if (arr.length === 0) delete throughputState.byConv[id];
     }
     recomputeGlobalThroughputPeaks();
+  }, 1000);
+  // Smooth left-slide: bump the reactive tick on every animation frame so
+  // each chart redraws with an updated sub-second shift. rAF auto-pauses
+  // when the tab is hidden, so we don't burn CPU off-screen.
+  function frame() {
     throughputState.tick = (throughputState.tick + 1) & 0xffff;
-  }, 250);
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
 }
 
 // Demo mode: ?pace-demo=1 overlays a synthetic fixture covering every tone
@@ -1848,6 +1858,15 @@ function ensureKeysApp() {
         const outBarW = Math.max(1, Math.floor((slotW - 1) / 2));
         const fullH = cssH - 1; // 1px headroom so bars don't kiss the top edge
 
+        // Continuous left-slide. Bucketing rounds sample age down to whole
+        // seconds, so without this every bar would sit still for ~1s and
+        // then snap one slot left. Shifting render X by the elapsed fraction
+        // of the current second turns those snaps into smooth motion: as
+        // shift approaches -slotW, the floor() in bucketing increments and
+        // each sample jumps to the next bucket on the left at the exact
+        // moment shift snaps back to 0 — net visual motion is uninterrupted.
+        const subSecondShift = -((Date.now() % 1000) / 1000) * slotW;
+
         // Independent log-normalized scales:
         //   h(v) = log(1 + v) / log(1 + peak) × fullH
         // log1p keeps small values (1, 5, 50) visible alongside spikes
@@ -1866,7 +1885,7 @@ function ensureKeysApp() {
         }
 
         for (let i = 0; i < N; i++) {
-          const slotX = Math.floor(i * slotW);
+          const slotX = i * slotW + subSecondShift;
           const inV = buckets[i].in;
           const outV = buckets[i].out;
           if (inV > 0) {
