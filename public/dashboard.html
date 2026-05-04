@@ -559,6 +559,19 @@
   .log-msg { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .c-green { color: var(--green); } .c-yellow { color: var(--yellow); } .c-red { color: var(--red); }
   .c-blue { color: var(--blue); } .c-dim { color: var(--text-dim); }
+  .pipeline-list { max-height: 280px; overflow-y: auto; font-size: 12px; display: flex; flex-direction: column; gap: 2px; }
+  .pipeline-list::-webkit-scrollbar { width: 6px; }
+  .pipeline-list::-webkit-scrollbar-track { background: var(--bg); }
+  .pipeline-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  .pipeline-row { display: grid; grid-template-columns: 90px 80px 130px 100px 1fr 80px; gap: 12px; padding: 4px 6px; border-radius: 4px; align-items: baseline; border: 1px solid transparent; }
+  .pipeline-row:hover { background: rgba(88,166,255,0.05); border-color: rgba(88,166,255,0.15); }
+  .pipeline-phase { font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .pipeline-phase-pending { color: var(--yellow); }
+  .pipeline-phase-fetching { color: var(--blue); }
+  .pipeline-phase-streaming { color: var(--green); }
+  .pipeline-meta { color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pipeline-age { text-align: right; color: var(--text-dim); font-variant-numeric: tabular-nums; }
+  .pipeline-empty { color: var(--text-dim); padding: 12px 0; text-align: center; }
   .collapsed { display: none; }
 
   /* Token created modal */
@@ -634,9 +647,17 @@
     <span class="sep">|</span>
     <span class="header-stat"><b id="hdr-tokens-in">0</b> in / <b id="hdr-tokens-out">0</b> out</span>
     <span class="sep">|</span>
-    <span class="header-stat" id="hdr-inflight-wrap" title="Live in-flight requests by phase. Fetching = waiting for upstream to start the response. Streaming = body chunks coming in. Updates from the request_started / request_first_chunk / request_done events.">
-      <b id="hdr-inflight-total">0</b> live · <b id="hdr-inflight-fetch">0</b> fetching · <b id="hdr-inflight-stream">0</b> streaming
+    <span class="header-stat" id="hdr-inflight-wrap" title="Live request pipeline. Pending = held server-side waiting on a per-key cooldown or the AIMD inter-request gap (we have NOT hit upstream yet). Fetching = upstream fetch in flight, no body chunks yet. Streaming = body chunks coming back.">
+      <b id="hdr-inflight-pending">0</b> pending · <b id="hdr-inflight-fetch">0</b> fetching · <b id="hdr-inflight-stream">0</b> streaming
     </span>
+  </div>
+
+  <div class="log-panel" style="margin-bottom:16px">
+    <div class="log-header">
+      <span class="panel-title">Live request pipeline</span>
+      <span class="header-stat" id="pipeline-summary">--</span>
+    </div>
+    <div id="pipeline-list" class="pipeline-list"></div>
   </div>
 
   <div class="log-panel" style="margin-bottom:16px">
@@ -940,62 +961,163 @@ function findOrCreateRequestEntry(sessionId, conversationHash, traceId, startedA
   return entry;
 }
 
-// ── Live in-flight tracker ─────────────────────────────────────
-// Map<traceId, { phase: 'fetching'|'streaming', startedAt: number }>.
-// Driven by request_started / request_first_chunk / request_done / error
-// events flowing in over SSE. Phases are presented in the header so the
-// operator can see at a glance how many requests are between us and upstream
-// vs. mid-stream. Stale entries (no update in 10 minutes) get pruned to
-// guard against missed terminal events from network blips.
+// ── Live request pipeline tracker ──────────────────────────────
+// Map<traceId, { phase, label, sessionId, conversationKey, user, attempt,
+//                pendingReason, fireAt, enteredPhaseAt, startedAt }>.
+// Driven by SSE events:
+//   request_pending      → phase='pending'      (gap-slot or cooldown wait)
+//   request_started      → phase='fetching'     (upstream fetch in flight)
+//   request_first_chunk  → phase='streaming'    (body chunks arriving)
+//   request_done | error → entry removed
+// Both the header counts and the pipeline panel render off this map. Stale
+// entries (no update in 10 minutes) get pruned defensively.
 const INFLIGHT_STALE_MS = 10 * 60 * 1000;
 const inflightByTrace = new Map();
 
-function recordInflightStart(traceId, startedAt) {
-  if (!traceId) return;
-  // Re-fired with the same traceId on retries: keep the earlier startedAt
-  // and reset the phase back to fetching for the new attempt.
+function upsertInflight(traceId, patch) {
+  if (!traceId) return null;
   const existing = inflightByTrace.get(traceId);
-  inflightByTrace.set(traceId, {
-    phase: 'fetching',
-    startedAt: existing?.startedAt ?? (startedAt || Date.now()),
+  const merged = { ...(existing || {}), ...patch };
+  if (!merged.startedAt) merged.startedAt = Date.now();
+  if (patch.phase && (!existing || existing.phase !== patch.phase)) {
+    merged.enteredPhaseAt = Date.now();
+  }
+  inflightByTrace.set(traceId, merged);
+  return merged;
+}
+
+function recordInflightPending(event) {
+  upsertInflight(event.traceId, {
+    phase: 'pending',
+    pendingReason: event.reason || 'cooldown',
+    fireAt: event.fireAt || (Date.now() + (event.waitMs || 0)),
+    label: event.label || null,
+    user: event.user || null,
+    sessionId: event.sessionId || null,
+    conversationKey: event.conversationKey || null,
+    path: event.path || null,
+    attempt: event.attempt ?? null,
+    interRequestGapMs: event.interRequestGapMs ?? null,
   });
-  renderInflightHeader();
+  renderPipeline();
+}
+function recordInflightStart(event) {
+  const startedAt = (typeof event === 'object' && event.startedAt) || Date.now();
+  const traceId = typeof event === 'string' ? event : event.traceId;
+  upsertInflight(traceId, {
+    phase: 'fetching',
+    label: (typeof event === 'object' && event.label) || undefined,
+    user: (typeof event === 'object' && event.user) || undefined,
+    sessionId: (typeof event === 'object' && event.sessionId) || undefined,
+    path: (typeof event === 'object' && event.path) || undefined,
+    pendingReason: null,
+    fireAt: null,
+    startedAt,
+  });
+  renderPipeline();
 }
 function recordInflightFirstChunk(traceId) {
   if (!traceId) return;
   const e = inflightByTrace.get(traceId);
-  if (e) e.phase = 'streaming';
-  renderInflightHeader();
+  if (e) { e.phase = 'streaming'; e.enteredPhaseAt = Date.now(); }
+  renderPipeline();
 }
 function recordInflightDone(traceId) {
   if (!traceId) return;
   inflightByTrace.delete(traceId);
-  renderInflightHeader();
+  renderPipeline();
 }
 function pruneInflight() {
   const cutoff = Date.now() - INFLIGHT_STALE_MS;
   for (const [traceId, e] of inflightByTrace) {
-    if (e.startedAt < cutoff) inflightByTrace.delete(traceId);
+    if ((e.startedAt ?? 0) < cutoff) inflightByTrace.delete(traceId);
   }
 }
-function renderInflightHeader() {
+function fmtPipelineDuration(ms) {
+  if (ms < 1000) return ms + 'ms';
+  if (ms < 60_000) return (ms / 1000).toFixed(1) + 's';
+  const mins = Math.floor(ms / 60_000);
+  const secs = Math.floor((ms % 60_000) / 1000);
+  return mins + 'm' + secs + 's';
+}
+function renderPipeline() {
   pruneInflight();
-  let total = 0, fetching = 0, streaming = 0;
-  for (const e of inflightByTrace.values()) {
-    total++;
-    if (e.phase === 'fetching') fetching++;
+  let pending = 0, fetching = 0, streaming = 0;
+  const entries = [];
+  for (const [traceId, e] of inflightByTrace) {
+    if (e.phase === 'pending') pending++;
+    else if (e.phase === 'fetching') fetching++;
     else if (e.phase === 'streaming') streaming++;
+    entries.push({ traceId, ...e });
   }
-  const totEl = document.getElementById('hdr-inflight-total');
+  // Sort: pending first (most urgent — held server-side), then fetching, then streaming.
+  // Within phase, longest-waiting first.
+  const phaseOrder = { pending: 0, fetching: 1, streaming: 2 };
+  entries.sort((a, b) => {
+    const po = (phaseOrder[a.phase] ?? 9) - (phaseOrder[b.phase] ?? 9);
+    if (po !== 0) return po;
+    return (a.enteredPhaseAt || 0) - (b.enteredPhaseAt || 0);
+  });
+
+  const pendEl = document.getElementById('hdr-inflight-pending');
   const fetchEl = document.getElementById('hdr-inflight-fetch');
   const streamEl = document.getElementById('hdr-inflight-stream');
-  if (totEl) totEl.textContent = total;
+  if (pendEl) pendEl.textContent = pending;
   if (fetchEl) fetchEl.textContent = fetching;
   if (streamEl) streamEl.textContent = streaming;
+
+  const summaryEl = document.getElementById('pipeline-summary');
+  if (summaryEl) {
+    summaryEl.textContent = entries.length === 0
+      ? 'No active requests'
+      : pending + ' pending · ' + fetching + ' fetching · ' + streaming + ' streaming';
+  }
+
+  const listEl = document.getElementById('pipeline-list');
+  if (!listEl) return;
+  if (entries.length === 0) {
+    listEl.innerHTML = '<div class="pipeline-empty">No active requests</div>';
+    return;
+  }
+
+  const now = Date.now();
+  const rows = entries.map(e => {
+    const phaseClass = 'pipeline-phase-' + e.phase;
+    const ageMs = now - (e.enteredPhaseAt || e.startedAt || now);
+    const ageStr = fmtPipelineDuration(Math.max(0, ageMs));
+    let phaseDetail = '';
+    if (e.phase === 'pending') {
+      const remaining = Math.max(0, (e.fireAt || 0) - now);
+      const reason = e.pendingReason === 'gap_slot' ? 'gap slot' : 'cooldown';
+      phaseDetail = reason + ' · fires in ' + fmtPipelineDuration(remaining);
+    } else if (e.phase === 'fetching') {
+      phaseDetail = 'awaiting upstream response';
+    } else if (e.phase === 'streaming') {
+      phaseDetail = 'reading body chunks';
+    }
+    const labelStr = e.label || (e.phase === 'pending' && e.pendingReason === 'cooldown' ? '(awaiting key)' : '--');
+    const userStr = e.user || '--';
+    const sessionStr = e.sessionId ? e.sessionId.slice(0, 8) : '--';
+    const attemptStr = e.attempt != null ? '#' + e.attempt : '';
+    return '<div class="pipeline-row" title="trace ' + escHtml(e.traceId) + '">'
+      + '<span class="pipeline-phase ' + phaseClass + '">' + e.phase + '</span>'
+      + '<span class="pipeline-meta">' + escHtml(labelStr) + '</span>'
+      + '<span class="pipeline-meta">' + escHtml(userStr) + ' · ' + escHtml(sessionStr) + ' ' + attemptStr + '</span>'
+      + '<span class="pipeline-meta">' + escHtml(e.path || '--') + '</span>'
+      + '<span class="pipeline-meta c-dim">' + escHtml(phaseDetail) + '</span>'
+      + '<span class="pipeline-age">' + ageStr + '</span>'
+      + '</div>';
+  });
+  listEl.innerHTML = rows.join('');
 }
-// Tick once a second so stale-prune visibly drains the counter even when
-// no new events flow.
-setInterval(renderInflightHeader, 1000);
+function escHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[c]));
+}
+// Tick once a second so durations and pending countdowns advance even
+// when no new events arrive.
+setInterval(renderPipeline, 1000);
 
 function recomputeGlobalThroughputPeaks() {
   const now = Date.now();
@@ -2638,12 +2760,15 @@ function connectSSE() {
       // All three share traceId for in-place updates. Timestamps are
       // Date.now()-style numeric ms; kept numeric for fast subtraction at
       // draw time.
+      if (event.type === 'request_pending') {
+        recordInflightPending(event);
+      }
       if (event.type === 'request_started' && event.sessionId) {
         findOrCreateRequestEntry(
           event.sessionId, event.conversationHash || null,
           event.traceId, event.startedAt,
         );
-        recordInflightStart(event.traceId, event.startedAt);
+        recordInflightStart(event);
       }
       if (event.type === 'request_first_chunk' && event.sessionId) {
         const entry = findOrCreateRequestEntry(

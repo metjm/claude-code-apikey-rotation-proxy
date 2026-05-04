@@ -328,6 +328,19 @@ export async function proxyRequest(
           waitMs,
           cooldownRemainingMs: selection.cooldownRemainingMs,
         });
+        emitWithKeys({
+          type: "request_pending",
+          ts: new Date().toISOString(),
+          user: proxyUser?.label,
+          path: url.pathname,
+          attempt: attempts,
+          traceId,
+          sessionId,
+          conversationKey,
+          reason: "cooldown",
+          waitMs,
+          fireAt: Date.now() + waitMs,
+        }, keyManager.listKeys());
         if (waitMs > 0) await new Promise((resolve) => setTimeout(resolve, waitMs));
         attempts++;
         continue;
@@ -360,6 +373,21 @@ export async function proxyRequest(
         interRequestGapMs: entry.interRequestGapMs,
         fireAt: new Date(slotFireAt).toISOString(),
       });
+      emitWithKeys({
+        type: "request_pending",
+        ts: new Date().toISOString(),
+        label: entry.label,
+        user: proxyUser?.label,
+        path: url.pathname,
+        attempt: attempts,
+        traceId,
+        sessionId,
+        conversationKey,
+        reason: "gap_slot",
+        waitMs: slotWaitMs,
+        fireAt: slotFireAt,
+        interRequestGapMs: entry.interRequestGapMs,
+      }, keyManager.listKeys());
       await new Promise((resolve) => setTimeout(resolve, slotWaitMs));
     }
     keyManager.recordRequest(entry);
