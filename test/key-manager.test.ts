@@ -14,6 +14,8 @@ import {
   computeRateLimitWaitMs,
   SHORT_TERM_BACKOFF_THRESHOLD_SECS,
   SHORT_TERM_BACKOFF_CAP_MS,
+  BACKOFF_INCREASE_FACTOR,
+  BACKOFF_DECREMENT_MS_PER_SUCCESS,
 } from "../src/key-manager.ts";
 import type {
   ApiKeyEntry,
@@ -737,142 +739,235 @@ describe("Key Stats Recording", () => {
   });
 });
 
-// ── Decorrelated-jitter backoff (pure function) ──────────────────────────────
+// ── AIMD backoff (pure function) ─────────────────────────────────────────────
 
-describe("computeRateLimitWaitMs", () => {
-  test("first short-term hit (streak=0) returns server retry-after as base", () => {
-    expect(computeRateLimitWaitMs(60, 0, 0)).toBe(60_000);
-    expect(computeRateLimitWaitMs(45, 0, 0)).toBe(45_000);
+describe("computeRateLimitWaitMs (AIMD with decorrelated jitter)", () => {
+  test("first hit with no prior backoff returns server retry-after as base", () => {
+    expect(computeRateLimitWaitMs(60, 0)).toBe(60_000);
+    expect(computeRateLimitWaitMs(45, 0)).toBe(45_000);
   });
 
   test("zero or negative retry-after defaults to 60s on first hit", () => {
-    expect(computeRateLimitWaitMs(0, 0, 0)).toBe(60_000);
-    expect(computeRateLimitWaitMs(-5, 0, 0)).toBe(60_000);
+    expect(computeRateLimitWaitMs(0, 0)).toBe(60_000);
+    expect(computeRateLimitWaitMs(-5, 0)).toBe(60_000);
   });
 
-  test("long-term retry-after passes through unchanged regardless of streak", () => {
+  test("long-term retry-after passes through unchanged regardless of prior backoff", () => {
     // 5h window: ~78 minutes
-    expect(computeRateLimitWaitMs(4662, 0, 0)).toBe(4662_000);
-    // Even mid-streak (long-term should not be affected)
-    expect(computeRateLimitWaitMs(4662, 60_000, 5)).toBe(4662_000);
+    expect(computeRateLimitWaitMs(4662, 0)).toBe(4662_000);
+    // Even with substantial prior backoff (long-term ignores it)
+    expect(computeRateLimitWaitMs(4662, 250_000, () => 0.99)).toBe(4662_000);
   });
 
   test("threshold boundary: exactly threshold seconds is short-term", () => {
-    // SHORT_TERM_BACKOFF_THRESHOLD_SECS itself counts as short-term (≤)
-    expect(computeRateLimitWaitMs(SHORT_TERM_BACKOFF_THRESHOLD_SECS, 0, 0))
+    expect(computeRateLimitWaitMs(SHORT_TERM_BACKOFF_THRESHOLD_SECS, 0))
       .toBe(SHORT_TERM_BACKOFF_THRESHOLD_SECS * 1000);
     // One second above is long-term, no jitter applied
-    const aboveBase = (SHORT_TERM_BACKOFF_THRESHOLD_SECS + 1);
-    expect(computeRateLimitWaitMs(aboveBase, 60_000, 3, () => 0.99))
-      .toBe(aboveBase * 1000);
+    const aboveThreshold = SHORT_TERM_BACKOFF_THRESHOLD_SECS + 1;
+    expect(computeRateLimitWaitMs(aboveThreshold, 250_000, () => 0.99))
+      .toBe(aboveThreshold * 1000);
   });
 
-  test("streak >= 1 produces jittered value in [base, prev*3]", () => {
-    // Bottom of jitter range
-    expect(computeRateLimitWaitMs(60, 60_000, 1, () => 0)).toBe(60_000);
-    // Top of jitter range — prev * 3 = 180s
-    const top = computeRateLimitWaitMs(60, 60_000, 1, () => 0.9999);
+  test("short-term with prior backoff applies multiplicative increase + jitter", () => {
+    // prev=60s, factor=1.5 → upper bound is max(base, prev*factor) = 90s
+    // Bottom of jitter range = base
+    expect(computeRateLimitWaitMs(60, 60_000, () => 0)).toBe(60_000);
+    // Top of jitter range
+    const top = computeRateLimitWaitMs(60, 60_000, () => 0.9999);
     expect(top).toBeGreaterThan(60_000);
-    expect(top).toBeLessThanOrEqual(180_000);
-    // Mid
-    const mid = computeRateLimitWaitMs(60, 60_000, 1, () => 0.5);
-    expect(mid).toBeCloseTo(120_000, -3);
+    expect(top).toBeLessThanOrEqual(60_000 * BACKOFF_INCREASE_FACTOR + 1);
+    // Mid: between base and base*1.5
+    const mid = computeRateLimitWaitMs(60, 60_000, () => 0.5);
+    expect(mid).toBeGreaterThanOrEqual(60_000);
+    expect(mid).toBeLessThanOrEqual(60_000 * BACKOFF_INCREASE_FACTOR);
+  });
+
+  test("backoff grows roughly geometrically across repeated hits", () => {
+    // Top-of-range every time: prev → prev*factor each iteration.
+    let prev = 60_000;
+    for (let i = 0; i < 4; i++) {
+      const next = computeRateLimitWaitMs(60, prev, () => 0.9999);
+      expect(next).toBeGreaterThan(prev * 0.99);  // grew (or capped)
+      prev = next;
+    }
+    // After 4 iterations from 60s with ×1.5 each, well above base
+    expect(prev).toBeGreaterThan(60_000);
   });
 
   test("backoff is capped at SHORT_TERM_BACKOFF_CAP_MS", () => {
-    // Even with prev = 4 min and rng at top, cap at 5 min
-    const ms = computeRateLimitWaitMs(60, 4 * 60 * 1000, 5, () => 0.9999);
+    // Even with prev far past cap, output is clamped
+    const ms = computeRateLimitWaitMs(60, 10 * 60 * 1000, () => 0.9999);
     expect(ms).toBeLessThanOrEqual(SHORT_TERM_BACKOFF_CAP_MS);
-    // And with already-saturated prev, still capped
-    const ms2 = computeRateLimitWaitMs(60, 10 * 60 * 1000, 9, () => 0.9999);
-    expect(ms2).toBeLessThanOrEqual(SHORT_TERM_BACKOFF_CAP_MS);
   });
 
   test("jitter range never goes below server retry-after", () => {
-    // With rng=0 (lowest), result is exactly base
-    expect(computeRateLimitWaitMs(60, 60_000, 1, () => 0)).toBe(60_000);
-    expect(computeRateLimitWaitMs(60, 1, 5, () => 0)).toBe(60_000);
-    // Even when prev is degenerately small, base is the floor
-    expect(computeRateLimitWaitMs(60, 0, 3, () => 0.5)).toBe(60_000);
+    expect(computeRateLimitWaitMs(60, 60_000, () => 0)).toBe(60_000);
+    expect(computeRateLimitWaitMs(60, 1, () => 0)).toBe(60_000);
+    // Degenerate prev: base is the floor
+    expect(computeRateLimitWaitMs(60, 0, () => 0.5)).toBe(60_000);
   });
 });
 
-// ── Decorrelated-jitter backoff (KeyManager integration) ─────────────────────
+// ── AIMD backoff (KeyManager integration) ────────────────────────────────────
 
-describe("recordRateLimit() decorrelated-jitter behavior", () => {
-  test("consecutive short-term 429s grow availableAt window beyond base", () => {
+describe("recordRateLimit() AIMD backoff behavior", () => {
+  test("first hit uses base 60s; subsequent fresh hits grow multiplicatively", () => {
     const km = create();
-    const entry = km.addKey(VALID_KEY_1, "streak");
+    const entry = km.addKey(VALID_KEY_1, "grow");
 
-    // First hit: exactly 60s (no jitter on streak=0)
+    // First hit: backoffMs=0 → exactly 60s (no prior to multiply against).
     let before = Date.now();
     km.recordRateLimit(entry, 60);
     let wait = entry.availableAt - before;
     expect(wait).toBeGreaterThanOrEqual(59_500);
     expect(wait).toBeLessThanOrEqual(60_500);
+    expect(entry.backoffMs).toBe(wait);
 
-    // Repeated hits should occasionally exceed 60s (jitter applies after streak=1).
-    // Run many trials and check at least one fell above the base, and none below.
+    // Subsequent FRESH hits should occasionally exceed 60s due to jitter on
+    // top of the prior backoff (×1.5 ceiling).
     let sawAboveBase = false;
     for (let i = 0; i < 30; i++) {
+      // Force cooldown to have lapsed so each hit counts as fresh.
+      entry.availableAt = unixMs(Date.now() - 1);
       before = Date.now();
       km.recordRateLimit(entry, 60);
       wait = entry.availableAt - before;
       // Floor: never below server retry-after
       expect(wait).toBeGreaterThanOrEqual(59_500);
-      // Cap: never above 5 min
+      // Cap
       expect(wait).toBeLessThanOrEqual(SHORT_TERM_BACKOFF_CAP_MS + 500);
       if (wait > 61_000) sawAboveBase = true;
     }
     expect(sawAboveBase).toBe(true);
   });
 
-  test("recordSuccess() resets the short-term streak", () => {
+  test("recordSuccess() walks backoff down by DECREMENT_MS (additive decrease)", () => {
     const km = create();
-    const entry = km.addKey(VALID_KEY_1, "reset-streak");
+    const entry = km.addKey(VALID_KEY_1, "additive");
 
-    // Build up a streak
-    for (let i = 0; i < 5; i++) km.recordRateLimit(entry, 60);
+    // Force backoff to a known value above the decrement.
+    entry.backoffMs = 200_000;
+    // Cooldown has lapsed (so the success counts as fresh, not in-flight).
+    entry.availableAt = unixMs(Date.now() - 1);
 
-    // Success resets streak
-    km.recordSuccess(entry, 10, 20);
+    km.recordSuccess(entry, 1, 1);
+    expect(entry.backoffMs).toBe(200_000 - BACKOFF_DECREMENT_MS_PER_SUCCESS);
 
-    // Next 429 should be exactly base 60s (back to streak=0)
-    const before = Date.now();
-    km.recordRateLimit(entry, 60);
-    const wait = entry.availableAt - before;
-    expect(wait).toBeGreaterThanOrEqual(59_500);
-    expect(wait).toBeLessThanOrEqual(60_500);
+    km.recordSuccess(entry, 1, 1);
+    expect(entry.backoffMs).toBe(
+      200_000 - 2 * BACKOFF_DECREMENT_MS_PER_SUCCESS,
+    );
   });
 
-  test("long-term retry-after is honored exactly and resets streak", () => {
+  test("recordSuccess() floors backoff at 0", () => {
+    const km = create();
+    const entry = km.addKey(VALID_KEY_1, "floor");
+
+    entry.backoffMs = 5_000;  // below decrement
+    entry.availableAt = unixMs(Date.now() - 1);
+
+    km.recordSuccess(entry, 1, 1);
+    expect(entry.backoffMs).toBe(0);
+  });
+
+  test("long-term retry-after honored exactly and resets backoff", () => {
     const km = create();
     const entry = km.addKey(VALID_KEY_1, "long-term");
 
-    // Build up short-term streak
+    // Build up some short-term backoff
     km.recordRateLimit(entry, 60);
+    entry.availableAt = unixMs(Date.now() - 1);
     km.recordRateLimit(entry, 60);
+    expect(entry.backoffMs).toBeGreaterThan(0);
 
-    // Long-term hit (5h window): should be exact, no jitter
+    // Long-term hit (need to expire cooldown so it isn't coalesced).
+    entry.availableAt = unixMs(Date.now() - 1);
     const before = Date.now();
     km.recordRateLimit(entry, 4662);
     const wait = entry.availableAt - before;
     expect(wait).toBeGreaterThanOrEqual(4661_500);
     expect(wait).toBeLessThanOrEqual(4662_500);
-
-    // After long-term, streak is reset — next short-term is base again
-    const before2 = Date.now();
-    km.recordRateLimit(entry, 60);
-    const wait2 = entry.availableAt - before2;
-    expect(wait2).toBeGreaterThanOrEqual(59_500);
-    expect(wait2).toBeLessThanOrEqual(60_500);
+    expect(entry.backoffMs).toBe(0);
   });
 
-  test("rateLimitHits stat still increments on every 429", () => {
+  test("rateLimitHits stat still increments on every 429 (including residuals)", () => {
     const km = create();
     const entry = km.addKey(VALID_KEY_1, "hits");
     for (let i = 0; i < 4; i++) km.recordRateLimit(entry, 60);
     expect(entry.stats.rateLimitHits).toBe(4);
+  });
+
+  test("in-flight success during cooldown does NOT decrement backoff", () => {
+    // Concurrency hazard: multiple requests in flight when the first 429
+    // lands. Pre-rate-limit successes shouldn't shrink the backoff.
+    const km = create();
+    const entry = km.addKey(VALID_KEY_1, "concurrent-ok");
+
+    km.recordRateLimit(entry, 60);
+    const backoffAfter429 = entry.backoffMs;
+    expect(backoffAfter429).toBe(60_000);
+    expect(entry.availableAt).toBeGreaterThan(Date.now());
+
+    // In-flight success arrives while cooldown is still active.
+    km.recordSuccess(entry, 100, 200);
+    expect(entry.backoffMs).toBe(backoffAfter429);  // unchanged
+    expect(entry.stats.successfulRequests).toBe(1);
+    expect(entry.stats.totalTokensIn).toBe(100);
+  });
+
+  test("post-cooldown success DOES decrement the backoff", () => {
+    const km = create();
+    const entry = km.addKey(VALID_KEY_1, "post-cooldown-ok");
+
+    km.recordRateLimit(entry, 60);
+    expect(entry.backoffMs).toBe(60_000);
+
+    // Cooldown lapsed.
+    entry.availableAt = unixMs(Date.now() - 1);
+    km.recordSuccess(entry, 1, 1);
+    expect(entry.backoffMs).toBe(60_000 - BACKOFF_DECREMENT_MS_PER_SUCCESS);
+  });
+
+  test("residual 429 during cooldown does NOT extend it or bump backoff", () => {
+    const km = create();
+    const entry = km.addKey(VALID_KEY_1, "residual-429");
+
+    km.recordRateLimit(entry, 60);
+    const firstAvailableAt = entry.availableAt;
+    const firstBackoffMs = entry.backoffMs;
+
+    // Second 429 arrives while still on cooldown.
+    km.recordRateLimit(entry, 60);
+
+    expect(entry.availableAt).toBe(firstAvailableAt);
+    expect(entry.backoffMs).toBe(firstBackoffMs);
+    // Hit count still rises.
+    expect(entry.stats.rateLimitHits).toBe(2);
+  });
+
+  test("AIMD pattern: 429 grows backoff, success shrinks it slowly", () => {
+    // Simulates the user's scenario: each cycle 1 fresh 429 then a couple of
+    // successes. The multiplicative-up beats the additive-down so backoff
+    // ratchets up over time. Without AIMD this would stay at 60s forever.
+    const km = create();
+    const entry = km.addKey(VALID_KEY_1, "aimd-cycle");
+
+    const backoffsAfter429: number[] = [];
+    for (let cycle = 0; cycle < 5; cycle++) {
+      // Fresh 429
+      entry.availableAt = unixMs(Date.now() - 1);
+      km.recordRateLimit(entry, 60);
+      backoffsAfter429.push(entry.backoffMs);
+      // Two post-cooldown successes
+      entry.availableAt = unixMs(Date.now() - 1);
+      km.recordSuccess(entry, 1, 1);
+      entry.availableAt = unixMs(Date.now() - 1);
+      km.recordSuccess(entry, 1, 1);
+    }
+    // Backoff after the 5th 429 should be substantially larger than the 1st.
+    expect(backoffsAfter429[4]).toBeGreaterThan(backoffsAfter429[0]);
+    // And should still respect the cap.
+    expect(backoffsAfter429[4]).toBeLessThanOrEqual(SHORT_TERM_BACKOFF_CAP_MS);
   });
 });
 

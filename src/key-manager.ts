@@ -315,37 +315,38 @@ const ROUTING_DECISION_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 // remap — staying on a dead key for 5h would starve the session.
 const SHORT_COOLDOWN_PASSTHROUGH_MS = 5 * 60 * 1000;
 
-// Decorrelated-jitter backoff for keys that keep tripping the same
-// short-term (per-minute) rate limit. Anthropic's `retry-after: 60` after a
-// huge request is just a hint — waiting exactly 60s and re-firing the same
-// payload immediately re-trips the rolling-minute window. AWS-style
-// decorrelated jitter (`next = random(base, prev * 3)`, capped) breaks the
-// loop without any extra signal from upstream. Long-term 429s (5h/7d
-// windows; retry-after well above this threshold) bypass the multiplier —
-// those are exact reset times, not smoothing hints.
+// AIMD backoff for keys that keep tripping the same short-term
+// (per-minute) rate limit. Anthropic's `retry-after: 60` after a huge
+// request is a smoothing hint — waiting exactly 60s and re-firing the same
+// payload often re-trips the rolling minute. We track a per-key backoff
+// target that grows multiplicatively on each fresh short-term 429 (with
+// decorrelated jitter on top) and shrinks additively on each fresh
+// post-cooldown success. The asymmetry — slow recovery, fast escalation —
+// means a single stray success can't undo the penalty learned across many
+// failures. Long-term 429s (5h/7d windows above the threshold) bypass AIMD
+// entirely; their retry-after is an exact reset time, not a hint.
 export const SHORT_TERM_BACKOFF_THRESHOLD_SECS = 300;
 export const SHORT_TERM_BACKOFF_CAP_MS = 5 * 60 * 1000;
+export const BACKOFF_INCREASE_FACTOR = 2.0;
+export const BACKOFF_DECREMENT_MS_PER_SUCCESS = 10_000;
 
 /**
- * Decorrelated-jitter backoff for a 429.
+ * AIMD backoff with decorrelated jitter for a 429.
  *
- * - Long-term retry-after (above threshold): pass through unchanged.
- * - Short-term, streak === 0: server's retry-after as base.
- * - Short-term, streak >= 1: `random(base, prev * 3)`, capped.
+ * - Long-term retry-after (>threshold): pass through unchanged.
+ * - Short-term: `next = random(base, max(base, prev * INCREASE_FACTOR))`, capped.
  *
- * `retryAfterSecs <= 0` is treated as 60s (matches Anthropic's typical
- * short-term cooldown when no header is present).
+ * `retryAfterSecs <= 0` is treated as 60s (typical Anthropic short-term
+ * cooldown when no usable header is present).
  */
 export function computeRateLimitWaitMs(
   retryAfterSecs: number,
   prevBackoffMs: number,
-  streak: number,
   rng: () => number = Math.random,
 ): number {
   const baseMs = (retryAfterSecs > 0 ? retryAfterSecs : 60) * 1000;
   if (retryAfterSecs > SHORT_TERM_BACKOFF_THRESHOLD_SECS) return baseMs;
-  if (streak === 0) return baseMs;
-  const upper = Math.max(baseMs, prevBackoffMs * 3);
+  const upper = Math.max(baseMs, prevBackoffMs * BACKOFF_INCREASE_FACTOR);
   const jittered = baseMs + rng() * (upper - baseMs);
   return Math.min(SHORT_TERM_BACKOFF_CAP_MS, jittered);
 }
@@ -1067,16 +1068,24 @@ export class KeyManager {
       totalCacheRead: entry.stats.totalCacheRead + cacheRead,
       totalCacheCreation: entry.stats.totalCacheCreation + cacheCreation,
     };
-    if (entry.shortTermStreak > 0) {
-      log("info", "Short-term backoff streak broken by success", {
+    // AIMD additive-decrease: each fresh post-cooldown success walks the
+    // backoff target down by a fixed increment. Successes arriving while the
+    // key is still parked (in-flight from before the 429) don't decrement —
+    // they aren't evidence the limit cleared. The asymmetry vs. the ×1.5
+    // increase means a stray success can't undo what the failures taught us;
+    // the backoff only fully recovers after several clean post-cooldown runs.
+    const onCooldown = entry.availableAt > Date.now();
+    if (entry.backoffMs > 0 && !onCooldown) {
+      const prevBackoffMs = entry.backoffMs;
+      entry.backoffMs = Math.max(0, prevBackoffMs - BACKOFF_DECREMENT_MS_PER_SUCCESS);
+      log("info", "Short-term backoff decremented by success", {
         label: entry.label,
-        streakLength: entry.shortTermStreak,
-        lastBackoffMs: entry.lastBackoffMs,
+        prevBackoffMs,
+        newBackoffMs: entry.backoffMs,
+        decrementMs: BACKOFF_DECREMENT_MS_PER_SUCCESS,
         tokensIn,
         tokensOut,
       });
-      entry.shortTermStreak = 0;
-      entry.lastBackoffMs = 0;
     }
     this.tsIncrement(entry.label, "__all__", "successes");
     this.tsAddTokens(entry.label, "__all__", tokensIn, tokensOut, cacheRead, cacheCreation);
@@ -1084,32 +1093,43 @@ export class KeyManager {
   }
 
   recordRateLimit(entry: ApiKeyEntry, retryAfterSecs: number): void {
-    const isShortTerm = retryAfterSecs <= SHORT_TERM_BACKOFF_THRESHOLD_SECS;
-    const prevStreak = entry.shortTermStreak;
-    const prevBackoffMs = entry.lastBackoffMs;
-    const baseMs = (retryAfterSecs > 0 ? retryAfterSecs : 60) * 1000;
-    const waitMs = computeRateLimitWaitMs(
-      retryAfterSecs,
-      prevBackoffMs,
-      prevStreak,
-    );
-    const jitterAppliedMs = waitMs - baseMs;
+    const nowMs = Date.now();
+    // Stat always increments — visibility into hit count even for residuals.
     entry.stats = {
       ...entry.stats,
       rateLimitHits: entry.stats.rateLimitHits + 1,
     };
-    entry.availableAt = unixMs(Date.now() + waitMs);
-    if (isShortTerm) {
-      entry.shortTermStreak += 1;
-      entry.lastBackoffMs = waitMs;
-    } else {
-      // Long-term hit (5h/7d reset): clear the short-term streak so a later
-      // 60s cooldown isn't penalized by a stale streak from before this
-      // window flipped.
-      entry.shortTermStreak = 0;
-      entry.lastBackoffMs = 0;
-    }
     this.tsIncrement(entry.label, "__all__", "rateLimits");
+
+    // Coalesce residual 429s from already-in-flight requests on a key whose
+    // cooldown is still active. They reflect the same incident as the first
+    // 429 — don't double-park the key, don't inflate the backoff counter.
+    if (entry.availableAt > nowMs) {
+      log("warn", "Key rate-limited (coalesced; key already on cooldown)", {
+        label: entry.label,
+        retryAfterSecs,
+        currentBackoffMs: entry.backoffMs,
+        remainingCooldownMs: entry.availableAt - nowMs,
+        availableAt: new Date(entry.availableAt).toISOString(),
+      });
+      this.scheduleSave();
+      return;
+    }
+
+    const isShortTerm = retryAfterSecs <= SHORT_TERM_BACKOFF_THRESHOLD_SECS;
+    const prevBackoffMs = entry.backoffMs;
+    const baseMs = (retryAfterSecs > 0 ? retryAfterSecs : 60) * 1000;
+    const waitMs = computeRateLimitWaitMs(retryAfterSecs, prevBackoffMs);
+    const jitterAppliedMs = waitMs - baseMs;
+    entry.availableAt = unixMs(nowMs + waitMs);
+    if (isShortTerm) {
+      entry.backoffMs = waitMs;
+    } else {
+      // Long-term hit (5h/7d reset): clear short-term backoff so a later
+      // 60s cooldown isn't penalized by stale state from before this
+      // window flipped.
+      entry.backoffMs = 0;
+    }
     log("warn", "Key rate-limited", {
       label: entry.label,
       retryAfterSecs,
@@ -1118,8 +1138,7 @@ export class KeyManager {
       waitMs,
       jitterAppliedMs,
       prevBackoffMs,
-      prevStreak,
-      newStreak: entry.shortTermStreak,
+      newBackoffMs: entry.backoffMs,
       cappedAtMaxBackoff: isShortTerm && waitMs >= SHORT_TERM_BACKOFF_CAP_MS,
       availableAt: new Date(entry.availableAt).toISOString(),
     });
@@ -1232,8 +1251,7 @@ export class KeyManager {
       availableAt: unixMs(0),
       priority: 2,
       allowedDays: ALL_DAYS,
-      shortTermStreak: 0,
-      lastBackoffMs: 0,
+      backoffMs: 0,
     };
 
     this.keys.push(entry);
@@ -2522,8 +2540,7 @@ function rowToKeyEntry(
     availableAt: r.available_at as UnixMs,
     priority: r.priority,
     allowedDays: parseAllowedDays(r.allowed_days),
-    shortTermStreak: 0,
-    lastBackoffMs: 0,
+    backoffMs: 0,
   };
 }
 
