@@ -340,6 +340,28 @@ export async function proxyRequest(
       return allExhaustedResult(keyManager);
     }
     attempts++;
+    // Synchronously reserve a fire-slot on this key. When many concurrent
+    // requests claim the same key in the same tick, this stacks them by
+    // entry.interRequestGapMs so they don't all hit upstream the instant a
+    // cooldown lifts. Returns the timestamp at which we should fire.
+    const slotFireAt = keyManager.reserveFireSlot(entry);
+    const slotWaitMs = slotFireAt - Date.now();
+    if (slotWaitMs > 0) {
+      log("info", "Waiting for inter-request gap slot", {
+        label: entry.label,
+        user: proxyUser?.label,
+        method: req.method,
+        path: url.pathname,
+        attempt: attempts,
+        traceId,
+        sessionId,
+        conversationKey,
+        slotWaitMs,
+        interRequestGapMs: entry.interRequestGapMs,
+        fireAt: new Date(slotFireAt).toISOString(),
+      });
+      await new Promise((resolve) => setTimeout(resolve, slotWaitMs));
+    }
     keyManager.recordRequest(entry);
 
     const upstreamUrl = `${config.upstream}${url.pathname}${url.search}`;

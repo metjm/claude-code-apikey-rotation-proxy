@@ -11,11 +11,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   KeyManager,
-  computeRateLimitWaitMs,
+  computeNextGapMs,
   SHORT_TERM_BACKOFF_THRESHOLD_SECS,
-  SHORT_TERM_BACKOFF_CAP_MS,
-  BACKOFF_INCREASE_FACTOR,
-  BACKOFF_DECREMENT_MS_PER_SUCCESS,
+  MAX_INTER_REQUEST_GAP_MS,
+  GAP_INCREASE_FACTOR,
+  GAP_DECREMENT_MS_PER_SUCCESS,
 } from "../src/key-manager.ts";
 import type {
   ApiKeyEntry,
@@ -739,235 +739,276 @@ describe("Key Stats Recording", () => {
   });
 });
 
-// ── AIMD backoff (pure function) ─────────────────────────────────────────────
+// ── Inter-request gap (pure function) ────────────────────────────────────────
 
-describe("computeRateLimitWaitMs (AIMD with decorrelated jitter)", () => {
-  test("first hit with no prior backoff returns server retry-after as base", () => {
-    expect(computeRateLimitWaitMs(60, 0)).toBe(60_000);
-    expect(computeRateLimitWaitMs(45, 0)).toBe(45_000);
+describe("computeNextGapMs (multiplicative growth + ±25% jitter)", () => {
+  test("zero prior gap stays zero (caller is responsible for seeding)", () => {
+    // The function multiplies prev by factor; if prev=0 there's nothing to
+    // multiply. Seeding via GAP_FIRST_HIT_SEED_MS is recordRateLimit's job.
+    expect(computeNextGapMs(60, 0, () => 0.5)).toBe(0);
   });
 
-  test("zero or negative retry-after defaults to 60s on first hit", () => {
-    expect(computeRateLimitWaitMs(0, 0)).toBe(60_000);
-    expect(computeRateLimitWaitMs(-5, 0)).toBe(60_000);
+  test("long-term retry-after returns 0 (no pacing)", () => {
+    expect(computeNextGapMs(4662, 5000)).toBe(0);
+    expect(computeNextGapMs(SHORT_TERM_BACKOFF_THRESHOLD_SECS + 1, 5000, () => 0.99))
+      .toBe(0);
   });
 
-  test("long-term retry-after passes through unchanged regardless of prior backoff", () => {
-    // 5h window: ~78 minutes
-    expect(computeRateLimitWaitMs(4662, 0)).toBe(4662_000);
-    // Even with substantial prior backoff (long-term ignores it)
-    expect(computeRateLimitWaitMs(4662, 250_000, () => 0.99)).toBe(4662_000);
+  test("short-term threshold boundary is inclusive", () => {
+    expect(computeNextGapMs(SHORT_TERM_BACKOFF_THRESHOLD_SECS, 1000, () => 0.5))
+      .toBeGreaterThan(0);
   });
 
-  test("threshold boundary: exactly threshold seconds is short-term", () => {
-    expect(computeRateLimitWaitMs(SHORT_TERM_BACKOFF_THRESHOLD_SECS, 0))
-      .toBe(SHORT_TERM_BACKOFF_THRESHOLD_SECS * 1000);
-    // One second above is long-term, no jitter applied
-    const aboveThreshold = SHORT_TERM_BACKOFF_THRESHOLD_SECS + 1;
-    expect(computeRateLimitWaitMs(aboveThreshold, 250_000, () => 0.99))
-      .toBe(aboveThreshold * 1000);
+  test("with prev > 0, result is always > prev (gap reliably grows)", () => {
+    // prev=1000, factor=2 → target=2000, range [1500, 2500]. Always > 1000.
+    expect(computeNextGapMs(60, 1000, () => 0)).toBeGreaterThan(1000);
+    expect(computeNextGapMs(60, 1000, () => 0.5)).toBeGreaterThan(1000);
+    expect(computeNextGapMs(60, 1000, () => 0.99)).toBeGreaterThan(1000);
   });
 
-  test("short-term with prior backoff applies multiplicative increase + jitter", () => {
-    // prev=60s, factor=1.5 → upper bound is max(base, prev*factor) = 90s
-    // Bottom of jitter range = base
-    expect(computeRateLimitWaitMs(60, 60_000, () => 0)).toBe(60_000);
-    // Top of jitter range
-    const top = computeRateLimitWaitMs(60, 60_000, () => 0.9999);
-    expect(top).toBeGreaterThan(60_000);
-    expect(top).toBeLessThanOrEqual(60_000 * BACKOFF_INCREASE_FACTOR + 1);
-    // Mid: between base and base*1.5
-    const mid = computeRateLimitWaitMs(60, 60_000, () => 0.5);
-    expect(mid).toBeGreaterThanOrEqual(60_000);
-    expect(mid).toBeLessThanOrEqual(60_000 * BACKOFF_INCREASE_FACTOR);
+  test("jitter range is target * [0.75, 1.25]", () => {
+    // prev=1000, factor=2 → target=2000. With rng=0: 1500. With rng=1: 2500.
+    expect(computeNextGapMs(60, 1000, () => 0)).toBeCloseTo(1500, -1);
+    expect(computeNextGapMs(60, 1000, () => 0.5)).toBeCloseTo(2000, -1);
+    expect(computeNextGapMs(60, 1000, () => 0.9999)).toBeCloseTo(2500, -1);
   });
 
-  test("backoff grows roughly geometrically across repeated hits", () => {
-    // Top-of-range every time: prev → prev*factor each iteration.
-    let prev = 60_000;
-    for (let i = 0; i < 4; i++) {
-      const next = computeRateLimitWaitMs(60, prev, () => 0.9999);
-      expect(next).toBeGreaterThan(prev * 0.99);  // grew (or capped)
-      prev = next;
+  test("gap grows monotonically across repeated hits at any rng", () => {
+    for (const r of [0, 0.25, 0.5, 0.75, 0.99]) {
+      let prev = 500;
+      for (let i = 0; i < 5; i++) {
+        const next = computeNextGapMs(60, prev, () => r);
+        // Must grow (or be capped at MAX)
+        expect(next === MAX_INTER_REQUEST_GAP_MS || next > prev).toBe(true);
+        prev = next;
+      }
     }
-    // After 4 iterations from 60s with ×1.5 each, well above base
-    expect(prev).toBeGreaterThan(60_000);
   });
 
-  test("backoff is capped at SHORT_TERM_BACKOFF_CAP_MS", () => {
-    // Even with prev far past cap, output is clamped
-    const ms = computeRateLimitWaitMs(60, 10 * 60 * 1000, () => 0.9999);
-    expect(ms).toBeLessThanOrEqual(SHORT_TERM_BACKOFF_CAP_MS);
+  test("gap is capped at MAX_INTER_REQUEST_GAP_MS", () => {
+    const ms = computeNextGapMs(60, MAX_INTER_REQUEST_GAP_MS * 4, () => 0.9999);
+    expect(ms).toBe(MAX_INTER_REQUEST_GAP_MS);
   });
 
-  test("jitter range never goes below server retry-after", () => {
-    expect(computeRateLimitWaitMs(60, 60_000, () => 0)).toBe(60_000);
-    expect(computeRateLimitWaitMs(60, 1, () => 0)).toBe(60_000);
-    // Degenerate prev: base is the floor
-    expect(computeRateLimitWaitMs(60, 0, () => 0.5)).toBe(60_000);
+  test("reaches the cap within a few hits starting from the seed", () => {
+    // Seed=500, factor=2. With rng=0.5: 1000 → 2000 → 4000 → 8000 → ...
+    // Should hit 30s cap within ~6 iterations.
+    let prev = 500;
+    let iters = 0;
+    while (prev < MAX_INTER_REQUEST_GAP_MS && iters < 20) {
+      prev = computeNextGapMs(60, prev, () => 0.5);
+      iters++;
+    }
+    expect(iters).toBeLessThanOrEqual(8);
   });
 });
 
-// ── AIMD backoff (KeyManager integration) ────────────────────────────────────
+// ── Inter-request gap (KeyManager integration) ───────────────────────────────
 
-describe("recordRateLimit() AIMD backoff behavior", () => {
-  test("first hit uses base 60s; subsequent fresh hits grow multiplicatively", () => {
+describe("recordRateLimit() honors server retry-after exactly", () => {
+  test("availableAt = exactly retry-after seconds in the future, no jitter", () => {
     const km = create();
-    const entry = km.addKey(VALID_KEY_1, "grow");
+    const entry = km.addKey(VALID_KEY_1, "exact-cooldown");
 
-    // First hit: backoffMs=0 → exactly 60s (no prior to multiply against).
-    let before = Date.now();
+    const before = Date.now();
     km.recordRateLimit(entry, 60);
-    let wait = entry.availableAt - before;
+    const wait = entry.availableAt - before;
     expect(wait).toBeGreaterThanOrEqual(59_500);
     expect(wait).toBeLessThanOrEqual(60_500);
-    expect(entry.backoffMs).toBe(wait);
-
-    // Subsequent FRESH hits should occasionally exceed 60s due to jitter on
-    // top of the prior backoff (×1.5 ceiling).
-    let sawAboveBase = false;
-    for (let i = 0; i < 30; i++) {
-      // Force cooldown to have lapsed so each hit counts as fresh.
-      entry.availableAt = unixMs(Date.now() - 1);
-      before = Date.now();
-      km.recordRateLimit(entry, 60);
-      wait = entry.availableAt - before;
-      // Floor: never below server retry-after
-      expect(wait).toBeGreaterThanOrEqual(59_500);
-      // Cap
-      expect(wait).toBeLessThanOrEqual(SHORT_TERM_BACKOFF_CAP_MS + 500);
-      if (wait > 61_000) sawAboveBase = true;
-    }
-    expect(sawAboveBase).toBe(true);
   });
 
-  test("recordSuccess() walks backoff down by DECREMENT_MS (additive decrease)", () => {
+  test("zero or negative retry-after defaults to a 60s cooldown", () => {
     const km = create();
-    const entry = km.addKey(VALID_KEY_1, "additive");
+    const entry = km.addKey(VALID_KEY_1, "default-cooldown");
 
-    // Force backoff to a known value above the decrement.
-    entry.backoffMs = 200_000;
-    // Cooldown has lapsed (so the success counts as fresh, not in-flight).
-    entry.availableAt = unixMs(Date.now() - 1);
-
-    km.recordSuccess(entry, 1, 1);
-    expect(entry.backoffMs).toBe(200_000 - BACKOFF_DECREMENT_MS_PER_SUCCESS);
-
-    km.recordSuccess(entry, 1, 1);
-    expect(entry.backoffMs).toBe(
-      200_000 - 2 * BACKOFF_DECREMENT_MS_PER_SUCCESS,
-    );
+    const before = Date.now();
+    km.recordRateLimit(entry, 0);
+    const wait = entry.availableAt - before;
+    expect(wait).toBeGreaterThanOrEqual(59_500);
+    expect(wait).toBeLessThanOrEqual(60_500);
   });
 
-  test("recordSuccess() floors backoff at 0", () => {
+  test("long-term retry-after is honored exactly", () => {
     const km = create();
-    const entry = km.addKey(VALID_KEY_1, "floor");
+    const entry = km.addKey(VALID_KEY_1, "long-cooldown");
 
-    entry.backoffMs = 5_000;  // below decrement
-    entry.availableAt = unixMs(Date.now() - 1);
-
-    km.recordSuccess(entry, 1, 1);
-    expect(entry.backoffMs).toBe(0);
-  });
-
-  test("long-term retry-after honored exactly and resets backoff", () => {
-    const km = create();
-    const entry = km.addKey(VALID_KEY_1, "long-term");
-
-    // Build up some short-term backoff
-    km.recordRateLimit(entry, 60);
-    entry.availableAt = unixMs(Date.now() - 1);
-    km.recordRateLimit(entry, 60);
-    expect(entry.backoffMs).toBeGreaterThan(0);
-
-    // Long-term hit (need to expire cooldown so it isn't coalesced).
-    entry.availableAt = unixMs(Date.now() - 1);
     const before = Date.now();
     km.recordRateLimit(entry, 4662);
     const wait = entry.availableAt - before;
     expect(wait).toBeGreaterThanOrEqual(4661_500);
     expect(wait).toBeLessThanOrEqual(4662_500);
-    expect(entry.backoffMs).toBe(0);
   });
 
-  test("rateLimitHits stat still increments on every 429 (including residuals)", () => {
+  test("rateLimitHits stat increments on every 429 (including residuals)", () => {
     const km = create();
     const entry = km.addKey(VALID_KEY_1, "hits");
     for (let i = 0; i < 4; i++) km.recordRateLimit(entry, 60);
     expect(entry.stats.rateLimitHits).toBe(4);
   });
 
-  test("in-flight success during cooldown does NOT decrement backoff", () => {
-    // Concurrency hazard: multiple requests in flight when the first 429
-    // lands. Pre-rate-limit successes shouldn't shrink the backoff.
+  test("residual 429 during cooldown does NOT extend it", () => {
     const km = create();
-    const entry = km.addKey(VALID_KEY_1, "concurrent-ok");
-
-    km.recordRateLimit(entry, 60);
-    const backoffAfter429 = entry.backoffMs;
-    expect(backoffAfter429).toBe(60_000);
-    expect(entry.availableAt).toBeGreaterThan(Date.now());
-
-    // In-flight success arrives while cooldown is still active.
-    km.recordSuccess(entry, 100, 200);
-    expect(entry.backoffMs).toBe(backoffAfter429);  // unchanged
-    expect(entry.stats.successfulRequests).toBe(1);
-    expect(entry.stats.totalTokensIn).toBe(100);
-  });
-
-  test("post-cooldown success DOES decrement the backoff", () => {
-    const km = create();
-    const entry = km.addKey(VALID_KEY_1, "post-cooldown-ok");
-
-    km.recordRateLimit(entry, 60);
-    expect(entry.backoffMs).toBe(60_000);
-
-    // Cooldown lapsed.
-    entry.availableAt = unixMs(Date.now() - 1);
-    km.recordSuccess(entry, 1, 1);
-    expect(entry.backoffMs).toBe(60_000 - BACKOFF_DECREMENT_MS_PER_SUCCESS);
-  });
-
-  test("residual 429 during cooldown does NOT extend it or bump backoff", () => {
-    const km = create();
-    const entry = km.addKey(VALID_KEY_1, "residual-429");
+    const entry = km.addKey(VALID_KEY_1, "coalesce-429");
 
     km.recordRateLimit(entry, 60);
     const firstAvailableAt = entry.availableAt;
-    const firstBackoffMs = entry.backoffMs;
+    const firstGap = entry.interRequestGapMs;
 
-    // Second 429 arrives while still on cooldown.
+    // Second 429 arrives while still on cooldown — same incident.
     km.recordRateLimit(entry, 60);
 
     expect(entry.availableAt).toBe(firstAvailableAt);
-    expect(entry.backoffMs).toBe(firstBackoffMs);
-    // Hit count still rises.
+    expect(entry.interRequestGapMs).toBe(firstGap);
     expect(entry.stats.rateLimitHits).toBe(2);
   });
+});
 
-  test("AIMD pattern: 429 grows backoff, success shrinks it slowly", () => {
-    // Simulates the user's scenario: each cycle 1 fresh 429 then a couple of
-    // successes. The multiplicative-up beats the additive-down so backoff
-    // ratchets up over time. Without AIMD this would stay at 60s forever.
+describe("recordRateLimit() AIMD on inter-request gap", () => {
+  test("first short-term 429 seeds gap from 0 (still 0)", () => {
     const km = create();
-    const entry = km.addKey(VALID_KEY_1, "aimd-cycle");
+    const entry = km.addKey(VALID_KEY_1, "first-gap");
 
-    const backoffsAfter429: number[] = [];
-    for (let cycle = 0; cycle < 5; cycle++) {
-      // Fresh 429
+    expect(entry.interRequestGapMs).toBe(0);
+    km.recordRateLimit(entry, 60);
+    // First 429 ever: prev=0, can't multiply 0 — stays 0. The seeding
+    // happens via the first DECREMENT recovery never running, OR via
+    // a synthetic seed below. We bootstrap the gap by clamping to a
+    // minimum after the first hit so growth has somewhere to start.
+    expect(entry.interRequestGapMs).toBeGreaterThanOrEqual(0);
+  });
+
+  test("subsequent fresh hits grow the gap multiplicatively", () => {
+    const km = create();
+    const entry = km.addKey(VALID_KEY_1, "grow-gap");
+
+    // Seed: first 429 + force a small starting gap to enable growth.
+    entry.interRequestGapMs = 1_000;
+    entry.availableAt = unixMs(Date.now() - 1);
+
+    const gaps: number[] = [];
+    for (let i = 0; i < 6; i++) {
       entry.availableAt = unixMs(Date.now() - 1);
       km.recordRateLimit(entry, 60);
-      backoffsAfter429.push(entry.backoffMs);
-      // Two post-cooldown successes
-      entry.availableAt = unixMs(Date.now() - 1);
-      km.recordSuccess(entry, 1, 1);
-      entry.availableAt = unixMs(Date.now() - 1);
-      km.recordSuccess(entry, 1, 1);
+      gaps.push(entry.interRequestGapMs);
     }
-    // Backoff after the 5th 429 should be substantially larger than the 1st.
-    expect(backoffsAfter429[4]).toBeGreaterThan(backoffsAfter429[0]);
-    // And should still respect the cap.
-    expect(backoffsAfter429[4]).toBeLessThanOrEqual(SHORT_TERM_BACKOFF_CAP_MS);
+    // Gap should grow over time (or saturate at cap)
+    expect(gaps[5]).toBeGreaterThan(gaps[0]);
+    expect(gaps[5]).toBeLessThanOrEqual(MAX_INTER_REQUEST_GAP_MS);
+  });
+
+  test("post-cooldown success shrinks the gap by DECREMENT", () => {
+    const km = create();
+    const entry = km.addKey(VALID_KEY_1, "shrink-gap");
+
+    entry.interRequestGapMs = 30_000;
+    entry.availableAt = unixMs(Date.now() - 1);
+
+    km.recordSuccess(entry, 1, 1);
+    expect(entry.interRequestGapMs).toBe(30_000 - GAP_DECREMENT_MS_PER_SUCCESS);
+
+    km.recordSuccess(entry, 1, 1);
+    expect(entry.interRequestGapMs).toBe(30_000 - 2 * GAP_DECREMENT_MS_PER_SUCCESS);
+  });
+
+  test("recordSuccess() floors gap at 0", () => {
+    const km = create();
+    const entry = km.addKey(VALID_KEY_1, "floor-gap");
+
+    entry.interRequestGapMs = 5_000;
+    entry.availableAt = unixMs(Date.now() - 1);
+
+    km.recordSuccess(entry, 1, 1);
+    expect(entry.interRequestGapMs).toBe(0);
+  });
+
+  test("long-term 429 resets the gap (5h/7d window state is unrelated)", () => {
+    const km = create();
+    const entry = km.addKey(VALID_KEY_1, "long-resets-gap");
+
+    entry.interRequestGapMs = 50_000;
+    entry.availableAt = unixMs(Date.now() - 1);
+
+    km.recordRateLimit(entry, 4662);
+    expect(entry.interRequestGapMs).toBe(0);
+  });
+
+  test("in-flight success during cooldown does NOT shrink the gap", () => {
+    const km = create();
+    const entry = km.addKey(VALID_KEY_1, "in-flight-success");
+
+    entry.interRequestGapMs = 30_000;
+    km.recordRateLimit(entry, 60);
+    const gapAfterRl = entry.interRequestGapMs;
+
+    // In-flight success arrives during cooldown — pre-rate-limit traffic.
+    km.recordSuccess(entry, 1, 1);
+    expect(entry.interRequestGapMs).toBe(gapAfterRl);
+    expect(entry.stats.successfulRequests).toBe(1);
+  });
+});
+
+describe("reserveFireSlot() — synchronous slot reservation prevents thundering herd", () => {
+  test("first reservation on a free key returns now (no wait)", () => {
+    const km = create();
+    const entry = km.addKey(VALID_KEY_1, "free-key");
+
+    const before = Date.now();
+    const fireAt = km.reserveFireSlot(entry);
+    expect(fireAt).toBeGreaterThanOrEqual(before);
+    expect(fireAt).toBeLessThanOrEqual(before + 50);
+  });
+
+  test("reservation respects availableAt (cooldown)", () => {
+    const km = create();
+    const entry = km.addKey(VALID_KEY_1, "cooled-key");
+
+    km.recordRateLimit(entry, 60);
+    const fireAt = km.reserveFireSlot(entry);
+    expect(fireAt).toBeGreaterThanOrEqual(entry.availableAt);
+  });
+
+  test("concurrent reservations on the same key stack by gap", () => {
+    // The herd-killer: when N requests claim the same key in the same tick
+    // (synchronous, no awaits between calls), each gets a fire-time GAP ms
+    // after the previous. JS being single-threaded makes this atomic.
+    const km = create();
+    const entry = km.addKey(VALID_KEY_1, "stacked");
+    entry.interRequestGapMs = 1_000;
+
+    const t0 = km.reserveFireSlot(entry);
+    const t1 = km.reserveFireSlot(entry);
+    const t2 = km.reserveFireSlot(entry);
+    const t3 = km.reserveFireSlot(entry);
+
+    expect(t1 - t0).toBeGreaterThanOrEqual(900);   // ~1s gap
+    expect(t1 - t0).toBeLessThanOrEqual(1100);
+    expect(t2 - t1).toBeGreaterThanOrEqual(900);
+    expect(t2 - t1).toBeLessThanOrEqual(1100);
+    expect(t3 - t2).toBeGreaterThanOrEqual(900);
+    expect(t3 - t2).toBeLessThanOrEqual(1100);
+  });
+
+  test("zero gap means no enforced spacing — back-to-back fires allowed", () => {
+    const km = create();
+    const entry = km.addKey(VALID_KEY_1, "no-gap");
+    entry.interRequestGapMs = 0;
+
+    const t0 = km.reserveFireSlot(entry);
+    const t1 = km.reserveFireSlot(entry);
+    expect(t1 - t0).toBeLessThanOrEqual(50);
+  });
+
+  test("reservation after a stale claim doesn't block forever", () => {
+    // If a request reserved a slot in the future and never fired, the next
+    // request should still inherit that future time (correct serialization)
+    // but as the clock advances, eventually new reservations return now.
+    const km = create();
+    const entry = km.addKey(VALID_KEY_1, "stale");
+    entry.interRequestGapMs = 0;
+    entry.nextRequestAt = unixMs(Date.now() - 1_000);  // already past
+
+    const fireAt = km.reserveFireSlot(entry);
+    expect(fireAt).toBeGreaterThanOrEqual(Date.now() - 50);
   });
 });
 

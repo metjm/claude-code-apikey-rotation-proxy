@@ -2257,13 +2257,13 @@ function ensureKeysApp() {
           !this.k.isAvailable ? fmtCountdown(this.k.availableAt - this.now) : null,
         ].filter(Boolean).join(' · ') || '--';
       },
-      hasElevatedBackoff() { return (this.k.backoffMs || 0) > 0; },
-      backoffSec() { return Math.round((this.k.backoffMs || 0) / 1000); },
-      backoffTitle() {
-        return 'Adaptive (AIMD) short-term backoff target: ' + this.backoffSec + 's. '
-          + 'Each fresh short-term 429 multiplies this up (×2 with decorrelated jitter, capped at 5min); '
-          + 'each fresh post-cooldown success knocks it down by 10s. '
-          + 'Drives the actual wait when this key gets rate-limited again.';
+      hasElevatedGap() { return (this.k.interRequestGapMs || 0) > 0; },
+      gapSec() { return ((this.k.interRequestGapMs || 0) / 1000).toFixed(1); },
+      gapTitle() {
+        return 'Adaptive minimum gap between successive requests on this key: ' + this.gapSec + 's. '
+          + 'Each fresh short-term 429 grows the gap (×2 with mild jitter, capped at 30s); '
+          + 'each fresh post-cooldown success shrinks it by 5s. '
+          + 'Prevents the thundering-herd of waiting requests all firing the instant a cooldown lifts.';
       },
       hasAnyWindow() { return sortedCapacityWindows(this.k).length > 0; },
       hasNormalizedHeaders() { return (this.k.capacity?.normalizedHeaderCount || 0) > 0; },
@@ -2338,7 +2338,7 @@ function ensureKeysApp() {
               <span v-html="routingBadgeHtml"></span>
               <span v-if="k.isAvailable" class="badge" :class="quotaState.className" :title="quotaState.title">{{ quotaState.label }}</span>
               <span v-if="showOverageBadge" class="badge badge-blue" :title="overageNoteText">Extra usage off</span>
-              <span v-if="hasElevatedBackoff" class="badge badge-warning" :title="backoffTitle">Backoff +{{ backoffSec }}s</span>
+              <span v-if="hasElevatedGap" class="badge badge-warning" :title="gapTitle">Gap {{ gapSec }}s</span>
             </div>
             <div class="metric-inline">{{ routingDetail }}</div>
           </div>

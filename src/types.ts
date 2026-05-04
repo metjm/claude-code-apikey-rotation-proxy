@@ -103,13 +103,19 @@ export interface ApiKeyEntry {
   priority: number;
   /** Days of the week this key may be used. 0=Sun … 6=Sat. Default: all days. */
   allowedDays: readonly number[];
-  /** Current short-term backoff target (ms). AIMD: each fresh short-term 429
-   *  multiplies this up (with decorrelated jitter); each fresh post-cooldown
-   *  success additively walks it down. Long-term 429s reset to 0. Stored as
-   *  the actual wait we set, so successive multiplications compound but a
-   *  steady stream of successes erodes the penalty over time.
-   *  In-memory only — not persisted across restart. */
-  backoffMs: number;
+  /** Adaptive minimum gap between consecutive requests on this key (ms). AIMD:
+   *  each fresh short-term 429 grows the gap multiplicatively (decorrelated
+   *  jitter, capped); each fresh post-cooldown success shrinks it additively.
+   *  Long-term 429s reset to 0. Anthropic's `retry-after` is honored exactly
+   *  for the cooldown duration — this gap is what we layer on top to prevent
+   *  the thundering-herd of waiting requests all firing the instant the
+   *  cooldown lifts. In-memory only. */
+  interRequestGapMs: number;
+  /** Earliest time we'll fire the next request on this key. Reservation
+   *  timestamp updated atomically by reserveFireSlot — concurrent claims in
+   *  the same JS tick get sequential fire-times stacked by interRequestGapMs.
+   *  In-memory only. */
+  nextRequestAt: UnixMs;
 }
 
 export interface MaskedKeyEntry {
@@ -123,11 +129,11 @@ export interface MaskedKeyEntry {
   readonly priority: number;
   readonly allowedDays: readonly number[];
   readonly recentErrors: number;
-  /** Current AIMD short-term backoff target (ms). 0 means baseline; positive
-   *  means past 429s elevated this key's wait beyond the server-suggested
-   *  retry-after. Each fresh post-cooldown success knocks it down; each fresh
-   *  short-term 429 multiplies it up (with decorrelated jitter). */
-  readonly backoffMs: number;
+  /** Current AIMD inter-request gap (ms). 0 means no enforced spacing between
+   *  requests on this key; positive means past 429s have made us pace
+   *  consecutive requests. Each fresh post-cooldown success shrinks it; each
+   *  fresh short-term 429 grows it (with decorrelated jitter). */
+  readonly interRequestGapMs: number;
   readonly recentSessions: readonly {
     readonly sessionId: string;
     readonly actor: string;
@@ -174,7 +180,7 @@ export interface MaskedTokenEntry {
 
 export interface StoredState {
   readonly version: 1;
-  readonly keys: readonly (Omit<ApiKeyEntry, "capacity" | "backoffMs"> & { readonly capacity?: ApiKeyCapacityState })[];
+  readonly keys: readonly (Omit<ApiKeyEntry, "capacity" | "interRequestGapMs" | "nextRequestAt"> & { readonly capacity?: ApiKeyCapacityState })[];
   readonly tokens?: readonly ProxyTokenEntry[];
 }
 

@@ -315,40 +315,55 @@ const ROUTING_DECISION_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 // remap — staying on a dead key for 5h would starve the session.
 const SHORT_COOLDOWN_PASSTHROUGH_MS = 5 * 60 * 1000;
 
-// AIMD backoff for keys that keep tripping the same short-term
-// (per-minute) rate limit. Anthropic's `retry-after: 60` after a huge
-// request is a smoothing hint — waiting exactly 60s and re-firing the same
-// payload often re-trips the rolling minute. We track a per-key backoff
-// target that grows multiplicatively on each fresh short-term 429 (with
-// decorrelated jitter on top) and shrinks additively on each fresh
-// post-cooldown success. The asymmetry — slow recovery, fast escalation —
-// means a single stray success can't undo the penalty learned across many
-// failures. Long-term 429s (5h/7d windows above the threshold) bypass AIMD
-// entirely; their retry-after is an exact reset time, not a hint.
+// AIMD inter-request gap for keys that keep tripping the same short-term
+// (per-minute) rate limit. Anthropic's `retry-after: 60` after a 429 tells
+// us when the rolling-minute window is expected to clear — we honor that
+// exactly. What we adapt on our end is how fast we re-press AFTER the
+// cooldown lifts. Without a gap, every request that was waiting on the
+// pinned-key cooldown would fire the instant it expires, immediately
+// re-tripping the limit. The gap grows multiplicatively (×2 with
+// decorrelated jitter) on each fresh short-term 429 and shrinks additively
+// on each fresh post-cooldown success — fast escalation, slow recovery, so
+// a stray success can't undo penalty learned across many failures. The
+// reservation mechanism (reserveFireSlot) makes the gap effective even
+// when many concurrent requests claim the same key simultaneously.
+//
+// Long-term 429s (5h/7d windows; retry-after well above threshold) reset
+// the gap to 0 — those are exact reset times, pacing doesn't help.
 export const SHORT_TERM_BACKOFF_THRESHOLD_SECS = 300;
-export const SHORT_TERM_BACKOFF_CAP_MS = 5 * 60 * 1000;
-export const BACKOFF_INCREASE_FACTOR = 2.0;
-export const BACKOFF_DECREMENT_MS_PER_SUCCESS = 10_000;
+export const MAX_INTER_REQUEST_GAP_MS = 30_000;
+export const GAP_INCREASE_FACTOR = 2.0;
+export const GAP_DECREMENT_MS_PER_SUCCESS = 5_000;
+// First-hit seed: the initial multiplicative-up needs a non-zero base. After
+// the first short-term 429 we clamp the gap to at least this so subsequent
+// growth has somewhere to start.
+const GAP_FIRST_HIT_SEED_MS = 500;
 
 /**
- * AIMD backoff with decorrelated jitter for a 429.
+ * AIMD inter-request gap with mild jitter for a 429.
  *
- * - Long-term retry-after (>threshold): pass through unchanged.
- * - Short-term: `next = random(base, max(base, prev * INCREASE_FACTOR))`, capped.
+ * - Long-term retry-after (>threshold): returns 0 (no pacing).
+ * - Short-term: `next = prev * factor * (0.75..1.25)`, capped.
  *
- * `retryAfterSecs <= 0` is treated as 60s (typical Anthropic short-term
- * cooldown when no usable header is present).
+ * Multiplicative growth with mild ±25% jitter so the gap reliably trends up
+ * across repeated hits (pure random-in-[0,prev*factor] would be a random
+ * walk that often shrinks). Caller seeds prevGapMs with at least
+ * GAP_FIRST_HIT_SEED_MS on the very first short-term hit so multiplication
+ * has a base.
+ *
+ * Returns the GAP (not a wait). The cooldown duration is set separately
+ * from `retryAfterSecs` exactly — the gap is layered on top of cooldown to
+ * spread out post-cooldown traffic.
  */
-export function computeRateLimitWaitMs(
+export function computeNextGapMs(
   retryAfterSecs: number,
-  prevBackoffMs: number,
+  prevGapMs: number,
   rng: () => number = Math.random,
 ): number {
-  const baseMs = (retryAfterSecs > 0 ? retryAfterSecs : 60) * 1000;
-  if (retryAfterSecs > SHORT_TERM_BACKOFF_THRESHOLD_SECS) return baseMs;
-  const upper = Math.max(baseMs, prevBackoffMs * BACKOFF_INCREASE_FACTOR);
-  const jittered = baseMs + rng() * (upper - baseMs);
-  return Math.min(SHORT_TERM_BACKOFF_CAP_MS, jittered);
+  if (retryAfterSecs > SHORT_TERM_BACKOFF_THRESHOLD_SECS) return 0;
+  const target = prevGapMs * GAP_INCREASE_FACTOR;
+  const jittered = target * (0.75 + rng() * 0.5);
+  return Math.min(MAX_INTER_REQUEST_GAP_MS, jittered);
 }
 
 // Seasonal factor table: how many weeks back, how few observations collapse a
@@ -1068,21 +1083,18 @@ export class KeyManager {
       totalCacheRead: entry.stats.totalCacheRead + cacheRead,
       totalCacheCreation: entry.stats.totalCacheCreation + cacheCreation,
     };
-    // AIMD additive-decrease: each fresh post-cooldown success walks the
-    // backoff target down by a fixed increment. Successes arriving while the
-    // key is still parked (in-flight from before the 429) don't decrement —
-    // they aren't evidence the limit cleared. The asymmetry vs. the ×1.5
-    // increase means a stray success can't undo what the failures taught us;
-    // the backoff only fully recovers after several clean post-cooldown runs.
+    // AIMD additive-decrease on the inter-request gap. Successes arriving
+    // while the key is still parked (in-flight from before the 429) don't
+    // shrink the gap — they aren't evidence the limit cleared.
     const onCooldown = entry.availableAt > Date.now();
-    if (entry.backoffMs > 0 && !onCooldown) {
-      const prevBackoffMs = entry.backoffMs;
-      entry.backoffMs = Math.max(0, prevBackoffMs - BACKOFF_DECREMENT_MS_PER_SUCCESS);
-      log("info", "Short-term backoff decremented by success", {
+    if (entry.interRequestGapMs > 0 && !onCooldown) {
+      const prevGapMs = entry.interRequestGapMs;
+      entry.interRequestGapMs = Math.max(0, prevGapMs - GAP_DECREMENT_MS_PER_SUCCESS);
+      log("info", "Inter-request gap decremented by success", {
         label: entry.label,
-        prevBackoffMs,
-        newBackoffMs: entry.backoffMs,
-        decrementMs: BACKOFF_DECREMENT_MS_PER_SUCCESS,
+        prevGapMs,
+        newGapMs: entry.interRequestGapMs,
+        decrementMs: GAP_DECREMENT_MS_PER_SUCCESS,
         tokensIn,
         tokensOut,
       });
@@ -1103,12 +1115,12 @@ export class KeyManager {
 
     // Coalesce residual 429s from already-in-flight requests on a key whose
     // cooldown is still active. They reflect the same incident as the first
-    // 429 — don't double-park the key, don't inflate the backoff counter.
+    // 429 — don't double-park the key, don't inflate the gap counter.
     if (entry.availableAt > nowMs) {
       log("warn", "Key rate-limited (coalesced; key already on cooldown)", {
         label: entry.label,
         retryAfterSecs,
-        currentBackoffMs: entry.backoffMs,
+        currentInterRequestGapMs: entry.interRequestGapMs,
         remainingCooldownMs: entry.availableAt - nowMs,
         availableAt: new Date(entry.availableAt).toISOString(),
       });
@@ -1117,32 +1129,56 @@ export class KeyManager {
     }
 
     const isShortTerm = retryAfterSecs <= SHORT_TERM_BACKOFF_THRESHOLD_SECS;
-    const prevBackoffMs = entry.backoffMs;
-    const baseMs = (retryAfterSecs > 0 ? retryAfterSecs : 60) * 1000;
-    const waitMs = computeRateLimitWaitMs(retryAfterSecs, prevBackoffMs);
-    const jitterAppliedMs = waitMs - baseMs;
-    entry.availableAt = unixMs(nowMs + waitMs);
+    // Cooldown duration: trust the server exactly. If they say wait 60s, we
+    // wait 60s — no multiplier. The smoothing happens via interRequestGapMs.
+    const cooldownMs = (retryAfterSecs > 0 ? retryAfterSecs : 60) * 1000;
+    entry.availableAt = unixMs(nowMs + cooldownMs);
+    // Reset reservation horizon to the cooldown end — any pending claims
+    // from before are superseded by the new cooldown.
+    entry.nextRequestAt = entry.availableAt;
+
+    const prevGapMs = entry.interRequestGapMs;
+    let newGapMs: number;
     if (isShortTerm) {
-      entry.backoffMs = waitMs;
+      // First-ever hit on this key: seed the gap so subsequent multiplications
+      // have a base. Without this, prev*factor stays 0 forever.
+      const seed = prevGapMs > 0 ? prevGapMs : GAP_FIRST_HIT_SEED_MS;
+      newGapMs = computeNextGapMs(retryAfterSecs, seed);
     } else {
-      // Long-term hit (5h/7d reset): clear short-term backoff so a later
-      // 60s cooldown isn't penalized by stale state from before this
-      // window flipped.
-      entry.backoffMs = 0;
+      // Long-term reset.
+      newGapMs = 0;
     }
+    entry.interRequestGapMs = newGapMs;
+
     log("warn", "Key rate-limited", {
       label: entry.label,
       retryAfterSecs,
       limitClass: isShortTerm ? "short_term" : "long_term",
-      baseMs,
-      waitMs,
-      jitterAppliedMs,
-      prevBackoffMs,
-      newBackoffMs: entry.backoffMs,
-      cappedAtMaxBackoff: isShortTerm && waitMs >= SHORT_TERM_BACKOFF_CAP_MS,
+      cooldownMs,
+      prevGapMs,
+      newGapMs,
+      gapCappedAtMax: isShortTerm && newGapMs >= MAX_INTER_REQUEST_GAP_MS,
       availableAt: new Date(entry.availableAt).toISOString(),
+      nextRequestAt: new Date(entry.nextRequestAt).toISOString(),
     });
     this.scheduleSave();
+  }
+
+  /**
+   * Synchronously claim a fire-slot on this key. Returns the timestamp at
+   * which the caller should fire upstream — `now` if the key is free, or
+   * later if the cooldown is active or another concurrent claim is ahead.
+   *
+   * Crucially: this updates `entry.nextRequestAt` synchronously (no await)
+   * so multiple claims in the same JS tick get sequential slots stacked by
+   * `interRequestGapMs`. That's the herd-killer for many waiting requests
+   * waking from the same cooldown.
+   */
+  reserveFireSlot(entry: ApiKeyEntry): UnixMs {
+    const nowMs = Date.now();
+    const fireAt = Math.max(nowMs, entry.availableAt, entry.nextRequestAt);
+    entry.nextRequestAt = unixMs(fireAt + entry.interRequestGapMs);
+    return unixMs(fireAt);
   }
 
   resetKeyCooldowns(): number {
@@ -1251,7 +1287,8 @@ export class KeyManager {
       availableAt: unixMs(0),
       priority: 2,
       allowedDays: ALL_DAYS,
-      backoffMs: 0,
+      interRequestGapMs: 0,
+      nextRequestAt: unixMs(0),
     };
 
     this.keys.push(entry);
@@ -1373,7 +1410,7 @@ export class KeyManager {
         allowedDays: k.allowedDays,
         recentErrors: recentErrs.get(k.label) ?? 0,
         recentSessions: recentSessionsByKey.get(k.key) ?? [],
-        backoffMs: k.backoffMs,
+        interRequestGapMs: k.interRequestGapMs,
       })
     );
   }
@@ -2541,7 +2578,8 @@ function rowToKeyEntry(
     availableAt: r.available_at as UnixMs,
     priority: r.priority,
     allowedDays: parseAllowedDays(r.allowed_days),
-    backoffMs: 0,
+    interRequestGapMs: 0,
+    nextRequestAt: unixMs(0),
   };
 }
 
