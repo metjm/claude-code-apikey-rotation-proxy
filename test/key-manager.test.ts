@@ -15,7 +15,7 @@ import {
   SHORT_TERM_BACKOFF_THRESHOLD_SECS,
   MAX_INTER_REQUEST_GAP_MS,
   GAP_INCREASE_FACTOR,
-  GAP_DECREMENT_MS_PER_SUCCESS,
+  GAP_DECREASE_FACTOR_PER_SUCCESS,
 } from "../src/key-manager.ts";
 import type {
   ApiKeyEntry,
@@ -896,28 +896,60 @@ describe("recordRateLimit() AIMD on inter-request gap", () => {
     expect(gaps[5]).toBeLessThanOrEqual(MAX_INTER_REQUEST_GAP_MS);
   });
 
-  test("post-cooldown success shrinks the gap by DECREMENT", () => {
+  test("post-cooldown success shrinks the gap multiplicatively", () => {
     const km = create();
     const entry = km.addKey(VALID_KEY_1, "shrink-gap");
 
-    entry.interRequestGapMs = 30_000;
+    entry.interRequestGapMs = 10_000;
     entry.availableAt = unixMs(Date.now() - 1);
 
     km.recordSuccess(entry, 1, 1);
-    expect(entry.interRequestGapMs).toBe(30_000 - GAP_DECREMENT_MS_PER_SUCCESS);
+    expect(entry.interRequestGapMs).toBeCloseTo(10_000 * GAP_DECREASE_FACTOR_PER_SUCCESS, 1);
 
     km.recordSuccess(entry, 1, 1);
-    expect(entry.interRequestGapMs).toBe(30_000 - 2 * GAP_DECREMENT_MS_PER_SUCCESS);
+    expect(entry.interRequestGapMs).toBeCloseTo(10_000 * GAP_DECREASE_FACTOR_PER_SUCCESS ** 2, 1);
   });
 
-  test("recordSuccess() floors gap at 0", () => {
+  test("a single success cannot wipe a learned gap (asymmetric AIMD)", () => {
+    // The whole point: 429s grow gap fast, success shrinks slowly. ONE
+    // success on a 1.7s gap (the production value seen in logs) leaves it
+    // at ~1.4s, not 0.
     const km = create();
-    const entry = km.addKey(VALID_KEY_1, "floor-gap");
+    const entry = km.addKey(VALID_KEY_1, "asymmetric");
 
-    entry.interRequestGapMs = 5_000;
+    entry.interRequestGapMs = 1_700;
+    entry.availableAt = unixMs(Date.now() - 1);
+    km.recordSuccess(entry, 1, 1);
+
+    // Gap should have shrunk but stayed substantial.
+    expect(entry.interRequestGapMs).toBeGreaterThan(1_000);
+    expect(entry.interRequestGapMs).toBeLessThan(1_700);
+  });
+
+  test("recordSuccess() collapses gap to 0 once it falls below the noise threshold", () => {
+    const km = create();
+    const entry = km.addKey(VALID_KEY_1, "collapse-gap");
+
+    entry.interRequestGapMs = 100;  // at-or-below collapse threshold after one success
     entry.availableAt = unixMs(Date.now() - 1);
 
     km.recordSuccess(entry, 1, 1);
+    expect(entry.interRequestGapMs).toBe(0);
+  });
+
+  test("many successes geometrically decay the gap toward 0", () => {
+    const km = create();
+    const entry = km.addKey(VALID_KEY_1, "decay");
+
+    entry.interRequestGapMs = 20_000;
+    entry.availableAt = unixMs(Date.now() - 1);
+
+    // 40 successes — the gap should have collapsed to 0 by the end
+    // (20000 × 0.85^33 ≈ 93 < 100ms collapse threshold, snaps to 0).
+    for (let i = 0; i < 40; i++) {
+      entry.availableAt = unixMs(Date.now() - 1);
+      km.recordSuccess(entry, 1, 1);
+    }
     expect(entry.interRequestGapMs).toBe(0);
   });
 

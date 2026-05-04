@@ -2262,7 +2262,7 @@ function ensureKeysApp() {
       gapTitle() {
         return 'Adaptive minimum gap between successive requests on this key: ' + this.gapSec + 's. '
           + 'Each fresh short-term 429 grows the gap (×2 with mild jitter, capped at 30s); '
-          + 'each fresh post-cooldown success shrinks it by 5s. '
+          + 'each fresh post-cooldown success shrinks it by 15% (multiplicative, so a single success cannot wipe state). '
           + 'Prevents the thundering-herd of waiting requests all firing the instant a cooldown lifts.';
       },
       hasAnyWindow() { return sortedCapacityWindows(this.k).length > 0; },

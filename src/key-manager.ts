@@ -333,7 +333,16 @@ const SHORT_COOLDOWN_PASSTHROUGH_MS = 5 * 60 * 1000;
 export const SHORT_TERM_BACKOFF_THRESHOLD_SECS = 300;
 export const MAX_INTER_REQUEST_GAP_MS = 30_000;
 export const GAP_INCREASE_FACTOR = 2.0;
-export const GAP_DECREMENT_MS_PER_SUCCESS = 5_000;
+// Multiplicative decrease per fresh post-cooldown success. A single success
+// shaves 15% off the gap; a stream of successes erodes it geometrically
+// (10 → 70%, 20 → 50%, 50 → 22%). Crucially, ONE success can't wipe state
+// that took many failures to learn — that's the asymmetric AIMD invariant.
+// A fixed-ms decrement was tried first; with small gaps (e.g. 1.7s) and
+// our 5s decrement, a single success would zero out the gap completely
+// and the next 429 would re-seed from base, defeating the point.
+export const GAP_DECREASE_FACTOR_PER_SUCCESS = 0.85;
+// Below this threshold the gap rounds to 0 — sub-100ms pacing is noise.
+const GAP_COLLAPSE_THRESHOLD_MS = 100;
 // First-hit seed: the initial multiplicative-up needs a non-zero base. After
 // the first short-term 429 we clamp the gap to at least this so subsequent
 // growth has somewhere to start.
@@ -1083,18 +1092,21 @@ export class KeyManager {
       totalCacheRead: entry.stats.totalCacheRead + cacheRead,
       totalCacheCreation: entry.stats.totalCacheCreation + cacheCreation,
     };
-    // AIMD additive-decrease on the inter-request gap. Successes arriving
-    // while the key is still parked (in-flight from before the 429) don't
-    // shrink the gap — they aren't evidence the limit cleared.
+    // AIMD multiplicative-decrease on the inter-request gap. Successes
+    // arriving while the key is still parked (in-flight from before the
+    // 429) don't shrink the gap — they aren't evidence the limit cleared.
+    // A multiplicative shrink ensures one success can't wipe state learned
+    // across many failures: it knocks 15% off, regardless of magnitude.
     const onCooldown = entry.availableAt > Date.now();
     if (entry.interRequestGapMs > 0 && !onCooldown) {
       const prevGapMs = entry.interRequestGapMs;
-      entry.interRequestGapMs = Math.max(0, prevGapMs - GAP_DECREMENT_MS_PER_SUCCESS);
-      log("info", "Inter-request gap decremented by success", {
+      const shrunk = prevGapMs * GAP_DECREASE_FACTOR_PER_SUCCESS;
+      entry.interRequestGapMs = shrunk < GAP_COLLAPSE_THRESHOLD_MS ? 0 : shrunk;
+      log("info", "Inter-request gap decreased by success", {
         label: entry.label,
         prevGapMs,
         newGapMs: entry.interRequestGapMs,
-        decrementMs: GAP_DECREMENT_MS_PER_SUCCESS,
+        factor: GAP_DECREASE_FACTOR_PER_SUCCESS,
         tokensIn,
         tokensOut,
       });
