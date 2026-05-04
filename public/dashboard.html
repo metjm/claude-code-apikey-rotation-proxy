@@ -572,6 +572,7 @@
   .pipeline-meta { color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .pipeline-age { text-align: right; color: var(--text-dim); font-variant-numeric: tabular-nums; }
   .pipeline-empty { color: var(--text-dim); padding: 12px 0; text-align: center; }
+  .live-counts { font-variant-numeric: tabular-nums; }
   .collapsed { display: none; }
 
   /* Token created modal */
@@ -646,10 +647,6 @@
     <span class="header-stat"><b id="hdr-reqs">0</b> reqs</span>
     <span class="sep">|</span>
     <span class="header-stat"><b id="hdr-tokens-in">0</b> in / <b id="hdr-tokens-out">0</b> out</span>
-    <span class="sep">|</span>
-    <span class="header-stat" id="hdr-inflight-wrap" title="Live request pipeline. Pending = held server-side waiting on a per-key cooldown or the AIMD inter-request gap (we have NOT hit upstream yet). Fetching = upstream fetch in flight, no body chunks yet. Streaming = body chunks coming back.">
-      <b id="hdr-inflight-pending">0</b> pending · <b id="hdr-inflight-fetch">0</b> fetching · <b id="hdr-inflight-stream">0</b> streaming
-    </span>
   </div>
 
   <div class="log-panel" style="margin-bottom:16px">
@@ -1058,13 +1055,6 @@ function renderPipeline() {
     if (po !== 0) return po;
     return (a.enteredPhaseAt || 0) - (b.enteredPhaseAt || 0);
   });
-
-  const pendEl = document.getElementById('hdr-inflight-pending');
-  const fetchEl = document.getElementById('hdr-inflight-fetch');
-  const streamEl = document.getElementById('hdr-inflight-stream');
-  if (pendEl) pendEl.textContent = pending;
-  if (fetchEl) fetchEl.textContent = fetching;
-  if (streamEl) streamEl.textContent = streaming;
 
   const summaryEl = document.getElementById('pipeline-summary');
   if (summaryEl) {
@@ -2381,6 +2371,19 @@ function ensureKeysApp() {
       },
       hasElevatedGap() { return (this.k.interRequestGapMs || 0) > 0; },
       gapSec() { return ((this.k.interRequestGapMs || 0) / 1000).toFixed(1); },
+      liveCounts() {
+        // `this.now` ticks every second so this computed re-evaluates and
+        // pulls fresh counts from the pipeline tracker (a non-reactive Map).
+        void this.now;
+        let pending = 0, fetching = 0, streaming = 0;
+        for (const e of inflightByTrace.values()) {
+          if (e.label !== this.k.label) continue;
+          if (e.phase === 'pending') pending++;
+          else if (e.phase === 'fetching') fetching++;
+          else if (e.phase === 'streaming') streaming++;
+        }
+        return { pending, fetching, streaming, total: pending + fetching + streaming };
+      },
       gapTitle() {
         return 'Adaptive minimum gap between successive requests on this key: ' + this.gapSec + 's. '
           + 'Each fresh short-term 429 grows the gap (×2 with mild jitter, capped at 30s); '
@@ -2463,6 +2466,13 @@ function ensureKeysApp() {
               <span v-if="hasElevatedGap" class="badge badge-warning" :title="gapTitle">Gap {{ gapSec }}s</span>
             </div>
             <div class="metric-inline">{{ routingDetail }}</div>
+            <div class="metric-inline live-counts" v-if="liveCounts.total > 0" title="Live requests on this key. Pending = held server-side waiting on the inter-request gap. Fetching = upstream fetch in flight. Streaming = body chunks arriving.">
+              <span v-if="liveCounts.pending > 0" class="c-yellow">{{ liveCounts.pending }} pending</span>
+              <span v-if="liveCounts.pending > 0 && (liveCounts.fetching > 0 || liveCounts.streaming > 0)" class="c-dim"> · </span>
+              <span v-if="liveCounts.fetching > 0" class="c-blue">{{ liveCounts.fetching }} fetching</span>
+              <span v-if="liveCounts.fetching > 0 && liveCounts.streaming > 0" class="c-dim"> · </span>
+              <span v-if="liveCounts.streaming > 0" class="c-green">{{ liveCounts.streaming }} streaming</span>
+            </div>
           </div>
         </td>
         <td>
