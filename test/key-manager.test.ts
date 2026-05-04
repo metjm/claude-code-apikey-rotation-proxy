@@ -9,7 +9,12 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { KeyManager } from "../src/key-manager.ts";
+import {
+  KeyManager,
+  computeRateLimitWaitMs,
+  SHORT_TERM_BACKOFF_THRESHOLD_SECS,
+  SHORT_TERM_BACKOFF_CAP_MS,
+} from "../src/key-manager.ts";
 import type {
   ApiKeyEntry,
   ProxyTokenEntry,
@@ -729,6 +734,145 @@ describe("Key Stats Recording", () => {
     expect(entry.stats.errors).toBe(2);
     expect(entry.stats.totalTokensIn).toBe(40);
     expect(entry.stats.totalTokensOut).toBe(60);
+  });
+});
+
+// ── Decorrelated-jitter backoff (pure function) ──────────────────────────────
+
+describe("computeRateLimitWaitMs", () => {
+  test("first short-term hit (streak=0) returns server retry-after as base", () => {
+    expect(computeRateLimitWaitMs(60, 0, 0)).toBe(60_000);
+    expect(computeRateLimitWaitMs(45, 0, 0)).toBe(45_000);
+  });
+
+  test("zero or negative retry-after defaults to 60s on first hit", () => {
+    expect(computeRateLimitWaitMs(0, 0, 0)).toBe(60_000);
+    expect(computeRateLimitWaitMs(-5, 0, 0)).toBe(60_000);
+  });
+
+  test("long-term retry-after passes through unchanged regardless of streak", () => {
+    // 5h window: ~78 minutes
+    expect(computeRateLimitWaitMs(4662, 0, 0)).toBe(4662_000);
+    // Even mid-streak (long-term should not be affected)
+    expect(computeRateLimitWaitMs(4662, 60_000, 5)).toBe(4662_000);
+  });
+
+  test("threshold boundary: exactly threshold seconds is short-term", () => {
+    // SHORT_TERM_BACKOFF_THRESHOLD_SECS itself counts as short-term (≤)
+    expect(computeRateLimitWaitMs(SHORT_TERM_BACKOFF_THRESHOLD_SECS, 0, 0))
+      .toBe(SHORT_TERM_BACKOFF_THRESHOLD_SECS * 1000);
+    // One second above is long-term, no jitter applied
+    const aboveBase = (SHORT_TERM_BACKOFF_THRESHOLD_SECS + 1);
+    expect(computeRateLimitWaitMs(aboveBase, 60_000, 3, () => 0.99))
+      .toBe(aboveBase * 1000);
+  });
+
+  test("streak >= 1 produces jittered value in [base, prev*3]", () => {
+    // Bottom of jitter range
+    expect(computeRateLimitWaitMs(60, 60_000, 1, () => 0)).toBe(60_000);
+    // Top of jitter range — prev * 3 = 180s
+    const top = computeRateLimitWaitMs(60, 60_000, 1, () => 0.9999);
+    expect(top).toBeGreaterThan(60_000);
+    expect(top).toBeLessThanOrEqual(180_000);
+    // Mid
+    const mid = computeRateLimitWaitMs(60, 60_000, 1, () => 0.5);
+    expect(mid).toBeCloseTo(120_000, -3);
+  });
+
+  test("backoff is capped at SHORT_TERM_BACKOFF_CAP_MS", () => {
+    // Even with prev = 4 min and rng at top, cap at 5 min
+    const ms = computeRateLimitWaitMs(60, 4 * 60 * 1000, 5, () => 0.9999);
+    expect(ms).toBeLessThanOrEqual(SHORT_TERM_BACKOFF_CAP_MS);
+    // And with already-saturated prev, still capped
+    const ms2 = computeRateLimitWaitMs(60, 10 * 60 * 1000, 9, () => 0.9999);
+    expect(ms2).toBeLessThanOrEqual(SHORT_TERM_BACKOFF_CAP_MS);
+  });
+
+  test("jitter range never goes below server retry-after", () => {
+    // With rng=0 (lowest), result is exactly base
+    expect(computeRateLimitWaitMs(60, 60_000, 1, () => 0)).toBe(60_000);
+    expect(computeRateLimitWaitMs(60, 1, 5, () => 0)).toBe(60_000);
+    // Even when prev is degenerately small, base is the floor
+    expect(computeRateLimitWaitMs(60, 0, 3, () => 0.5)).toBe(60_000);
+  });
+});
+
+// ── Decorrelated-jitter backoff (KeyManager integration) ─────────────────────
+
+describe("recordRateLimit() decorrelated-jitter behavior", () => {
+  test("consecutive short-term 429s grow availableAt window beyond base", () => {
+    const km = create();
+    const entry = km.addKey(VALID_KEY_1, "streak");
+
+    // First hit: exactly 60s (no jitter on streak=0)
+    let before = Date.now();
+    km.recordRateLimit(entry, 60);
+    let wait = entry.availableAt - before;
+    expect(wait).toBeGreaterThanOrEqual(59_500);
+    expect(wait).toBeLessThanOrEqual(60_500);
+
+    // Repeated hits should occasionally exceed 60s (jitter applies after streak=1).
+    // Run many trials and check at least one fell above the base, and none below.
+    let sawAboveBase = false;
+    for (let i = 0; i < 30; i++) {
+      before = Date.now();
+      km.recordRateLimit(entry, 60);
+      wait = entry.availableAt - before;
+      // Floor: never below server retry-after
+      expect(wait).toBeGreaterThanOrEqual(59_500);
+      // Cap: never above 5 min
+      expect(wait).toBeLessThanOrEqual(SHORT_TERM_BACKOFF_CAP_MS + 500);
+      if (wait > 61_000) sawAboveBase = true;
+    }
+    expect(sawAboveBase).toBe(true);
+  });
+
+  test("recordSuccess() resets the short-term streak", () => {
+    const km = create();
+    const entry = km.addKey(VALID_KEY_1, "reset-streak");
+
+    // Build up a streak
+    for (let i = 0; i < 5; i++) km.recordRateLimit(entry, 60);
+
+    // Success resets streak
+    km.recordSuccess(entry, 10, 20);
+
+    // Next 429 should be exactly base 60s (back to streak=0)
+    const before = Date.now();
+    km.recordRateLimit(entry, 60);
+    const wait = entry.availableAt - before;
+    expect(wait).toBeGreaterThanOrEqual(59_500);
+    expect(wait).toBeLessThanOrEqual(60_500);
+  });
+
+  test("long-term retry-after is honored exactly and resets streak", () => {
+    const km = create();
+    const entry = km.addKey(VALID_KEY_1, "long-term");
+
+    // Build up short-term streak
+    km.recordRateLimit(entry, 60);
+    km.recordRateLimit(entry, 60);
+
+    // Long-term hit (5h window): should be exact, no jitter
+    const before = Date.now();
+    km.recordRateLimit(entry, 4662);
+    const wait = entry.availableAt - before;
+    expect(wait).toBeGreaterThanOrEqual(4661_500);
+    expect(wait).toBeLessThanOrEqual(4662_500);
+
+    // After long-term, streak is reset — next short-term is base again
+    const before2 = Date.now();
+    km.recordRateLimit(entry, 60);
+    const wait2 = entry.availableAt - before2;
+    expect(wait2).toBeGreaterThanOrEqual(59_500);
+    expect(wait2).toBeLessThanOrEqual(60_500);
+  });
+
+  test("rateLimitHits stat still increments on every 429", () => {
+    const km = create();
+    const entry = km.addKey(VALID_KEY_1, "hits");
+    for (let i = 0; i < 4; i++) km.recordRateLimit(entry, 60);
+    expect(entry.stats.rateLimitHits).toBe(4);
   });
 });
 

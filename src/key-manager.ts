@@ -315,6 +315,41 @@ const ROUTING_DECISION_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 // remap — staying on a dead key for 5h would starve the session.
 const SHORT_COOLDOWN_PASSTHROUGH_MS = 5 * 60 * 1000;
 
+// Decorrelated-jitter backoff for keys that keep tripping the same
+// short-term (per-minute) rate limit. Anthropic's `retry-after: 60` after a
+// huge request is just a hint — waiting exactly 60s and re-firing the same
+// payload immediately re-trips the rolling-minute window. AWS-style
+// decorrelated jitter (`next = random(base, prev * 3)`, capped) breaks the
+// loop without any extra signal from upstream. Long-term 429s (5h/7d
+// windows; retry-after well above this threshold) bypass the multiplier —
+// those are exact reset times, not smoothing hints.
+export const SHORT_TERM_BACKOFF_THRESHOLD_SECS = 300;
+export const SHORT_TERM_BACKOFF_CAP_MS = 5 * 60 * 1000;
+
+/**
+ * Decorrelated-jitter backoff for a 429.
+ *
+ * - Long-term retry-after (above threshold): pass through unchanged.
+ * - Short-term, streak === 0: server's retry-after as base.
+ * - Short-term, streak >= 1: `random(base, prev * 3)`, capped.
+ *
+ * `retryAfterSecs <= 0` is treated as 60s (matches Anthropic's typical
+ * short-term cooldown when no header is present).
+ */
+export function computeRateLimitWaitMs(
+  retryAfterSecs: number,
+  prevBackoffMs: number,
+  streak: number,
+  rng: () => number = Math.random,
+): number {
+  const baseMs = (retryAfterSecs > 0 ? retryAfterSecs : 60) * 1000;
+  if (retryAfterSecs > SHORT_TERM_BACKOFF_THRESHOLD_SECS) return baseMs;
+  if (streak === 0) return baseMs;
+  const upper = Math.max(baseMs, prevBackoffMs * 3);
+  const jittered = baseMs + rng() * (upper - baseMs);
+  return Math.min(SHORT_TERM_BACKOFF_CAP_MS, jittered);
+}
+
 // Seasonal factor table: how many weeks back, how few observations collapse a
 // slot to a "no signal" factor of 1, and how far we let a busy/quiet slot
 // stretch the projection. Clamp keeps a single anomalous week from dominating.
@@ -1032,22 +1067,60 @@ export class KeyManager {
       totalCacheRead: entry.stats.totalCacheRead + cacheRead,
       totalCacheCreation: entry.stats.totalCacheCreation + cacheCreation,
     };
+    if (entry.shortTermStreak > 0) {
+      log("info", "Short-term backoff streak broken by success", {
+        label: entry.label,
+        streakLength: entry.shortTermStreak,
+        lastBackoffMs: entry.lastBackoffMs,
+        tokensIn,
+        tokensOut,
+      });
+      entry.shortTermStreak = 0;
+      entry.lastBackoffMs = 0;
+    }
     this.tsIncrement(entry.label, "__all__", "successes");
     this.tsAddTokens(entry.label, "__all__", tokensIn, tokensOut, cacheRead, cacheCreation);
     this.scheduleSave();
   }
 
   recordRateLimit(entry: ApiKeyEntry, retryAfterSecs: number): void {
-    const waitMs = (retryAfterSecs > 0 ? retryAfterSecs : 60) * 1000;
+    const isShortTerm = retryAfterSecs <= SHORT_TERM_BACKOFF_THRESHOLD_SECS;
+    const prevStreak = entry.shortTermStreak;
+    const prevBackoffMs = entry.lastBackoffMs;
+    const baseMs = (retryAfterSecs > 0 ? retryAfterSecs : 60) * 1000;
+    const waitMs = computeRateLimitWaitMs(
+      retryAfterSecs,
+      prevBackoffMs,
+      prevStreak,
+    );
+    const jitterAppliedMs = waitMs - baseMs;
     entry.stats = {
       ...entry.stats,
       rateLimitHits: entry.stats.rateLimitHits + 1,
     };
     entry.availableAt = unixMs(Date.now() + waitMs);
+    if (isShortTerm) {
+      entry.shortTermStreak += 1;
+      entry.lastBackoffMs = waitMs;
+    } else {
+      // Long-term hit (5h/7d reset): clear the short-term streak so a later
+      // 60s cooldown isn't penalized by a stale streak from before this
+      // window flipped.
+      entry.shortTermStreak = 0;
+      entry.lastBackoffMs = 0;
+    }
     this.tsIncrement(entry.label, "__all__", "rateLimits");
     log("warn", "Key rate-limited", {
       label: entry.label,
       retryAfterSecs,
+      limitClass: isShortTerm ? "short_term" : "long_term",
+      baseMs,
+      waitMs,
+      jitterAppliedMs,
+      prevBackoffMs,
+      prevStreak,
+      newStreak: entry.shortTermStreak,
+      cappedAtMaxBackoff: isShortTerm && waitMs >= SHORT_TERM_BACKOFF_CAP_MS,
       availableAt: new Date(entry.availableAt).toISOString(),
     });
     this.scheduleSave();
@@ -1159,6 +1232,8 @@ export class KeyManager {
       availableAt: unixMs(0),
       priority: 2,
       allowedDays: ALL_DAYS,
+      shortTermStreak: 0,
+      lastBackoffMs: 0,
     };
 
     this.keys.push(entry);
@@ -1748,7 +1823,7 @@ export class KeyManager {
       out_tokens_sum: number;
       ttft_for_input_sum: number | null;
       in_tokens_sum: number;
-    }, [number, number]>(`
+    }, [number, number, number]>(`
       SELECT
         (ended_at / ?) * ? AS bucket_start,
         COUNT(*) AS n,
@@ -2447,6 +2522,8 @@ function rowToKeyEntry(
     availableAt: r.available_at as UnixMs,
     priority: r.priority,
     allowedDays: parseAllowedDays(r.allowed_days),
+    shortTermStreak: 0,
+    lastBackoffMs: 0,
   };
 }
 

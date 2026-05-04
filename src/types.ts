@@ -103,6 +103,16 @@ export interface ApiKeyEntry {
   priority: number;
   /** Days of the week this key may be used. 0=Sun … 6=Sat. Default: all days. */
   allowedDays: readonly number[];
+  /** Consecutive short-term 429s without a successful request in between.
+   *  Drives decorrelated-jitter backoff so a key that gets re-ratelimited
+   *  the instant its 60s cooldown expires waits longer next time. Reset to 0
+   *  on any successful response or on a long-term (>threshold) 429.
+   *  In-memory only — not persisted across restart. */
+  shortTermStreak: number;
+  /** Last computed wait time (ms) for this key. Seeds the next jitter range
+   *  per AWS decorrelated-jitter formula: next = random(base, prev * 3).
+   *  In-memory only. */
+  lastBackoffMs: number;
 }
 
 export interface MaskedKeyEntry {
@@ -162,7 +172,7 @@ export interface MaskedTokenEntry {
 
 export interface StoredState {
   readonly version: 1;
-  readonly keys: readonly (Omit<ApiKeyEntry, "capacity"> & { readonly capacity?: ApiKeyCapacityState })[];
+  readonly keys: readonly (Omit<ApiKeyEntry, "capacity" | "shortTermStreak" | "lastBackoffMs"> & { readonly capacity?: ApiKeyCapacityState })[];
   readonly tokens?: readonly ProxyTokenEntry[];
 }
 
