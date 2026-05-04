@@ -572,7 +572,8 @@
   .pipeline-meta { color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .pipeline-age { text-align: right; color: var(--text-dim); font-variant-numeric: tabular-nums; }
   .pipeline-empty { color: var(--text-dim); padding: 12px 0; text-align: center; }
-  .live-counts { font-variant-numeric: tabular-nums; }
+  .live-counts { font-variant-numeric: tabular-nums; font-size: 12px; line-height: 1.5; margin-top: 4px; }
+  .live-counts b { display: inline-block; min-width: 1.5ch; text-align: right; }
   .collapsed { display: none; }
 
   /* Token created modal */
@@ -2466,12 +2467,10 @@ function ensureKeysApp() {
               <span v-if="hasElevatedGap" class="badge badge-warning" :title="gapTitle">Gap {{ gapSec }}s</span>
             </div>
             <div class="metric-inline">{{ routingDetail }}</div>
-            <div class="metric-inline live-counts" v-if="liveCounts.total > 0" title="Live requests on this key. Pending = held server-side waiting on the inter-request gap. Fetching = upstream fetch in flight. Streaming = body chunks arriving.">
-              <span v-if="liveCounts.pending > 0" class="c-yellow">{{ liveCounts.pending }} pending</span>
-              <span v-if="liveCounts.pending > 0 && (liveCounts.fetching > 0 || liveCounts.streaming > 0)" class="c-dim"> · </span>
-              <span v-if="liveCounts.fetching > 0" class="c-blue">{{ liveCounts.fetching }} fetching</span>
-              <span v-if="liveCounts.fetching > 0 && liveCounts.streaming > 0" class="c-dim"> · </span>
-              <span v-if="liveCounts.streaming > 0" class="c-green">{{ liveCounts.streaming }} streaming</span>
+            <div class="live-counts" title="Live requests on this key. Pending = held server-side waiting on the inter-request gap. Fetching = upstream fetch in flight. Streaming = body chunks arriving.">
+              <div :class="liveCounts.pending > 0 ? 'c-yellow' : 'c-dim'"><b>{{ liveCounts.pending }}</b> pending</div>
+              <div :class="liveCounts.fetching > 0 ? 'c-blue' : 'c-dim'"><b>{{ liveCounts.fetching }}</b> fetching</div>
+              <div :class="liveCounts.streaming > 0 ? 'c-green' : 'c-dim'"><b>{{ liveCounts.streaming }}</b> streaming</div>
             </div>
           </div>
         </td>
