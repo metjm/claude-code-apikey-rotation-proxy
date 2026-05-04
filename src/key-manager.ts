@@ -1373,6 +1373,7 @@ export class KeyManager {
         allowedDays: k.allowedDays,
         recentErrors: recentErrs.get(k.label) ?? 0,
         recentSessions: recentSessionsByKey.get(k.key) ?? [],
+        backoffMs: k.backoffMs,
       })
     );
   }

@@ -123,6 +123,11 @@ export interface MaskedKeyEntry {
   readonly priority: number;
   readonly allowedDays: readonly number[];
   readonly recentErrors: number;
+  /** Current AIMD short-term backoff target (ms). 0 means baseline; positive
+   *  means past 429s elevated this key's wait beyond the server-suggested
+   *  retry-after. Each fresh post-cooldown success knocks it down; each fresh
+   *  short-term 429 multiplies it up (with decorrelated jitter). */
+  readonly backoffMs: number;
   readonly recentSessions: readonly {
     readonly sessionId: string;
     readonly actor: string;

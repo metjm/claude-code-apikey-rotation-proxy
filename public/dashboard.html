@@ -633,6 +633,10 @@
     <span class="header-stat"><b id="hdr-reqs">0</b> reqs</span>
     <span class="sep">|</span>
     <span class="header-stat"><b id="hdr-tokens-in">0</b> in / <b id="hdr-tokens-out">0</b> out</span>
+    <span class="sep">|</span>
+    <span class="header-stat" id="hdr-inflight-wrap" title="Live in-flight requests by phase. Fetching = waiting for upstream to start the response. Streaming = body chunks coming in. Updates from the request_started / request_first_chunk / request_done events.">
+      <b id="hdr-inflight-total">0</b> live · <b id="hdr-inflight-fetch">0</b> fetching · <b id="hdr-inflight-stream">0</b> streaming
+    </span>
   </div>
 
   <div class="log-panel" style="margin-bottom:16px">
@@ -935,6 +939,63 @@ function findOrCreateRequestEntry(sessionId, conversationHash, traceId, startedA
   if (arr.length > 200) arr.splice(0, arr.length - 200);
   return entry;
 }
+
+// ── Live in-flight tracker ─────────────────────────────────────
+// Map<traceId, { phase: 'fetching'|'streaming', startedAt: number }>.
+// Driven by request_started / request_first_chunk / request_done / error
+// events flowing in over SSE. Phases are presented in the header so the
+// operator can see at a glance how many requests are between us and upstream
+// vs. mid-stream. Stale entries (no update in 10 minutes) get pruned to
+// guard against missed terminal events from network blips.
+const INFLIGHT_STALE_MS = 10 * 60 * 1000;
+const inflightByTrace = new Map();
+
+function recordInflightStart(traceId, startedAt) {
+  if (!traceId) return;
+  // Re-fired with the same traceId on retries: keep the earlier startedAt
+  // and reset the phase back to fetching for the new attempt.
+  const existing = inflightByTrace.get(traceId);
+  inflightByTrace.set(traceId, {
+    phase: 'fetching',
+    startedAt: existing?.startedAt ?? (startedAt || Date.now()),
+  });
+  renderInflightHeader();
+}
+function recordInflightFirstChunk(traceId) {
+  if (!traceId) return;
+  const e = inflightByTrace.get(traceId);
+  if (e) e.phase = 'streaming';
+  renderInflightHeader();
+}
+function recordInflightDone(traceId) {
+  if (!traceId) return;
+  inflightByTrace.delete(traceId);
+  renderInflightHeader();
+}
+function pruneInflight() {
+  const cutoff = Date.now() - INFLIGHT_STALE_MS;
+  for (const [traceId, e] of inflightByTrace) {
+    if (e.startedAt < cutoff) inflightByTrace.delete(traceId);
+  }
+}
+function renderInflightHeader() {
+  pruneInflight();
+  let total = 0, fetching = 0, streaming = 0;
+  for (const e of inflightByTrace.values()) {
+    total++;
+    if (e.phase === 'fetching') fetching++;
+    else if (e.phase === 'streaming') streaming++;
+  }
+  const totEl = document.getElementById('hdr-inflight-total');
+  const fetchEl = document.getElementById('hdr-inflight-fetch');
+  const streamEl = document.getElementById('hdr-inflight-stream');
+  if (totEl) totEl.textContent = total;
+  if (fetchEl) fetchEl.textContent = fetching;
+  if (streamEl) streamEl.textContent = streaming;
+}
+// Tick once a second so stale-prune visibly drains the counter even when
+// no new events flow.
+setInterval(renderInflightHeader, 1000);
 
 function recomputeGlobalThroughputPeaks() {
   const now = Date.now();
@@ -2196,6 +2257,14 @@ function ensureKeysApp() {
           !this.k.isAvailable ? fmtCountdown(this.k.availableAt - this.now) : null,
         ].filter(Boolean).join(' · ') || '--';
       },
+      hasElevatedBackoff() { return (this.k.backoffMs || 0) > 0; },
+      backoffSec() { return Math.round((this.k.backoffMs || 0) / 1000); },
+      backoffTitle() {
+        return 'Adaptive (AIMD) short-term backoff target: ' + this.backoffSec + 's. '
+          + 'Each fresh short-term 429 multiplies this up (×2 with decorrelated jitter, capped at 5min); '
+          + 'each fresh post-cooldown success knocks it down by 10s. '
+          + 'Drives the actual wait when this key gets rate-limited again.';
+      },
       hasAnyWindow() { return sortedCapacityWindows(this.k).length > 0; },
       hasNormalizedHeaders() { return (this.k.capacity?.normalizedHeaderCount || 0) > 0; },
       awaitingNote() { return this.hasNormalizedHeaders ? telemetryAwaitingNote(this.k) : 'Awaiting limit headers'; },
@@ -2269,6 +2338,7 @@ function ensureKeysApp() {
               <span v-html="routingBadgeHtml"></span>
               <span v-if="k.isAvailable" class="badge" :class="quotaState.className" :title="quotaState.title">{{ quotaState.label }}</span>
               <span v-if="showOverageBadge" class="badge badge-blue" :title="overageNoteText">Extra usage off</span>
+              <span v-if="hasElevatedBackoff" class="badge badge-warning" :title="backoffTitle">Backoff +{{ backoffSec }}s</span>
             </div>
             <div class="metric-inline">{{ routingDetail }}</div>
           </div>
@@ -2573,6 +2643,7 @@ function connectSSE() {
           event.sessionId, event.conversationHash || null,
           event.traceId, event.startedAt,
         );
+        recordInflightStart(event.traceId, event.startedAt);
       }
       if (event.type === 'request_first_chunk' && event.sessionId) {
         const entry = findOrCreateRequestEntry(
@@ -2580,6 +2651,7 @@ function connectSSE() {
           event.traceId, event.startedAt,
         );
         if (entry) entry.firstChunkAt = event.firstChunkAt;
+        recordInflightFirstChunk(event.traceId);
       }
       if (event.type === 'request_done' && event.sessionId) {
         const entry = findOrCreateRequestEntry(
@@ -2596,6 +2668,12 @@ function connectSSE() {
           entry.endedAt = event.endedAt;
           entry.output = event.output || 0;
         }
+        recordInflightDone(event.traceId);
+      }
+      // A terminal error before request_done means the request died mid-flight.
+      // Drop the in-flight entry so the counter doesn't stick at 1 forever.
+      if (event.type === 'error' && event.traceId) {
+        recordInflightDone(event.traceId);
       }
       // Log non-heartbeat events
       if (event.type !== 'keys') {
