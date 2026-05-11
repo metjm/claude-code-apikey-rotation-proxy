@@ -731,6 +731,67 @@ describe("Dashboard sessions cell (Vue render)", () => {
     }
   }, 60_000);
 
+  test("session-move button reassigns a session's affinity to another available key", async () => {
+    const dataDir = makeTempDir();
+    const upstream = startMockUpstream();
+    const proxy = startProxy({ dataDir, upstream: upstream.url, adminToken: ADMIN_TOKEN });
+
+    try {
+      proxy.km.addKey(VALID_KEY_1, "key-a");
+      proxy.km.addKey(VALID_KEY_2, "key-b");
+
+      // Pin a session to key-a (bucket-of-3 routing fills the first available
+      // key first, so a single brand-new session lands on whichever sorts
+      // first).
+      const sessionId = "60000000-0000-0000-0000-000000000006";
+      const hash = "cafebabedeadbeef";
+      const initial = proxy.km.getKeyForConversation(
+        `till@trainly:${sessionId}:${hash}`, sessionId,
+      );
+      const originalKeyLabel = proxy.km.listKeys()
+        .find((k) => k.maskedKey === initial.entry?.key.slice(0, 10) + "..." + initial.entry?.key.slice(-4))
+        ?.label ?? "";
+      expect(originalKeyLabel.length).toBeGreaterThan(0);
+
+      const page = await openDashboard(browser, proxy.url, ADMIN_TOKEN);
+      await page.waitForSelector(".session-group .session-move", { timeout: 15_000 });
+
+      await page.evaluate((sid: string) => {
+        const group = [...document.querySelectorAll(".session-group")].find(
+          (el) => el.querySelector(".cell-id")?.getAttribute("title") === sid,
+        );
+        const btn = group?.querySelector(".session-move") as HTMLButtonElement | null;
+        if (!btn) throw new Error("move button not found");
+        btn.click();
+      }, sessionId);
+
+      // The next routing decision for this session should land on a key with a
+      // different label, and affinity should hit (the new key is sticky).
+      await page.waitForFunction(
+        (label: string) => {
+          return new Promise((resolve) => setTimeout(() => resolve(true), 200));
+        },
+        { timeout: 2_000 },
+        originalKeyLabel,
+      ).catch(() => {});
+
+      const after = proxy.km.getKeyForConversation(
+        `till@trainly:${sessionId}:${hash}`, sessionId,
+      );
+      const afterLabel = proxy.km.listKeys().find(
+        (k) => k.maskedKey === after.entry?.key.slice(0, 10) + "..." + after.entry?.key.slice(-4),
+      )?.label ?? "";
+      expect(after.affinityHit).toBe(true);
+      expect(afterLabel).not.toBe(originalKeyLabel);
+
+      await page.close();
+    } finally {
+      proxy.stop();
+      upstream.stop();
+      cleanupTempDir(dataDir);
+    }
+  }, 60_000);
+
   test("log scale keeps quiet bars visible alongside loud ones, but loud still reads taller", async () => {
     const dataDir = makeTempDir();
     const upstream = startMockUpstream();

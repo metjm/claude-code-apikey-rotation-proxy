@@ -930,6 +930,61 @@ export class KeyManager {
     };
   }
 
+  /** Detach every conversation affinity sharing this session-id from its
+   *  currently-assigned key and reattach them to another available key.
+   *  Auto-picks the least-loaded available key, excluding the one currently
+   *  serving the session. Returns null if no affinities match the session-id
+   *  or there is no other available key to move to. */
+  reassignSessionAffinity(sessionId: string): {
+    movedConversations: number;
+    fromKeyLabel: string;
+    toKeyLabel: string;
+    toMaskedKey: string;
+  } | { error: "session_not_found" | "no_other_key_available" } {
+    const matching: ConversationAffinityEntry[] = [];
+    for (const affinity of this.conversationAffinities.values()) {
+      if (affinity.sessionId === sessionId) matching.push(affinity);
+    }
+    if (matching.length === 0) return { error: "session_not_found" };
+
+    const currentKey = matching[0]!.key;
+    const currentEntry = this.keys.find((k) => k.key === currentKey) ?? null;
+    const fromLabel = currentEntry?.label ?? "(unknown)";
+
+    const currentTime = now();
+    const candidates = this.keys.filter(
+      (entry) => entry.key !== currentKey && this.isKeyAvailable(entry),
+    );
+    if (candidates.length === 0) return { error: "no_other_key_available" };
+
+    const sessionCounts = this.countRecentSessionsByKey(
+      unixMs(currentTime - RECENT_SESSION_WINDOW_MS),
+    );
+    const sorted = [...candidates].sort((a, b) =>
+      this.compareForSort(a, b, sessionCounts, currentTime),
+    );
+    const target = sorted[0]!;
+
+    for (const affinity of matching) {
+      affinity.key = target.key;
+      affinity.lastSeenAt = currentTime;
+      affinity.assignedAt = currentTime;
+    }
+    this.scheduleSave();
+    log("info", "Session affinity reassigned", {
+      sessionId,
+      fromKeyLabel: fromLabel,
+      toKeyLabel: target.label,
+      movedConversations: matching.length,
+    });
+    return {
+      movedConversations: matching.length,
+      fromKeyLabel: fromLabel,
+      toKeyLabel: target.label,
+      toMaskedKey: maskKey(target.key),
+    };
+  }
+
   getEarliestAvailableAt(): UnixMs {
     const currentDay = new Date().getDay();
     const midnight = midnightLocalMs();

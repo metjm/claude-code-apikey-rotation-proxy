@@ -30,6 +30,10 @@ const routes: ReadonlyMap<string, ReadonlyMap<string, RouteHandler>> = new Map([
     new Map<string, RouteHandler>([["POST", handleResetKeyCooldowns]]),
   ],
   [
+    "/admin/affinities/reassign",
+    new Map<string, RouteHandler>([["POST", handleReassignSessionAffinity]]),
+  ],
+  [
     "/admin/tokens",
     new Map<string, RouteHandler>([
       ["GET", handleListTokens],
@@ -302,6 +306,25 @@ function handleResetKeyCooldowns(
     availableKeys: keyManager.availableCount(),
     totalKeys: keyManager.totalCount(),
   });
+}
+
+async function handleReassignSessionAffinity(
+  req: Request,
+  keyManager: KeyManager,
+): Promise<Response> {
+  const body = await parseJsonBody<{ sessionId?: string }>(req);
+  if (body === null) return json({ error: "Invalid JSON body" }, 400);
+  if (typeof body.sessionId !== "string" || body.sessionId.length === 0) {
+    return json({ error: "Missing or empty 'sessionId' field" }, 400);
+  }
+  const result = keyManager.reassignSessionAffinity(body.sessionId);
+  if ("error" in result) {
+    if (result.error === "session_not_found") {
+      return json({ error: "Session not found" }, 404);
+    }
+    return json({ error: "No other available key to reassign to" }, 409);
+  }
+  return json({ reassigned: true, ...result });
 }
 
 // ── Token handlers ────────────────────────────────────────────────

@@ -620,6 +620,53 @@ describe("Key Selection", () => {
     expect(second.entry?.key).toBe(VALID_KEY_1);
     expect(second.affinityHit).toBe(true);
   });
+
+  test("reassignSessionAffinity() moves every conversation under a session to another available key", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "a");
+    km.addKey(VALID_KEY_2, "b");
+
+    km.getKeyForConversation("user-1:session-x:1111111111111111", "session-x");
+    km.getKeyForConversation("user-1:session-x:2222222222222222", "session-x");
+
+    const beforeKeys = new Set([
+      km.getKeyForConversation("user-1:session-x:1111111111111111", "session-x").entry?.key,
+      km.getKeyForConversation("user-1:session-x:2222222222222222", "session-x").entry?.key,
+    ]);
+    expect(beforeKeys.size).toBe(1);
+    const originalKey = [...beforeKeys][0]!;
+
+    const result = km.reassignSessionAffinity("session-x");
+    expect("error" in result).toBe(false);
+    if ("error" in result) return;
+    expect(result.movedConversations).toBe(2);
+    expect(result.toKeyLabel).not.toBe(result.fromKeyLabel);
+
+    const after1 = km.getKeyForConversation("user-1:session-x:1111111111111111", "session-x");
+    const after2 = km.getKeyForConversation("user-1:session-x:2222222222222222", "session-x");
+    expect(after1.entry?.key).not.toBe(originalKey);
+    expect(after2.entry?.key).not.toBe(originalKey);
+    expect(after1.entry?.key).toBe(after2.entry?.key);
+    expect(after1.affinityHit).toBe(true);
+  });
+
+  test("reassignSessionAffinity() returns session_not_found for unknown sessionId", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "a");
+    km.addKey(VALID_KEY_2, "b");
+
+    const result = km.reassignSessionAffinity("nope");
+    expect(result).toEqual({ error: "session_not_found" });
+  });
+
+  test("reassignSessionAffinity() returns no_other_key_available when only one key exists", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "only");
+    km.getKeyForConversation("user-1:session-x:1111111111111111", "session-x");
+
+    const result = km.reassignSessionAffinity("session-x");
+    expect(result).toEqual({ error: "no_other_key_available" });
+  });
 });
 
 // ── Key Stats Recording ─────────────────────────────────────────────────────

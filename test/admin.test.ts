@@ -150,6 +150,45 @@ describe("Route Dispatch", () => {
     expect(body).toHaveProperty("availableKeys");
   });
 
+  test("routes POST /admin/affinities/reassign moves a session to another available key", async () => {
+    km.addKey(VALID_KEY, "src");
+    km.addKey(VALID_KEY_2, "dst");
+    km.getKeyForConversation("user-1:session-x:1111111111111111", "session-x");
+
+    const req = makeReq("POST", "/admin/affinities/reassign", { sessionId: "session-x" });
+    const res = await handleAdminRoute(req, km, config, st);
+    expect(res).not.toBeNull();
+    expect(res!.status).toBe(200);
+    const body = await jsonBody(res!) as {
+      reassigned: boolean; movedConversations: number;
+      fromKeyLabel: string; toKeyLabel: string;
+    };
+    expect(body.reassigned).toBe(true);
+    expect(body.movedConversations).toBe(1);
+    expect(body.toKeyLabel).not.toBe(body.fromKeyLabel);
+  });
+
+  test("POST /admin/affinities/reassign returns 404 when sessionId is unknown", async () => {
+    km.addKey(VALID_KEY, "only");
+    const req = makeReq("POST", "/admin/affinities/reassign", { sessionId: "nope" });
+    const res = await handleAdminRoute(req, km, config, st);
+    expect(res!.status).toBe(404);
+  });
+
+  test("POST /admin/affinities/reassign returns 409 when no other key is available", async () => {
+    km.addKey(VALID_KEY, "only");
+    km.getKeyForConversation("user-1:session-x:1111111111111111", "session-x");
+    const req = makeReq("POST", "/admin/affinities/reassign", { sessionId: "session-x" });
+    const res = await handleAdminRoute(req, km, config, st);
+    expect(res!.status).toBe(409);
+  });
+
+  test("POST /admin/affinities/reassign returns 400 when sessionId is missing", async () => {
+    const req = makeReq("POST", "/admin/affinities/reassign", {});
+    const res = await handleAdminRoute(req, km, config, st);
+    expect(res!.status).toBe(400);
+  });
+
   test("routes GET /admin/tokens", async () => {
     const req = makeReq("GET", "/admin/tokens");
     const res = await handleAdminRoute(req, km, config, st);

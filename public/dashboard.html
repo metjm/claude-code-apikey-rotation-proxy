@@ -246,6 +246,25 @@
     background: rgba(88,166,255,0.13);
     color: var(--blue);
   }
+  .session-move {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    height: 14px;
+    width: 16px;
+    padding: 0;
+    margin: 0;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    background: transparent;
+    color: var(--text-dim);
+    font-family: var(--font);
+    font-size: 10px;
+    line-height: 1;
+    cursor: pointer;
+  }
+  .session-move:hover { color: var(--blue); border-color: var(--blue); }
+  .session-move:disabled { opacity: 0.4; cursor: not-allowed; }
   /* Per-conversation live throughput chart. 150px wide canvas with twin
      bars per second growing up from the bottom — input (blue) on the
      left of each slot, output (green) on the right. Log scale so a big
@@ -2272,11 +2291,25 @@ function ensureKeysApp() {
         return throughputConvKey(this.session.sessionId, c ? c.hash : null);
       },
     },
+    data() {
+      return { moving: false };
+    },
     methods: {
       convIdHead(c) { return idHead(c.hash || '(no hash)', 8, 8); },
       convIdTail(c) { return idTail(c.hash || '(no hash)', 8, 8); },
       ageTitle(iso) { return iso ? 'First seen ' + iso : ''; },
       convKey(c) { return throughputConvKey(this.session.sessionId, c.hash); },
+      async moveSession() {
+        if (this.moving) return;
+        this.moving = true;
+        try {
+          await api('POST', '/admin/affinities/reassign', { sessionId: this.session.sessionId });
+        } catch (err) {
+          alert('Failed to move session: ' + (err && err.message ? err.message : err));
+        } finally {
+          this.moving = false;
+        }
+      },
       fmtAge: fmtAge,
       fmtRelative: fmtRelative,
       fmtNum: fmtNum,
@@ -2286,6 +2319,8 @@ function ensureKeysApp() {
         <span class="cell-id" :title="session.sessionId">{{ idHead }}<span v-if="idTailText" class="id-tail">{{ idTailText }}</span></span>
         <span class="cell-right">
           <span v-if="hasMultipleConvs" class="session-count">×{{ convs.length }}</span>
+          <button class="session-move" :disabled="moving" @click="moveSession"
+            title="Detach this session and reattach to another available key">↻</button>
           <span>{{ fmtRelative(session.lastSeenAt) }}</span>
         </span>
         <span class="cell-meta-row">
