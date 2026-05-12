@@ -820,6 +820,95 @@ describe("Rate Limit Handling (429)", () => {
       // so we can correlate every 429 back to a routing decision row.
       expect(typeof rlEntry["conversationKey"]).toBe("string");
       expect(rlEntry["sessionId"]).toBe("diag-1");
+
+      // Raw request body verbatim (no parsing, no allocations beyond a
+      // bounded slice + decode — the previous preview impl that DID parse
+      // segfaulted Bun on huge tool inputs and was reverted).
+      expect(rlEntry["requestBody"]).toBe(reqBody);
+      expect(rlEntry["requestBodyPreviewTruncated"]).toBe(false);
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  test("rate-limit log includes request body verbatim even when not JSON", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    km.addKey(FAKE_KEY_B, "key-b");
+
+    const mock = upstream((req) => {
+      const key = req.headers.get("x-api-key");
+      if (key === FAKE_KEY_A) {
+        return new Response("rate limited", { status: 429, headers: { "retry-after": "600" } });
+      }
+      return new Response("ok");
+    });
+
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const reqBody = "this is not json, but we still want to see it in the log";
+      const config = makeConfig(mock.url);
+      await proxyRequest(
+        makeRequest("/v1/messages", {
+          method: "POST",
+          headers: { "content-type": "text/plain" },
+          body: reqBody,
+        }),
+        km,
+        config,
+        st,
+      );
+      const rlEntry = parseConsoleEntries(logSpy).find((e) => e.msg === "Rate limited, trying next key");
+      expect(rlEntry?.["requestBody"]).toBe(reqBody);
+      expect(rlEntry?.["requestBodyPreviewTruncated"]).toBe(false);
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  test("rate-limit log truncates request body at the cap and survives multi-MB bodies", async () => {
+    // The exact failure mode the reverted preview commit triggered: a
+    // multi-MB request body. The new implementation should slice once
+    // and decode O(N) at the cap, never touching the rest of the bytes.
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    km.addKey(FAKE_KEY_B, "key-b");
+
+    const mock = upstream((req) => {
+      const key = req.headers.get("x-api-key");
+      if (key === FAKE_KEY_A) {
+        return new Response("rate limited", { status: 429, headers: { "retry-after": "600" } });
+      }
+      return new Response("ok");
+    });
+
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      // 5MB body — past the JSON-parse summary cap (4MB), past the request
+      // body log cap (50KB), the size class that broke Bun before.
+      const huge = "A".repeat(5_000_000);
+      const reqBody = JSON.stringify({ model: "claude-sonnet-4-5", payload: huge });
+      const config = makeConfig(mock.url);
+      await proxyRequest(
+        makeRequest("/v1/messages", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: reqBody,
+        }),
+        km,
+        config,
+        st,
+      );
+      const rlEntry = parseConsoleEntries(logSpy).find((e) => e.msg === "Rate limited, trying next key");
+      expect(rlEntry).toBeDefined();
+      expect((rlEntry?.["requestBody"] as string).length).toBe(50_000);
+      expect(rlEntry?.["requestBodyPreviewTruncated"]).toBe(true);
+      // Summary falls through to body_too_large at the 4MB cap, which is
+      // the correct behavior — we still get the size signal without ever
+      // attempting to JSON.parse 5MB of input.
+      const summary = rlEntry?.["requestBodySummary"] as Record<string, unknown>;
+      expect(summary["parseOk"]).toBe(false);
+      expect(summary["reason"]).toBe("body_too_large");
     } finally {
       logSpy.mockRestore();
     }

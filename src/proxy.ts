@@ -32,6 +32,11 @@ const UPSTREAM_ERROR_BODY_LOG_BYTES = 4_000;
 // summaries. Cap protects against pathological cases; we only extract metadata
 // (model, message count, tool count, cache_control presence), never content.
 const REQUEST_BODY_SUMMARY_MAX_BYTES = 4_000_000;
+// First N bytes of the raw request body to log verbatim on 429 / 4xx-5xx
+// responses. No parsing — just decode the bytes and put them in the log so
+// we can see exactly what payload Anthropic is reacting to. 50KB fits a
+// typical Claude Code request's system prompt + first user message.
+const RATE_LIMIT_REQUEST_BODY_LOG_BYTES = 50_000;
 
 type ActiveRequestPhase =
   | "fetching_upstream"
@@ -567,6 +572,9 @@ export async function proxyRequest(
         responseHeaders: collectResponseHeaders(upstream.headers),
         capacityObservation,
         requestBodySummary: summarizeRequestBody(requestBody),
+        requestBody: previewRequestBody(requestBody),
+        requestBodyPreviewTruncated: requestBody !== null
+          && requestBody.byteLength > RATE_LIMIT_REQUEST_BODY_LOG_BYTES,
       });
       emitWithKeys({
         type: "rate_limit", ts: new Date().toISOString(), label: entry.label,
@@ -601,6 +609,9 @@ export async function proxyRequest(
         responseHeaders: collectResponseHeaders(upstream.headers),
         capacityObservation,
         requestBodySummary: summarizeRequestBody(requestBody),
+        requestBody: previewRequestBody(requestBody),
+        requestBodyPreviewTruncated: requestBody !== null
+          && requestBody.byteLength > RATE_LIMIT_REQUEST_BODY_LOG_BYTES,
       });
       emitWithKeys({
         type: "error", ts: new Date().toISOString(), label: entry.label,
@@ -869,6 +880,17 @@ function collectResponseHeaders(headers: Headers): Record<string, string> {
     out[name] = value;
   }
   return out;
+}
+
+// Decode the first N bytes of the raw request body for logging. No parsing,
+// no recursive walks — just a bounded slice + UTF-8 decode. `subarray` is a
+// view (no copy), and `TextDecoder.decode` allocates exactly N bytes' worth
+// of output. The previous "preview" implementation crashed Bun by calling
+// JSON.stringify on unbounded tool_use inputs; this implementation cannot.
+function previewRequestBody(body: BufferedRequestBody): string | null {
+  if (body === null) return null;
+  const slice = body.subarray(0, RATE_LIMIT_REQUEST_BODY_LOG_BYTES);
+  return new TextDecoder("utf-8", { fatal: false }).decode(slice);
 }
 
 export type RequestBodySummary = {
