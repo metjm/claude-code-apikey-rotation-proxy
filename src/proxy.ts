@@ -29,16 +29,9 @@ const MAX_ACTIVE_REQUEST_PEERS_LOGGED = 5;
 const RATE_LIMIT_BODY_LOG_BYTES = 4_000;
 const UPSTREAM_ERROR_BODY_LOG_BYTES = 4_000;
 // First N bytes of a request body we'll attempt to JSON-parse for diagnostic
-// summaries. Cap protects against pathological cases.
+// summaries. Cap protects against pathological cases; we only extract metadata
+// (model, message count, tool count, cache_control presence), never content.
 const REQUEST_BODY_SUMMARY_MAX_BYTES = 4_000_000;
-// Per-segment preview lengths used inside the request body summary. The
-// previews are only emitted on 429 / 4xx / 5xx paths (single-digit
-// frequency); the caps keep individual log lines manageable while still
-// giving enough text to recognize "is this the cron summarizer? the
-// codebase indexer? a long-running agent turn?".
-const SYSTEM_PREVIEW_MAX_CHARS = 2_000;
-const MESSAGE_PREVIEW_MAX_CHARS = 1_500;
-const MAX_MESSAGES_PREVIEWED = 5;
 
 type ActiveRequestPhase =
   | "fetching_upstream"
@@ -878,13 +871,6 @@ function collectResponseHeaders(headers: Headers): Record<string, string> {
   return out;
 }
 
-export type MessagePreview = {
-  readonly role: string;
-  readonly contentKind: string;
-  readonly preview: string;
-  readonly truncated: boolean;
-};
-
 export type RequestBodySummary = {
   readonly parseOk: boolean;
   readonly model: string | null;
@@ -892,12 +878,8 @@ export type RequestBodySummary = {
   readonly maxTokens: number | null;
   readonly systemSegments: number | null;
   readonly systemBytes: number | null;
-  readonly systemPreview: string | null;
-  readonly systemPreviewTruncated: boolean;
   readonly messages: number | null;
-  readonly messagesPreview: readonly MessagePreview[] | null;
   readonly tools: number | null;
-  readonly toolNames: readonly string[] | null;
   readonly thinkingType: string | null;
   readonly cacheControlSegments: number | null;
   readonly anthropicBeta: string | null;
@@ -911,12 +893,8 @@ const EMPTY_SUMMARY: RequestBodySummary = {
   maxTokens: null,
   systemSegments: null,
   systemBytes: null,
-  systemPreview: null,
-  systemPreviewTruncated: false,
   messages: null,
-  messagesPreview: null,
   tools: null,
-  toolNames: null,
   thinkingType: null,
   cacheControlSegments: null,
   anthropicBeta: null,
@@ -948,42 +926,25 @@ export function summarizeRequestBody(body: BufferedRequestBody): RequestBodySumm
 
   let systemSegments: number | null = null;
   let systemBytes: number | null = null;
-  let systemText = "";
   const systemField = obj["system"];
   if (typeof systemField === "string") {
     systemSegments = 1;
     systemBytes = systemField.length;
-    systemText = systemField;
   } else if (Array.isArray(systemField)) {
     systemSegments = systemField.length;
-    const parts: string[] = [];
-    let totalBytes = 0;
-    for (const seg of systemField) {
+    systemBytes = systemField.reduce<number>((sum, seg) => {
       if (seg !== null && typeof seg === "object") {
         const text = (seg as { text?: unknown }).text;
-        if (typeof text === "string") {
-          parts.push(text);
-          totalBytes += text.length;
-        }
+        if (typeof text === "string") return sum + text.length;
       }
-    }
-    systemBytes = totalBytes;
-    systemText = parts.join("\n");
+      return sum;
+    }, 0);
   }
-  const systemPreview = systemText.length > 0
-    ? systemText.slice(0, SYSTEM_PREVIEW_MAX_CHARS)
-    : null;
-  const systemPreviewTruncated = systemText.length > SYSTEM_PREVIEW_MAX_CHARS;
 
   const messagesField = obj["messages"];
   const messages = Array.isArray(messagesField) ? messagesField.length : null;
-  const messagesPreview = Array.isArray(messagesField)
-    ? buildMessagesPreview(messagesField)
-    : null;
-
   const toolsField = obj["tools"];
   const tools = Array.isArray(toolsField) ? toolsField.length : null;
-  const toolNames = Array.isArray(toolsField) ? extractToolNames(toolsField) : null;
 
   let thinkingType: string | null = null;
   const thinkingField = obj["thinking"];
@@ -1011,96 +972,13 @@ export function summarizeRequestBody(body: BufferedRequestBody): RequestBodySumm
     maxTokens: typeof maxTokensField === "number" ? maxTokensField : null,
     systemSegments,
     systemBytes,
-    systemPreview,
-    systemPreviewTruncated,
     messages,
-    messagesPreview,
     tools,
-    toolNames,
     thinkingType,
     cacheControlSegments,
     anthropicBeta,
     reason: null,
   };
-}
-
-// Build content previews for up to MAX_MESSAGES_PREVIEWED messages. We log
-// the FIRST few messages so the system+user-task prefix is visible
-// regardless of conversation length. (The last message is whatever Claude
-// Code just sent; the first messages tell us which agent/workflow this is.)
-function buildMessagesPreview(messages: readonly unknown[]): MessagePreview[] {
-  const out: MessagePreview[] = [];
-  for (let i = 0; i < messages.length && out.length < MAX_MESSAGES_PREVIEWED; i++) {
-    const msg = messages[i];
-    if (msg === null || typeof msg !== "object") continue;
-    const roleField = (msg as { role?: unknown }).role;
-    const role = typeof roleField === "string" ? roleField : "unknown";
-    const preview = previewMessageContent((msg as { content?: unknown }).content);
-    out.push({
-      role,
-      contentKind: preview.kind,
-      preview: preview.text.slice(0, MESSAGE_PREVIEW_MAX_CHARS),
-      truncated: preview.text.length > MESSAGE_PREVIEW_MAX_CHARS,
-    });
-  }
-  return out;
-}
-
-// Render a message's `content` field into a single string preview. Anthropic
-// supports both a bare string and an array of typed blocks (text / tool_use
-// / tool_result / image / etc). We pick the first text-shaped data we find
-// and prefix the kind so the log reader can tell text from a tool call.
-function previewMessageContent(content: unknown): { kind: string; text: string } {
-  if (typeof content === "string") return { kind: "text", text: content };
-  if (!Array.isArray(content)) return { kind: "absent", text: "" };
-  const parts: string[] = [];
-  let kind: string = "blocks";
-  for (const block of content) {
-    if (block === null || typeof block !== "object") continue;
-    const blockType = (block as { type?: unknown }).type;
-    if (blockType === "text") {
-      const t = (block as { text?: unknown }).text;
-      if (typeof t === "string") {
-        parts.push(t);
-        if (kind === "blocks") kind = "text_blocks";
-      }
-    } else if (blockType === "tool_use") {
-      const name = (block as { name?: unknown }).name;
-      const input = (block as { input?: unknown }).input;
-      parts.push(`[tool_use ${String(name ?? "")} ${JSON.stringify(input ?? null)}]`);
-      kind = kind === "blocks" || kind === "text_blocks" ? "mixed_with_tool_use" : kind;
-    } else if (blockType === "tool_result") {
-      const id = (block as { tool_use_id?: unknown }).tool_use_id;
-      const inner = (block as { content?: unknown }).content;
-      let innerText = "";
-      if (typeof inner === "string") {
-        innerText = inner;
-      } else if (Array.isArray(inner)) {
-        for (const b of inner) {
-          if (b !== null && typeof b === "object") {
-            const t = (b as { text?: unknown }).text;
-            if (typeof t === "string") innerText += t;
-          }
-        }
-      }
-      parts.push(`[tool_result ${String(id ?? "")}: ${innerText}]`);
-      kind = kind === "blocks" || kind === "text_blocks" ? "mixed_with_tool_result" : kind;
-    } else if (typeof blockType === "string") {
-      parts.push(`[${blockType}]`);
-    }
-    if (parts.join("\n").length >= MESSAGE_PREVIEW_MAX_CHARS) break;
-  }
-  return { kind, text: parts.join("\n") };
-}
-
-function extractToolNames(tools: readonly unknown[]): string[] {
-  const out: string[] = [];
-  for (const tool of tools) {
-    if (tool === null || typeof tool !== "object") continue;
-    const name = (tool as { name?: unknown }).name;
-    if (typeof name === "string") out.push(name);
-  }
-  return out;
 }
 
 export function countCacheControlSegments(node: unknown): number {
