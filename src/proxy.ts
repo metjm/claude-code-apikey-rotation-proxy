@@ -23,6 +23,15 @@ const SLOW_STREAM_SILENCE_LOG_MS = 5_000;
 const SLOW_FIRST_CHUNK_LOG_MS = 5_000;
 const STREAM_START_HISTORY_WINDOW_MS = 15 * 60 * 1_000;
 const MAX_ACTIVE_REQUEST_PEERS_LOGGED = 5;
+// Diagnostic logging caps for rate-limit / upstream-error responses. Larger
+// than the previous 500-byte non-429 cap because Anthropic's error bodies
+// sometimes carry useful detail beyond the first sentence.
+const RATE_LIMIT_BODY_LOG_BYTES = 4_000;
+const UPSTREAM_ERROR_BODY_LOG_BYTES = 4_000;
+// First N bytes of a request body we'll attempt to JSON-parse for diagnostic
+// summaries. Cap protects against pathological cases; we only extract metadata
+// (model, message count, tool count, cache_control presence), never content.
+const REQUEST_BODY_SUMMARY_MAX_BYTES = 4_000_000;
 
 type ActiveRequestPhase =
   | "fetching_upstream"
@@ -535,7 +544,7 @@ export async function proxyRequest(
       sawRateLimit = true;
       const retryAfter = parseRetryAfter(upstream.headers);
       keyManager.recordRateLimit(entry, retryAfter);
-      await upstream.text();
+      const responseBody = await upstream.text();
       clearActiveRequest(traceId);
 
       log("info", "Rate limited, trying next key", {
@@ -546,11 +555,18 @@ export async function proxyRequest(
         attempt: attempts,
         traceId,
         sessionId,
+        conversationKey,
+        firstMessageHash,
         durationMs: Date.now() - fetchStartedAt,
         retryAfter,
         availableKeys: keyManager.availableCount(),
         requestContentLength,
         requestBodyState,
+        responseBody: responseBody.slice(0, RATE_LIMIT_BODY_LOG_BYTES),
+        responseBodyTruncated: responseBody.length > RATE_LIMIT_BODY_LOG_BYTES,
+        responseHeaders: collectResponseHeaders(upstream.headers),
+        capacityObservation,
+        requestBodySummary: summarizeRequestBody(requestBody),
       });
       emitWithKeys({
         type: "rate_limit", ts: new Date().toISOString(), label: entry.label,
@@ -570,7 +586,21 @@ export async function proxyRequest(
         label: entry.label,
         user: proxyUser?.label,
         status: upstream.status,
-        body: body.slice(0, 500),
+        method: req.method,
+        path: url.pathname,
+        attempt: attempts,
+        traceId,
+        sessionId,
+        conversationKey,
+        firstMessageHash,
+        durationMs: Date.now() - fetchStartedAt,
+        requestContentLength,
+        requestBodyState,
+        body: body.slice(0, UPSTREAM_ERROR_BODY_LOG_BYTES),
+        bodyTruncated: body.length > UPSTREAM_ERROR_BODY_LOG_BYTES,
+        responseHeaders: collectResponseHeaders(upstream.headers),
+        capacityObservation,
+        requestBodySummary: summarizeRequestBody(requestBody),
       });
       emitWithKeys({
         type: "error", ts: new Date().toISOString(), label: entry.label,
@@ -825,6 +855,146 @@ async function bufferRequestBody(req: Request): Promise<BufferedRequestBody> {
   if (req.body === null) return null;
   const body = await req.arrayBuffer();
   return new Uint8Array(body);
+}
+
+// Flatten Response Headers into a plain object so it survives JSON-stringify
+// in the structured log. Header names from `fetch` are already lowercased.
+// We intentionally include every header — the goal is to see what Anthropic
+// actually returns on 429s (no `retry-after`? bare body?) and on other 4xx
+// responses. Cookie headers and CDN noise are kept since they help correlate
+// with Anthropic's edge (cf-ray, set-cookie cfuvid) when filing support.
+function collectResponseHeaders(headers: Headers): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [name, value] of headers.entries()) {
+    out[name] = value;
+  }
+  return out;
+}
+
+export type RequestBodySummary = {
+  readonly parseOk: boolean;
+  readonly model: string | null;
+  readonly stream: boolean | null;
+  readonly maxTokens: number | null;
+  readonly systemSegments: number | null;
+  readonly systemBytes: number | null;
+  readonly messages: number | null;
+  readonly tools: number | null;
+  readonly thinkingType: string | null;
+  readonly cacheControlSegments: number | null;
+  readonly anthropicBeta: string | null;
+  readonly reason: string | null;
+};
+
+const EMPTY_SUMMARY: RequestBodySummary = {
+  parseOk: false,
+  model: null,
+  stream: null,
+  maxTokens: null,
+  systemSegments: null,
+  systemBytes: null,
+  messages: null,
+  tools: null,
+  thinkingType: null,
+  cacheControlSegments: null,
+  anthropicBeta: null,
+  reason: null,
+};
+
+// Extract a diagnostic summary of the JSON request body. The proxy never logs
+// message content — only structural metadata that helps explain why upstream
+// rate-limited (e.g. a session sending 0 cache-control segments will not hit
+// the prompt cache and burns more of the rolling input-token budget).
+//
+// Exported for unit testing. All fields use `| null` instead of optional so
+// that the structured log entry has stable keys regardless of input.
+export function summarizeRequestBody(body: BufferedRequestBody): RequestBodySummary {
+  if (body === null) return { ...EMPTY_SUMMARY, reason: "no_body" };
+  if (body.byteLength > REQUEST_BODY_SUMMARY_MAX_BYTES) {
+    return { ...EMPTY_SUMMARY, reason: "body_too_large" };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(new TextDecoder().decode(body));
+  } catch {
+    return { ...EMPTY_SUMMARY, reason: "not_json" };
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { ...EMPTY_SUMMARY, reason: "not_object" };
+  }
+  const obj = parsed as Record<string, unknown>;
+
+  let systemSegments: number | null = null;
+  let systemBytes: number | null = null;
+  const systemField = obj["system"];
+  if (typeof systemField === "string") {
+    systemSegments = 1;
+    systemBytes = systemField.length;
+  } else if (Array.isArray(systemField)) {
+    systemSegments = systemField.length;
+    systemBytes = systemField.reduce<number>((sum, seg) => {
+      if (seg !== null && typeof seg === "object") {
+        const text = (seg as { text?: unknown }).text;
+        if (typeof text === "string") return sum + text.length;
+      }
+      return sum;
+    }, 0);
+  }
+
+  const messagesField = obj["messages"];
+  const messages = Array.isArray(messagesField) ? messagesField.length : null;
+  const toolsField = obj["tools"];
+  const tools = Array.isArray(toolsField) ? toolsField.length : null;
+
+  let thinkingType: string | null = null;
+  const thinkingField = obj["thinking"];
+  if (thinkingField !== null && typeof thinkingField === "object" && !Array.isArray(thinkingField)) {
+    const t = (thinkingField as { type?: unknown }).type;
+    if (typeof t === "string") thinkingType = t;
+  }
+
+  // Count cache_control breakpoints anywhere in the JSON. Anthropic's prompt
+  // cache only matches if cache_control segments are present, so a 0 here
+  // means the request is forced to be a cold-cache request.
+  const cacheControlSegments = countCacheControlSegments(parsed);
+
+  const anthropicBetaField = obj["anthropic-beta"];
+  const anthropicBeta = typeof anthropicBetaField === "string" ? anthropicBetaField : null;
+
+  const modelField = obj["model"];
+  const streamField = obj["stream"];
+  const maxTokensField = obj["max_tokens"];
+
+  return {
+    parseOk: true,
+    model: typeof modelField === "string" ? modelField : null,
+    stream: typeof streamField === "boolean" ? streamField : null,
+    maxTokens: typeof maxTokensField === "number" ? maxTokensField : null,
+    systemSegments,
+    systemBytes,
+    messages,
+    tools,
+    thinkingType,
+    cacheControlSegments,
+    anthropicBeta,
+    reason: null,
+  };
+}
+
+export function countCacheControlSegments(node: unknown): number {
+  if (node === null || typeof node !== "object") return 0;
+  if (Array.isArray(node)) {
+    let sum = 0;
+    for (const item of node) sum += countCacheControlSegments(item);
+    return sum;
+  }
+  const obj = node as Record<string, unknown>;
+  let sum = obj["cache_control"] !== undefined ? 1 : 0;
+  for (const key of Object.keys(obj)) {
+    if (key === "cache_control") continue;
+    sum += countCacheControlSegments(obj[key]);
+  }
+  return sum;
 }
 
 function normalizeChunk(chunk: Uint8Array | ArrayBufferView): Uint8Array {

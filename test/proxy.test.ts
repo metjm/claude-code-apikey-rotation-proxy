@@ -5,7 +5,12 @@ import { join } from "node:path";
 import type { Server } from "bun";
 
 import { KeyManager } from "../src/key-manager.ts";
-import { proxyRequest, resetProxyDebugStateForTests } from "../src/proxy.ts";
+import {
+  proxyRequest,
+  resetProxyDebugStateForTests,
+  summarizeRequestBody,
+  countCacheControlSegments,
+} from "../src/proxy.ts";
 import { subscribe, type ProxyEvent } from "../src/events.ts";
 import type { ProxyConfig, ProxyTokenEntry } from "../src/types.ts";
 import { SchemaTracker } from "../src/schema-tracker.ts";
@@ -705,6 +710,306 @@ describe("Rate Limit Handling (429)", () => {
     expect(rlEvents[0]!.user).toBe("alice");
     expect(rlEvents[0]!.retryAfter).toBe(45);
   });
+
+  // ── Diagnostic logging for 429s (added 2026-05) ──────────────────────
+  // We don't have control over how Anthropic 429s; they sometimes ship
+  // a bare body with no rate-limit headers, sometimes a full unified-*
+  // header set. The proxy used to read+discard the body, throwing away
+  // the only data that distinguishes the two cases. These tests pin the
+  // shape of the new diagnostic log entry so future refactors can't
+  // silently drop fields a debugger would need.
+
+  test("rate-limit log captures response body, all headers, and request body summary", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    km.addKey(FAKE_KEY_B, "key-b");
+
+    const errBody = JSON.stringify({
+      type: "error",
+      error: { type: "rate_limit_error", message: "you exceeded your 5h quota" },
+    });
+
+    // Use retry-after greater than SHORT_COOLDOWN_PASSTHROUGH_MS (5 min) so
+    // the proxy remaps to key-b instead of sleeping on key-a — keeps the
+    // test fast while still exercising the rate-limit code path.
+    const mock = upstream((req) => {
+      const key = req.headers.get("x-api-key");
+      if (key === FAKE_KEY_A) {
+        return new Response(errBody, {
+          status: 429,
+          headers: {
+            "retry-after": "600",
+            "anthropic-ratelimit-unified-status": "rejected",
+            "anthropic-ratelimit-unified-representative-claim": "five_hour",
+            "anthropic-organization-id": "org-xyz",
+            "x-should-retry": "true",
+            "request-id": "req_diag_001",
+          },
+        });
+      }
+      return new Response("ok");
+    });
+
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const reqBody = JSON.stringify({
+        model: "claude-sonnet-4-5",
+        max_tokens: 1024,
+        stream: true,
+        system: [
+          { type: "text", text: "You are Claude.", cache_control: { type: "ephemeral" } },
+        ],
+        messages: [
+          { role: "user", content: "hello" },
+          { role: "assistant", content: "hi" },
+        ],
+        tools: [{ name: "Read" }, { name: "Edit" }],
+      });
+      const config = makeConfig(mock.url);
+      await proxyRequest(
+        makeRequest("/v1/messages", {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-claude-code-session-id": "diag-1" },
+          body: reqBody,
+        }),
+        km,
+        config,
+        st,
+      );
+
+      const entries = parseConsoleEntries(logSpy);
+      const rlEntry = entries.find((e) => e.msg === "Rate limited, trying next key");
+      expect(rlEntry).toBeDefined();
+      if (rlEntry === undefined) return;
+
+      // Response body is logged (not discarded) so we can read Anthropic's
+      // actual error message and request-id for support correlation.
+      expect(rlEntry["responseBody"]).toContain("rate_limit_error");
+      expect(rlEntry["responseBodyTruncated"]).toBe(false);
+
+      // ALL response headers (lowercased by fetch) survive into the log.
+      const respHeaders = rlEntry["responseHeaders"] as Record<string, string>;
+      expect(respHeaders["retry-after"]).toBe("600");
+      expect(respHeaders["anthropic-ratelimit-unified-status"]).toBe("rejected");
+      expect(respHeaders["anthropic-ratelimit-unified-representative-claim"]).toBe("five_hour");
+      expect(respHeaders["anthropic-organization-id"]).toBe("org-xyz");
+      expect(respHeaders["x-should-retry"]).toBe("true");
+      expect(respHeaders["request-id"]).toBe("req_diag_001");
+
+      // Parsed capacity observation alongside the raw headers — lets the
+      // dashboard correlate without re-parsing.
+      const cap = rlEntry["capacityObservation"] as Record<string, unknown>;
+      expect(cap["representativeClaim"]).toBe("five_hour");
+      expect(cap["organizationId"]).toBe("org-xyz");
+      expect(cap["retryAfterSecs"]).toBe(600);
+      expect(cap["shouldRetry"]).toBe(true);
+
+      // Request body summary distinguishes cold-cache requests from
+      // primed ones (the user's hypothesis about cache-bound 429s).
+      const summary = rlEntry["requestBodySummary"] as Record<string, unknown>;
+      expect(summary["parseOk"]).toBe(true);
+      expect(summary["model"]).toBe("claude-sonnet-4-5");
+      expect(summary["stream"]).toBe(true);
+      expect(summary["maxTokens"]).toBe(1024);
+      expect(summary["messages"]).toBe(2);
+      expect(summary["tools"]).toBe(2);
+      expect(summary["systemSegments"]).toBe(1);
+      expect(summary["cacheControlSegments"]).toBe(1);
+
+      // Conversation-key + first-message-hash are now alongside sessionId
+      // so we can correlate every 429 back to a routing decision row.
+      expect(typeof rlEntry["conversationKey"]).toBe("string");
+      expect(rlEntry["sessionId"]).toBe("diag-1");
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  test("rate-limit log truncates oversized response bodies and flags it", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    km.addKey(FAKE_KEY_B, "key-b");
+
+    // 10K body, well over the 4K cap.
+    const bigBody = "x".repeat(10_000);
+    const mock = upstream((req) => {
+      const key = req.headers.get("x-api-key");
+      if (key === FAKE_KEY_A) {
+        return new Response(bigBody, { status: 429, headers: { "retry-after": "60" } });
+      }
+      return new Response("ok");
+    });
+
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const config = makeConfig(mock.url);
+      await proxyRequest(makeRequest("/v1/messages"), km, config, st);
+
+      const entries = parseConsoleEntries(logSpy);
+      const rlEntry = entries.find((e) => e.msg === "Rate limited, trying next key");
+      expect(rlEntry).toBeDefined();
+      expect((rlEntry?.["responseBody"] as string).length).toBe(4_000);
+      expect(rlEntry?.["responseBodyTruncated"]).toBe(true);
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  test("rate-limit log records empty headers and bare 429 bodies", async () => {
+    // This is the case the user actually sees in prod: Anthropic returns
+    // a 429 with NO rate-limit headers and a minimal body. The proxy
+    // should still log everything available — and the "missing" fields
+    // should be visibly missing, not silently swallowed.
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    km.addKey(FAKE_KEY_B, "key-b");
+
+    const bareBody = JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: "Error" } });
+    const mock = upstream((req) => {
+      const key = req.headers.get("x-api-key");
+      if (key === FAKE_KEY_A) {
+        // Intentionally NO retry-after, NO anthropic-ratelimit-* headers.
+        return new Response(bareBody, { status: 429, headers: { "content-type": "application/json" } });
+      }
+      return new Response("ok");
+    });
+
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const config = makeConfig(mock.url);
+      await proxyRequest(makeRequest("/v1/messages"), km, config, st);
+
+      const entries = parseConsoleEntries(logSpy);
+      const rlEntry = entries.find((e) => e.msg === "Rate limited, trying next key");
+      expect(rlEntry).toBeDefined();
+      if (rlEntry === undefined) return;
+
+      // Proxy defaulted to 60 because no retry-after was sent.
+      expect(rlEntry["retryAfter"]).toBe(60);
+
+      // Body is still captured even when bare.
+      expect(rlEntry["responseBody"]).toContain("rate_limit_error");
+
+      // Capacity observation shows the absence of unified-* signals.
+      const cap = rlEntry["capacityObservation"] as Record<string, unknown>;
+      expect(cap["representativeClaim"]).toBeUndefined();
+      expect(cap["overageStatus"]).toBeUndefined();
+      expect(cap["organizationId"]).toBeUndefined();
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  function parseConsoleEntries(...spies: Array<ReturnType<typeof spyOn>>): Array<Record<string, unknown>> {
+    return spies.flatMap((spy) =>
+      spy.mock.calls.map(([line]) => JSON.parse(line as string) as Record<string, unknown>)
+    );
+  }
+});
+
+describe("Request body summary (pure helper)", () => {
+  function buf(s: string): Uint8Array { return new TextEncoder().encode(s); }
+
+  test("returns no_body reason when body is null", () => {
+    expect(summarizeRequestBody(null).reason).toBe("no_body");
+    expect(summarizeRequestBody(null).parseOk).toBe(false);
+  });
+
+  test("returns not_json reason for non-JSON bodies", () => {
+    expect(summarizeRequestBody(buf("not json {{{")).reason).toBe("not_json");
+  });
+
+  test("returns not_object reason for JSON arrays / primitives", () => {
+    expect(summarizeRequestBody(buf("[1,2,3]")).reason).toBe("not_object");
+    expect(summarizeRequestBody(buf("42")).reason).toBe("not_object");
+    expect(summarizeRequestBody(buf("null")).reason).toBe("not_object");
+  });
+
+  test("extracts top-level Anthropic request fields", () => {
+    const body = JSON.stringify({
+      model: "claude-opus-4-7",
+      stream: false,
+      max_tokens: 2048,
+      messages: [{ role: "user", content: "a" }],
+      tools: [{ name: "Read" }, { name: "Write" }, { name: "Edit" }],
+      thinking: { type: "enabled", budget_tokens: 1024 },
+    });
+    const s = summarizeRequestBody(buf(body));
+    expect(s.parseOk).toBe(true);
+    expect(s.model).toBe("claude-opus-4-7");
+    expect(s.stream).toBe(false);
+    expect(s.maxTokens).toBe(2048);
+    expect(s.messages).toBe(1);
+    expect(s.tools).toBe(3);
+    expect(s.thinkingType).toBe("enabled");
+  });
+
+  test("handles system as string and as segment array", () => {
+    const stringSys = summarizeRequestBody(buf(JSON.stringify({ system: "be helpful" })));
+    expect(stringSys.systemSegments).toBe(1);
+    expect(stringSys.systemBytes).toBe("be helpful".length);
+
+    const arraySys = summarizeRequestBody(buf(JSON.stringify({
+      system: [
+        { type: "text", text: "AAA" },
+        { type: "text", text: "BBBBB" },
+        { type: "text" }, // no text field; counted as a segment, 0 bytes
+      ],
+    })));
+    expect(arraySys.systemSegments).toBe(3);
+    expect(arraySys.systemBytes).toBe(3 + 5);
+  });
+
+  test("cacheControlSegments counts every cache_control breakpoint recursively", () => {
+    const body = JSON.stringify({
+      system: [{ type: "text", text: "s", cache_control: { type: "ephemeral" } }],
+      messages: [
+        { role: "user", content: [
+          { type: "text", text: "hi", cache_control: { type: "ephemeral" } },
+          { type: "text", text: "more", cache_control: { type: "ephemeral" } },
+        ]},
+      ],
+      tools: [{ name: "T", cache_control: { type: "ephemeral" } }],
+    });
+    expect(summarizeRequestBody(buf(body)).cacheControlSegments).toBe(4);
+  });
+
+  test("cacheControlSegments is 0 when no breakpoints are present", () => {
+    const body = JSON.stringify({
+      messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+    });
+    expect(summarizeRequestBody(buf(body)).cacheControlSegments).toBe(0);
+  });
+
+  test("rejects bodies above the size cap with body_too_large", () => {
+    // 5MB string body — over the 4MB summarization cap.
+    const huge = JSON.stringify({ data: "x".repeat(5_000_000) });
+    expect(summarizeRequestBody(buf(huge)).reason).toBe("body_too_large");
+  });
+
+  test("missing top-level fields are reported as null, not undefined", () => {
+    const s = summarizeRequestBody(buf("{}"));
+    expect(s.parseOk).toBe(true);
+    expect(s.model).toBeNull();
+    expect(s.stream).toBeNull();
+    expect(s.maxTokens).toBeNull();
+    expect(s.messages).toBeNull();
+    expect(s.tools).toBeNull();
+    expect(s.systemSegments).toBeNull();
+    expect(s.cacheControlSegments).toBe(0);
+  });
+
+  test("countCacheControlSegments counts undefined-keyed cache_control too", () => {
+    // The Anthropic SDK sometimes serializes cache_control: null which
+    // JSON.parse keeps as a null entry. We count any present key.
+    expect(countCacheControlSegments({ cache_control: null })).toBe(1);
+    expect(countCacheControlSegments({ cache_control: { type: "ephemeral" } })).toBe(1);
+    expect(countCacheControlSegments({ nested: { cache_control: {} } })).toBe(1);
+    expect(countCacheControlSegments([{ cache_control: {} }, { cache_control: {} }])).toBe(2);
+    expect(countCacheControlSegments({})).toBe(0);
+    expect(countCacheControlSegments(null)).toBe(0);
+    expect(countCacheControlSegments("string")).toBe(0);
+  });
 });
 
 // ────────────────────────────────────────────────────────────────────
@@ -763,6 +1068,66 @@ describe("Error Handling", () => {
     expect(result.kind).toBe("error");
     if (result.kind === "error") {
       expect(result.status).toBe(500);
+    }
+  });
+
+  test("upstream error log captures response headers, capacity observation, and body summary", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    const mock = upstream(() =>
+      new Response(JSON.stringify({ error: { type: "invalid_request_error", message: "bad" } }), {
+        status: 400,
+        headers: {
+          "content-type": "application/json",
+          "request-id": "req_err_42",
+          "anthropic-organization-id": "org-err",
+        },
+      }),
+    );
+
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const reqBody = JSON.stringify({
+        model: "claude-sonnet-4-5",
+        messages: [{ role: "user", content: "hello" }],
+      });
+      const config = makeConfig(mock.url);
+      await proxyRequest(
+        makeRequest("/v1/messages", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: reqBody,
+        }),
+        km,
+        config,
+        st,
+      );
+
+      const entries = warnSpy.mock.calls
+        .map(([line]) => JSON.parse(line as string) as Record<string, unknown>);
+      const errEntry = entries.find((e) => e.msg === "Upstream error");
+      expect(errEntry).toBeDefined();
+      if (errEntry === undefined) return;
+
+      expect(errEntry["status"]).toBe(400);
+      expect(errEntry["body"]).toContain("invalid_request_error");
+      expect(errEntry["bodyTruncated"]).toBe(false);
+
+      const respHeaders = errEntry["responseHeaders"] as Record<string, string>;
+      expect(respHeaders["request-id"]).toBe("req_err_42");
+      expect(respHeaders["anthropic-organization-id"]).toBe("org-err");
+
+      const cap = errEntry["capacityObservation"] as Record<string, unknown>;
+      expect(cap["organizationId"]).toBe("org-err");
+      expect(cap["requestId"]).toBe("req_err_42");
+
+      const summary = errEntry["requestBodySummary"] as Record<string, unknown>;
+      expect(summary["parseOk"]).toBe(true);
+      expect(summary["model"]).toBe("claude-sonnet-4-5");
+      expect(summary["messages"]).toBe(1);
+    } finally {
+      warnSpy.mockRestore();
     }
   });
 
