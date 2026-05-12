@@ -813,8 +813,17 @@ describe("Rate Limit Handling (429)", () => {
       expect(summary["maxTokens"]).toBe(1024);
       expect(summary["messages"]).toBe(2);
       expect(summary["tools"]).toBe(2);
+      expect(summary["toolNames"]).toEqual(["Read", "Edit"]);
       expect(summary["systemSegments"]).toBe(1);
       expect(summary["cacheControlSegments"]).toBe(1);
+      expect(summary["systemPreview"]).toBe("You are Claude.");
+
+      // Message previews surface the first parts of each turn so we can
+      // recognize which agent/workflow is generating doomed requests.
+      const previews = summary["messagesPreview"] as Array<Record<string, unknown>>;
+      expect(previews).toHaveLength(2);
+      expect(previews[0]).toEqual({ role: "user", contentKind: "text", preview: "hello", truncated: false });
+      expect(previews[1]).toEqual({ role: "assistant", contentKind: "text", preview: "hi", truncated: false });
 
       // Conversation-key + first-message-hash are now alongside sessionId
       // so we can correlate every 429 back to a routing decision row.
@@ -995,8 +1004,92 @@ describe("Request body summary (pure helper)", () => {
     expect(s.maxTokens).toBeNull();
     expect(s.messages).toBeNull();
     expect(s.tools).toBeNull();
+    expect(s.toolNames).toBeNull();
     expect(s.systemSegments).toBeNull();
+    expect(s.systemPreview).toBeNull();
+    expect(s.messagesPreview).toBeNull();
     expect(s.cacheControlSegments).toBe(0);
+  });
+
+  test("systemPreview captures string system field verbatim within cap", () => {
+    const s = summarizeRequestBody(buf(JSON.stringify({ system: "You are a helpful assistant." })));
+    expect(s.systemPreview).toBe("You are a helpful assistant.");
+    expect(s.systemPreviewTruncated).toBe(false);
+  });
+
+  test("systemPreview joins multi-segment system arrays with newlines", () => {
+    const s = summarizeRequestBody(buf(JSON.stringify({
+      system: [
+        { type: "text", text: "Part A" },
+        { type: "text", text: "Part B" },
+      ],
+    })));
+    expect(s.systemPreview).toBe("Part A\nPart B");
+  });
+
+  test("systemPreview truncates at the cap and flags it", () => {
+    const long = "x".repeat(5_000);
+    const s = summarizeRequestBody(buf(JSON.stringify({ system: long })));
+    expect(s.systemPreview?.length).toBe(2_000);
+    expect(s.systemPreviewTruncated).toBe(true);
+  });
+
+  test("messagesPreview captures string-content messages", () => {
+    const s = summarizeRequestBody(buf(JSON.stringify({
+      messages: [
+        { role: "user", content: "first user turn" },
+        { role: "assistant", content: "first assistant turn" },
+      ],
+    })));
+    expect(s.messagesPreview).toEqual([
+      { role: "user", contentKind: "text", preview: "first user turn", truncated: false },
+      { role: "assistant", contentKind: "text", preview: "first assistant turn", truncated: false },
+    ]);
+  });
+
+  test("messagesPreview renders block arrays including tool_use / tool_result", () => {
+    const s = summarizeRequestBody(buf(JSON.stringify({
+      messages: [
+        { role: "user", content: [{ type: "text", text: "summarize the file" }] },
+        { role: "assistant", content: [
+          { type: "text", text: "I will read it." },
+          { type: "tool_use", name: "Read", input: { path: "/x" } },
+        ]},
+        { role: "user", content: [
+          { type: "tool_result", tool_use_id: "tu_1", content: "file contents" },
+        ]},
+      ],
+    })));
+    const previews = s.messagesPreview!;
+    expect(previews[0]).toEqual({ role: "user", contentKind: "text_blocks", preview: "summarize the file", truncated: false });
+    expect(previews[1]!.preview).toContain("I will read it.");
+    expect(previews[1]!.preview).toContain('[tool_use Read {"path":"/x"}]');
+    expect(previews[2]!.preview).toContain("[tool_result tu_1: file contents]");
+  });
+
+  test("messagesPreview caps at MAX_MESSAGES_PREVIEWED entries", () => {
+    const many = Array.from({ length: 12 }, (_, i) => ({ role: "user", content: `msg ${i}` }));
+    const s = summarizeRequestBody(buf(JSON.stringify({ messages: many })));
+    expect(s.messagesPreview!.length).toBe(5);
+    expect(s.messagesPreview![0]!.preview).toBe("msg 0");
+    expect(s.messagesPreview![4]!.preview).toBe("msg 4");
+  });
+
+  test("messagesPreview truncates individual message content at its cap", () => {
+    const long = "y".repeat(5_000);
+    const s = summarizeRequestBody(buf(JSON.stringify({
+      messages: [{ role: "user", content: long }],
+    })));
+    const preview = s.messagesPreview![0]!;
+    expect(preview.preview.length).toBe(1_500);
+    expect(preview.truncated).toBe(true);
+  });
+
+  test("toolNames extracts each tool's name in order", () => {
+    const s = summarizeRequestBody(buf(JSON.stringify({
+      tools: [{ name: "Read" }, { name: "Edit" }, { name: "Bash" }],
+    })));
+    expect(s.toolNames).toEqual(["Read", "Edit", "Bash"]);
   });
 
   test("countCacheControlSegments counts undefined-keyed cache_control too", () => {
