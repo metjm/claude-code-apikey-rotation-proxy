@@ -914,6 +914,231 @@ describe("Rate Limit Handling (429)", () => {
     }
   });
 
+  // ── Sonnet long-context short-circuit ────────────────────────────────
+  // When Anthropic returns 429 "Extra usage is required for long context
+  // requests" on a Sonnet model with a large request body, the proxy
+  // short-circuits the retry loop with a 500 carrying a model-readable
+  // instruction to switch to Opus. These tests pin both the firing
+  // conditions and the false-positive guardrails.
+
+  test("short-circuits sonnet long-context 429 with explicit 500 message", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    km.addKey(FAKE_KEY_B, "key-b");
+
+    // Two keys — if the short-circuit didn't fire, the proxy would retry
+    // key-b. The mock counts how many upstream attempts actually fire.
+    let calls = 0;
+    const longContextBody = JSON.stringify({
+      type: "error",
+      error: { type: "rate_limit_error", message: "Extra usage is required for long context requests." },
+    });
+    const mock = upstream(() => {
+      calls++;
+      return new Response(longContextBody, { status: 429, headers: { "retry-after": "60" } });
+    });
+
+    // 25KB body, well past the 20KB threshold, with model claude-sonnet-*
+    const reqBody = JSON.stringify({
+      model: "claude-sonnet-4-6",
+      messages: [{ role: "user", content: "x".repeat(25_000) }],
+    });
+
+    const config = makeConfig(mock.url);
+    const result = await proxyRequest(
+      makeRequest("/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: reqBody,
+      }),
+      km,
+      config,
+      st,
+    );
+
+    // Returned to client as 500 — not retried, not all_exhausted, not 429.
+    expect(result.kind).toBe("error");
+    if (result.kind !== "error") return;
+    expect(result.status).toBe(500);
+    expect(calls).toBe(1); // critical: only ONE upstream call, no retry
+
+    const parsed = JSON.parse(result.body) as { type: string; error: { type: string; message: string } };
+    expect(parsed.type).toBe("error");
+    expect(parsed.error.type).toBe("proxy_short_circuit_long_context_sonnet");
+    // Message is for an LLM reader — must say what happened, what NOT to do, and what TO do.
+    expect(parsed.error.message).toContain("PROXY ABORTED RETRY LOOP");
+    expect(parsed.error.message).toContain("Extra usage is required for long context");
+    expect(parsed.error.message).toContain("claude-sonnet-4-6");
+    expect(parsed.error.message).toContain("DO NOT retry");
+    expect(parsed.error.message).toContain("opus");
+  });
+
+  test("does NOT short-circuit when model is opus (different rejection class)", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    km.addKey(FAKE_KEY_B, "key-b");
+
+    let calls = 0;
+    const longContextBody = JSON.stringify({
+      type: "error",
+      error: { type: "rate_limit_error", message: "Extra usage is required for long context requests." },
+    });
+    const mock = upstream((req) => {
+      calls++;
+      const key = req.headers.get("x-api-key");
+      if (key === FAKE_KEY_A) {
+        return new Response(longContextBody, { status: 429, headers: { "retry-after": "60" } });
+      }
+      return new Response("ok");
+    });
+
+    const reqBody = JSON.stringify({
+      model: "claude-opus-4-7",
+      messages: [{ role: "user", content: "x".repeat(25_000) }],
+    });
+    const config = makeConfig(mock.url);
+    const result = await proxyRequest(
+      makeRequest("/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: reqBody,
+      }),
+      km,
+      config,
+      st,
+    );
+    // Normal retry — falls through to key-b which returns 200.
+    expect(result.kind).toBe("success");
+    expect(calls).toBe(2);
+  });
+
+  test("does NOT short-circuit small sonnet requests below the byte threshold", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    km.addKey(FAKE_KEY_B, "key-b");
+
+    let calls = 0;
+    const longContextBody = JSON.stringify({
+      type: "error",
+      error: { type: "rate_limit_error", message: "Extra usage is required for long context requests." },
+    });
+    const mock = upstream((req) => {
+      calls++;
+      const key = req.headers.get("x-api-key");
+      if (key === FAKE_KEY_A) {
+        return new Response(longContextBody, { status: 429, headers: { "retry-after": "60" } });
+      }
+      return new Response("ok");
+    });
+
+    // 500-byte body — well under the 20KB threshold.
+    const reqBody = JSON.stringify({
+      model: "claude-sonnet-4-6",
+      messages: [{ role: "user", content: "hi" }],
+    });
+    const config = makeConfig(mock.url);
+    const result = await proxyRequest(
+      makeRequest("/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: reqBody,
+      }),
+      km,
+      config,
+      st,
+    );
+    expect(result.kind).toBe("success");
+    expect(calls).toBe(2);
+  });
+
+  test("does NOT short-circuit when the 429 body lacks 'long context' wording", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    km.addKey(FAKE_KEY_B, "key-b");
+
+    let calls = 0;
+    const burstBody = JSON.stringify({
+      type: "error",
+      error: { type: "rate_limit_error", message: "This request would exceed your account's rate limit." },
+    });
+    const mock = upstream((req) => {
+      calls++;
+      const key = req.headers.get("x-api-key");
+      if (key === FAKE_KEY_A) {
+        return new Response(burstBody, { status: 429, headers: { "retry-after": "60" } });
+      }
+      return new Response("ok");
+    });
+
+    const reqBody = JSON.stringify({
+      model: "claude-sonnet-4-6",
+      messages: [{ role: "user", content: "x".repeat(25_000) }],
+    });
+    const config = makeConfig(mock.url);
+    const result = await proxyRequest(
+      makeRequest("/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: reqBody,
+      }),
+      km,
+      config,
+      st,
+    );
+    expect(result.kind).toBe("success");
+    expect(calls).toBe(2);
+  });
+
+  test("short-circuit emits warn log + error event (no rate_limit event)", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    km.addKey(FAKE_KEY_B, "key-b");
+
+    const longContextBody = JSON.stringify({
+      type: "error",
+      error: { type: "rate_limit_error", message: "Extra usage is required for long context requests." },
+    });
+    const mock = upstream(() =>
+      new Response(longContextBody, { status: 429, headers: { "retry-after": "60" } }),
+    );
+
+    const reqBody = JSON.stringify({
+      model: "claude-sonnet-4-6",
+      messages: [{ role: "user", content: "x".repeat(25_000) }],
+    });
+    const config = makeConfig(mock.url);
+
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const [, events] = await collectEvents(() =>
+        proxyRequest(
+          makeRequest("/v1/messages", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: reqBody,
+          }),
+          km,
+          config,
+          st,
+        ),
+      );
+      const warnEntries = warnSpy.mock.calls
+        .map(([line]) => JSON.parse(line as string) as Record<string, unknown>);
+      const shortCircuit = warnEntries.find((e) => e.msg === "Short-circuiting sonnet long-context 429 retry loop");
+      expect(shortCircuit).toBeDefined();
+      expect(shortCircuit?.["model"]).toBe("claude-sonnet-4-6");
+      expect(shortCircuit?.["requestBytes"]).toBeGreaterThan(20_000);
+
+      // No rate_limit event — this is treated as a terminal error, not a retry.
+      const rlEvents = events.filter((e) => e.type === "rate_limit");
+      expect(rlEvents).toHaveLength(0);
+      const errEvents = events.filter((e) => e.type === "error");
+      expect(errEvents.length).toBeGreaterThan(0);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
   test("rate-limit log truncates oversized response bodies and flags it", async () => {
     const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");

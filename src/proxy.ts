@@ -37,6 +37,11 @@ const REQUEST_BODY_SUMMARY_MAX_BYTES = 4_000_000;
 // we can see exactly what payload Anthropic is reacting to. 50KB fits a
 // typical Claude Code request's system prompt + first user message.
 const RATE_LIMIT_REQUEST_BODY_LOG_BYTES = 50_000;
+// Threshold above which a Sonnet request hitting "Extra usage is required
+// for long context requests" is treated as unrecoverable and short-circuited
+// with a 500 + model-readable message asking the caller to switch to Opus.
+// Below this size, the 429 is likely transient and retried normally.
+const SONNET_LONG_CONTEXT_SHORTCIRCUIT_MIN_BYTES = 20_000;
 
 type ActiveRequestPhase =
   | "fetching_upstream"
@@ -550,6 +555,61 @@ export async function proxyRequest(
       const retryAfter = parseRetryAfter(upstream.headers);
       keyManager.recordRateLimit(entry, retryAfter);
       const responseBody = await upstream.text();
+
+      // "Extra usage is required for long context requests" on a Sonnet
+      // model with a large body is a wall, not a transient rate limit.
+      // Every account without overage enabled will reject the same request
+      // identically — retrying burns 10 keys for nothing while the calling
+      // agent waits 5+ minutes. Short-circuit with a 500 carrying a
+      // model-readable message so the agent can switch to Opus instead.
+      const requestBytes = requestBody?.byteLength ?? 0;
+      const summary = summarizeRequestBody(requestBody);
+      const modelLower = summary.model !== null ? summary.model.toLowerCase() : "";
+      const isLongContextWall =
+        /long context/i.test(responseBody)
+        && modelLower.includes("sonnet")
+        && requestBytes > SONNET_LONG_CONTEXT_SHORTCIRCUIT_MIN_BYTES;
+      if (isLongContextWall) {
+        clearActiveRequest(traceId);
+        const shortCircuitMessage =
+          `PROXY ABORTED RETRY LOOP. Anthropic returned 429 "Extra usage is required for long context requests." `
+          + `for a ${summary.model ?? "sonnet"} request of ${requestBytes} bytes. `
+          + `The accounts available to this proxy do not have long-context overage enabled, so every retry on every key `
+          + `will fail identically — this is a hard wall, not a transient rate limit. `
+          + `DO NOT retry with any Sonnet model. Switch to claude-opus-4-7 (or another non-Sonnet model) `
+          + `for long-context requests on this proxy, or shorten the request below ~20KB.`;
+        log("warn", "Short-circuiting sonnet long-context 429 retry loop", {
+          label: entry.label,
+          user: proxyUser?.label,
+          method: req.method,
+          path: url.pathname,
+          attempt: attempts,
+          traceId,
+          sessionId,
+          conversationKey,
+          firstMessageHash,
+          model: summary.model,
+          requestBytes,
+          retryAfter,
+          responseBody: responseBody.slice(0, RATE_LIMIT_BODY_LOG_BYTES),
+          responseHeaders: collectResponseHeaders(upstream.headers),
+          capacityObservation,
+        });
+        emitWithKeys({
+          type: "error", ts: new Date().toISOString(), label: entry.label,
+          user: proxyUser?.label, status: 500,
+        }, keyManager.listKeys());
+        return {
+          kind: "error",
+          status: 500,
+          body: JSON.stringify({
+            type: "error",
+            error: { type: "proxy_short_circuit_long_context_sonnet", message: shortCircuitMessage },
+          }),
+          usedKey: entry,
+        };
+      }
+
       clearActiveRequest(traceId);
 
       log("info", "Rate limited, trying next key", {
