@@ -310,6 +310,17 @@ export async function proxyRequest(
   // a 429 response — otherwise every probe poisons a healthy key with a 60s
   // cooldown + AIMD gap growth, queueing real traffic behind a phantom limit.
   const requestIsQuotaProbe = isQuotaProbe(requestBody, url.pathname);
+  if (requestIsQuotaProbe) {
+    log("info", "Detected quota probe (will suppress rate-limit accounting on 429)", {
+      user: proxyUser?.label,
+      method: req.method,
+      path: url.pathname,
+      traceId,
+      sessionId,
+      conversationKey,
+      requestContentLength,
+    });
+  }
 
   let attempts = 0;
   let firstChunkRetries = 0;
