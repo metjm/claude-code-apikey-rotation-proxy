@@ -646,7 +646,7 @@ describe("Rate Limit Handling (429)", () => {
     const mock = upstream(() =>
       new Response("rate limited", {
         status: 429,
-        headers: { "retry-after": "60" },
+        headers: { "retry-after": "120" },
       }),
     );
 
@@ -657,6 +657,32 @@ describe("Rate Limit Handling (429)", () => {
     if (result.kind === "all_exhausted") {
       expect(result.earliestAvailableAt).toBeGreaterThan(Date.now());
     }
+  });
+
+  test("holds connection when all keys cooled but earliest available ≤ 60s", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    let callCount = 0;
+    const mock = upstream(() => {
+      callCount++;
+      if (callCount === 1) {
+        return new Response("rate limited", {
+          status: 429,
+          headers: { "retry-after": "2" },
+        });
+      }
+      return new Response("ok");
+    });
+
+    const config = makeConfig(mock.url);
+    const start = Date.now();
+    const result = await proxyRequest(makeRequest("/v1/messages"), km, config, st);
+    const elapsedMs = Date.now() - start;
+
+    expect(result.kind).toBe("success");
+    expect(callCount).toBe(2);
+    expect(elapsedMs).toBeGreaterThanOrEqual(1_900);
   });
 
   test("tracks rateLimitHits stat", async () => {
@@ -2595,7 +2621,7 @@ describe("Key Rotation", () => {
       callCount++;
       return new Response("rate limited", {
         status: 429,
-        headers: { "retry-after": "60" },
+        headers: { "retry-after": "120" },
       });
     });
 
@@ -2615,7 +2641,7 @@ describe("Key Rotation", () => {
     const mock = upstream(() =>
       new Response("rate limited", {
         status: 429,
-        headers: { "retry-after": "60" },
+        headers: { "retry-after": "120" },
       }),
     );
 
@@ -2710,7 +2736,7 @@ describe("Proxy User Attribution", () => {
     const mock = upstream(() =>
       new Response("rate limited", {
         status: 429,
-        headers: { "retry-after": "60" },
+        headers: { "retry-after": "120" },
       }),
     );
 

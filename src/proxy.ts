@@ -17,6 +17,10 @@ const RATE_LIMIT_STATUS = 429 as const;
 // comfortably under the Bun idle timeout (255s) so the client connection
 // isn't dropped mid-wait. Longer cooldowns loop for multiple iterations.
 const AFFINITY_COOLDOWN_WAIT_CAP_MS = 200_000;
+// When every key is rate-limited but the soonest one comes back within this
+// window, hold the client connection and re-route instead of returning 429.
+// Saves the client from a forced retry when the wait is short.
+const ALL_KEYS_HOLD_THRESHOLD_MS = 60_000;
 const ACTIVE_STREAM_SNAPSHOT_INTERVAL_MS = 2_000;
 const RECENT_STREAM_ACTIVITY_WINDOW_MS = 1_000;
 const SLOW_STREAM_SILENCE_LOG_MS = 5_000;
@@ -361,6 +365,36 @@ export async function proxyRequest(
           fireAt: Date.now() + waitMs,
         }, keyManager.listKeys());
         if (waitMs > 0) await new Promise((resolve) => setTimeout(resolve, waitMs));
+        attempts++;
+        continue;
+      }
+      const earliestAvailableAt = keyManager.getEarliestAvailableAt();
+      const globalWaitMs = earliestAvailableAt - Date.now();
+      if (globalWaitMs > 0 && globalWaitMs <= ALL_KEYS_HOLD_THRESHOLD_MS) {
+        log("info", "Holding for short global cooldown", {
+          user: proxyUser?.label,
+          method: req.method,
+          path: url.pathname,
+          attempt: attempts,
+          traceId,
+          sessionId,
+          conversationKey,
+          waitMs: globalWaitMs,
+        });
+        emitWithKeys({
+          type: "request_pending",
+          ts: new Date().toISOString(),
+          user: proxyUser?.label,
+          path: url.pathname,
+          attempt: attempts,
+          traceId,
+          sessionId,
+          conversationKey,
+          reason: "all_keys_cooled",
+          waitMs: globalWaitMs,
+          fireAt: Date.now() + globalWaitMs,
+        }, keyManager.listKeys());
+        await new Promise((resolve) => setTimeout(resolve, globalWaitMs));
         attempts++;
         continue;
       }

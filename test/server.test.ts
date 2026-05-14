@@ -1786,7 +1786,7 @@ describe("Rate Limit Rotation End-to-End", () => {
             status: 429,
             headers: {
               "content-type": "application/json",
-              "retry-after": "60",
+              "retry-after": "120",
             },
           },
         ),
