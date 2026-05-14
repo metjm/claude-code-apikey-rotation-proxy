@@ -9,7 +9,7 @@ import {
 } from "./types.ts";
 import { log } from "./logger.ts";
 import { emitWithKeys } from "./events.ts";
-import { computeFirstMessageHash } from "./message-fingerprint.ts";
+import { computeFirstMessageHash, isQuotaProbe } from "./message-fingerprint.ts";
 import type { SchemaTracker } from "./schema-tracker.ts";
 
 const RATE_LIMIT_STATUS = 429 as const;
@@ -304,6 +304,12 @@ export async function proxyRequest(
     ? computeFirstMessageHash(requestBody, url.pathname)
     : null;
   const conversationKey = buildConversationKey(proxyUser, sessionId, firstMessageHash);
+  // Claude Code's "quota" probe: small POST /v1/messages with content="quota"
+  // and max_tokens=1. Anthropic always 429s these regardless of real quota
+  // state. We proxy them normally but suppress the rate-limit accounting on
+  // a 429 response — otherwise every probe poisons a healthy key with a 60s
+  // cooldown + AIMD gap growth, queueing real traffic behind a phantom limit.
+  const requestIsQuotaProbe = isQuotaProbe(requestBody, url.pathname);
 
   let attempts = 0;
   let firstChunkRetries = 0;
@@ -585,6 +591,37 @@ export async function proxyRequest(
     }
 
     if (upstream.status === RATE_LIMIT_STATUS) {
+      // Quota-probe passthrough: forward the upstream 429 to the client
+      // unchanged, but DO NOT call recordRateLimit and DO NOT retry. These
+      // probes always 429 on Anthropic's side, so the 429 isn't evidence
+      // that this key is rate-limited for real traffic.
+      if (requestIsQuotaProbe) {
+        clearActiveRequest(traceId);
+        log("info", "Quota-probe 429 — passing through without key state update", {
+          label: entry.label,
+          user: proxyUser?.label,
+          method: req.method,
+          path: url.pathname,
+          attempt: attempts,
+          traceId,
+          sessionId,
+          conversationKey,
+          durationMs: Date.now() - fetchStartedAt,
+        });
+        const responseHeaders = new Headers();
+        for (const [k, v] of upstream.headers.entries()) {
+          if (!STRIPPED_RESPONSE_HEADERS.has(k.toLowerCase())) responseHeaders.set(k, v);
+        }
+        const passthroughBody = await upstream.text();
+        return {
+          kind: "success",
+          response: new Response(passthroughBody, {
+            status: upstream.status,
+            headers: responseHeaders,
+          }),
+          usedKey: entry,
+        };
+      }
       sawRateLimit = true;
       const retryAfter = parseRetryAfter(upstream.headers);
       keyManager.recordRateLimit(entry, retryAfter);

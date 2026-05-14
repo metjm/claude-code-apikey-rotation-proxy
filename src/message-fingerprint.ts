@@ -40,3 +40,31 @@ export function extractActorFromConversationKey(conversationKey: string): string
   const idx = conversationKey.indexOf(":");
   return idx === -1 ? conversationKey : conversationKey.slice(0, idx);
 }
+
+/**
+ * Detect Claude Code's "quota" probe: a POST /v1/messages with max_tokens=1
+ * and a single user message whose content is literally "quota". Anthropic
+ * always returns 429 to these regardless of actual quota state, so we use
+ * this to skip the rate-limit accounting that would otherwise contaminate
+ * a perfectly-healthy key (60s cooldown + AIMD gap growth) for traffic
+ * the upstream never intended us to retry.
+ */
+export function isQuotaProbe(body: Uint8Array | null, path: string): boolean {
+  if (body === null) return false;
+  if (path !== "/v1/messages") return false;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(new TextDecoder().decode(body));
+  } catch {
+    return false;
+  }
+  if (typeof parsed !== "object" || parsed === null) return false;
+  const maxTokens = (parsed as { max_tokens?: unknown }).max_tokens;
+  if (maxTokens !== 1) return false;
+  const messages = (parsed as { messages?: unknown }).messages;
+  if (!Array.isArray(messages) || messages.length !== 1) return false;
+  const msg = messages[0];
+  if (typeof msg !== "object" || msg === null) return false;
+  const content = (msg as { content?: unknown }).content;
+  return content === "quota";
+}

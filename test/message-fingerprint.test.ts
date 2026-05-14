@@ -3,6 +3,7 @@ import {
   computeFirstMessageHash,
   extractActorFromConversationKey,
   extractFirstMessageHashFromConversationKey,
+  isQuotaProbe,
 } from "../src/message-fingerprint.ts";
 
 function bodyOf(obj: unknown): Uint8Array {
@@ -123,5 +124,64 @@ describe("extractFirstMessageHashFromConversationKey", () => {
     const hash = computeFirstMessageHash(body, "/v1/messages")!;
     const conversationKey = `actor:session:${hash}`;
     expect(extractFirstMessageHashFromConversationKey(conversationKey)).toBe(hash);
+  });
+});
+
+describe("isQuotaProbe", () => {
+  // Captured from production proxy logs — the exact shape Claude Code sends.
+  const realProbe = {
+    model: "claude-opus-4-7",
+    max_tokens: 1,
+    messages: [{ role: "user", content: "quota" }],
+    metadata: { user_id: "{\"device_id\":\"abc\",\"account_uuid\":\"xyz\"}" },
+  };
+
+  test("matches the real production probe shape", () => {
+    expect(isQuotaProbe(bodyOf(realProbe), "/v1/messages")).toBe(true);
+  });
+
+  test("returns false for null body", () => {
+    expect(isQuotaProbe(null, "/v1/messages")).toBe(false);
+  });
+
+  test("returns false for non-/v1/messages paths", () => {
+    expect(isQuotaProbe(bodyOf(realProbe), "/v1/messages/count_tokens")).toBe(false);
+    expect(isQuotaProbe(bodyOf(realProbe), "/v1/complete")).toBe(false);
+  });
+
+  test("returns false when max_tokens != 1", () => {
+    expect(isQuotaProbe(bodyOf({ ...realProbe, max_tokens: 2 }), "/v1/messages")).toBe(false);
+    expect(isQuotaProbe(bodyOf({ ...realProbe, max_tokens: 1024 }), "/v1/messages")).toBe(false);
+  });
+
+  test("returns false when content is not the literal string 'quota'", () => {
+    expect(isQuotaProbe(bodyOf({ ...realProbe, messages: [{ role: "user", content: "hi" }] }), "/v1/messages")).toBe(false);
+    expect(isQuotaProbe(bodyOf({ ...realProbe, messages: [{ role: "user", content: "Quota" }] }), "/v1/messages")).toBe(false);
+    expect(isQuotaProbe(bodyOf({ ...realProbe, messages: [{ role: "user", content: " quota" }] }), "/v1/messages")).toBe(false);
+    // Block-formatted content (an array of content blocks) is real conversation, not a probe.
+    expect(isQuotaProbe(bodyOf({ ...realProbe, messages: [{ role: "user", content: [{ type: "text", text: "quota" }] }] }), "/v1/messages")).toBe(false);
+  });
+
+  test("returns false when there is more than one message", () => {
+    expect(isQuotaProbe(bodyOf({
+      ...realProbe,
+      messages: [
+        { role: "user", content: "quota" },
+        { role: "assistant", content: "..." },
+      ],
+    }), "/v1/messages")).toBe(false);
+  });
+
+  test("returns false for unparseable body", () => {
+    expect(isQuotaProbe(new TextEncoder().encode("not json"), "/v1/messages")).toBe(false);
+  });
+
+  test("returns false when messages is missing or empty", () => {
+    expect(isQuotaProbe(bodyOf({ model: "x", max_tokens: 1 }), "/v1/messages")).toBe(false);
+    expect(isQuotaProbe(bodyOf({ model: "x", max_tokens: 1, messages: [] }), "/v1/messages")).toBe(false);
+  });
+
+  test("returns false when max_tokens is missing", () => {
+    expect(isQuotaProbe(bodyOf({ model: "x", messages: [{ role: "user", content: "quota" }] }), "/v1/messages")).toBe(false);
   });
 });

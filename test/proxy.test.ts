@@ -1247,6 +1247,115 @@ describe("Rate Limit Handling (429)", () => {
   }
 });
 
+describe("Quota-probe 429 passthrough", () => {
+  // Claude Code sends a small `/v1/messages` request with max_tokens=1 and
+  // a single user message of literally "quota". Anthropic always 429s these
+  // regardless of real quota state. We must proxy them as normal but skip
+  // the rate-limit accounting so a healthy key isn't poisoned by a phantom
+  // cooldown + AIMD gap growth on every probe.
+
+  function quotaProbeBody(): string {
+    return JSON.stringify({
+      model: "claude-opus-4-7",
+      max_tokens: 1,
+      messages: [{ role: "user", content: "quota" }],
+    });
+  }
+
+  test("on 429: returns response unchanged without touching key state or retrying", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    km.addKey(FAKE_KEY_B, "key-b");
+
+    let callCount = 0;
+    const mock = upstream(() => {
+      callCount++;
+      return new Response(
+        JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: "Error" } }),
+        { status: 429, headers: { "content-type": "application/json" } },
+      );
+    });
+
+    const config = makeConfig(mock.url);
+    const result = await proxyRequest(
+      makeRequest("/v1/messages", { method: "POST", body: quotaProbeBody() }),
+      km, config, st,
+    );
+
+    // Must NOT retry the next key — only one upstream call.
+    expect(callCount).toBe(1);
+    // Result is a success kind with the 429 response forwarded.
+    expect(result.kind).toBe("success");
+    if (result.kind !== "success") return;
+    expect(result.response.status).toBe(429);
+    const body = await result.response.text();
+    expect(body).toContain("rate_limit_error");
+
+    // Critical: neither key should have a cooldown set, and neither should
+    // have grown its inter-request gap. The probe must not poison state.
+    for (const k of km.listKeys()) {
+      expect(k.availableAt).toBe(0 as unknown as typeof k.availableAt);
+      expect(k.interRequestGapMs).toBe(0);
+      // Hit stat also unchanged (the probe didn't even count as a rate-limit
+      // hit on the key).
+      expect(k.stats.rateLimitHits).toBe(0);
+    }
+  });
+
+  test("on 200: probe behaves like a normal request (no special passthrough)", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    const mock = upstream(() => new Response(JSON.stringify({ id: "ok" }), {
+      status: 200, headers: { "content-type": "application/json" },
+    }));
+
+    const config = makeConfig(mock.url);
+    const result = await proxyRequest(
+      makeRequest("/v1/messages", { method: "POST", body: quotaProbeBody() }),
+      km, config, st,
+    );
+    expect(result.kind).toBe("success");
+    if (result.kind !== "success") return;
+    expect(result.response.status).toBe(200);
+  });
+
+  test("non-probe 429 still triggers recordRateLimit + retry (probe gate is narrow)", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    km.addKey(FAKE_KEY_B, "key-b");
+
+    let callCount = 0;
+    const mock = upstream((req) => {
+      callCount++;
+      const key = req.headers.get("x-api-key");
+      if (key === FAKE_KEY_A) {
+        return new Response("rate limited", { status: 429, headers: { "retry-after": "30" } });
+      }
+      return new Response("ok");
+    });
+
+    // Real chat request — not a probe.
+    const realBody = JSON.stringify({
+      model: "claude-opus-4-7",
+      max_tokens: 1024,
+      messages: [{ role: "user", content: "hello there" }],
+    });
+    const config = makeConfig(mock.url);
+    const result = await proxyRequest(
+      makeRequest("/v1/messages", { method: "POST", body: realBody }),
+      km, config, st,
+    );
+    expect(result.kind).toBe("success");
+    expect(callCount).toBe(2);  // retried after 429
+
+    // Key A should now have a cooldown set (full rate-limit accounting applied).
+    const keyA = km.listKeys().find((k) => k.label === "key-a")!;
+    expect(keyA.availableAt).toBeGreaterThan(Date.now());
+    expect(keyA.stats.rateLimitHits).toBe(1);
+  });
+});
+
 describe("Request body summary (pure helper)", () => {
   function buf(s: string): Uint8Array { return new TextEncoder().encode(s); }
 
