@@ -2058,6 +2058,112 @@ describe("Capacity telemetry", () => {
     expect(buckets[0]!.warning).toBe(1);
     expect(buckets[0]!.allowed).toBe(1);
     expect(buckets[0]!.maxUtilization).toBe(0.77);
+    expect(buckets[0]!.keysObserved).toBe(1);
+    expect(buckets[0]!.avgUtilizationPerKey).toBeCloseTo((0.77 + 0.55) / 2, 6);
+  });
+
+  test("queryCapacityTimeseries day resolution collapses a key's hours per day before averaging across keys", async () => {
+    // Same UTC day, two keys, both with two hourly rows. Key A drifts from
+    // 0.20 → 0.40 (per-key day avg = 0.30). Key B is steady at 0.80 (per-key
+    // day avg = 0.80). Fleet per-key avg for the day = (0.30 + 0.80) / 2 = 0.55.
+    // A naïve "average all samples across all hours and keys" would compute
+    // (0.20 + 0.40 + 0.80 + 0.80) / 4 = 0.55 — identical here because samples
+    // per row are equal. To make the two diverge we vary utilization_samples
+    // so the sample-weighted avg ≠ per-key avg.
+    const km = create();
+    const db = (km as unknown as { db: Database }).db;
+
+    // Pick yesterday's date in UTC so the bucket is in-window for hours=24
+    // even at minute 59 of the host's local hour. We use 2 distinct hour
+    // buckets on the same UTC day for each key, totaling 4 rows.
+    const ref = new Date();
+    const yesterdayUtc = new Date(Date.UTC(
+      ref.getUTCFullYear(),
+      ref.getUTCMonth(),
+      ref.getUTCDate() - 1,
+      0, 0, 0, 0,
+    ));
+    const dayPrefix = yesterdayUtc.toISOString().slice(0, 10);
+    const hourA = `${dayPrefix}T08`;
+    const hourB = `${dayPrefix}T20`;
+
+    function row(
+      bucket: string,
+      keyLabel: string,
+      windowName: string,
+      utilizationSum: number,
+      utilizationSamples: number,
+      utilizationMax: number,
+    ): void {
+      db.run(
+        `INSERT INTO capacity_window_timeseries
+          (bucket, key_label, window_name, samples, allowed_count, warning_count, rejected_count, utilization_sum, utilization_samples, utilization_max)
+          VALUES (?, ?, ?, ?, 0, 0, 0, ?, ?, ?)`,
+        [bucket, keyLabel, windowName, utilizationSamples, utilizationSum, utilizationSamples, utilizationMax],
+      );
+    }
+
+    // Key A — varying util across two hours, varying sample counts to make
+    // the sample-weighted aggregate diverge from the per-key day average.
+    row(hourA, "day-a", "unified", 0.20 * 1, 1, 0.20);   // hour 08: 1 sample @ 0.20
+    row(hourB, "day-a", "unified", 0.40 * 9, 9, 0.40);   // hour 20: 9 samples @ 0.40
+    // Key A's per-day sample-weighted avg = (0.20 + 3.60) / 10 = 0.38
+
+    // Key B — flat across the day.
+    row(hourA, "day-b", "unified", 0.80 * 1, 1, 0.80);
+    row(hourB, "day-b", "unified", 0.80 * 1, 1, 0.80);
+    // Key B's per-day avg = 0.80
+
+    const buckets = km.queryCapacityTimeseries({ hours: 48, resolution: "day" });
+    const today = buckets.find((b) => b.bucket === dayPrefix && b.windowName === "unified");
+    expect(today).toBeDefined();
+
+    // Distinct key count for the day — both keys had data.
+    expect(today!.keysObserved).toBe(2);
+
+    // Per-key avg for the day collapses each key's hours first, then averages
+    // across keys: (0.38 + 0.80) / 2 = 0.59.
+    expect(today!.avgUtilizationPerKey!).toBeCloseTo((0.38 + 0.80) / 2, 6);
+
+    // Sample-weighted avg (kept for back-compat callers) is a different number —
+    // (0.20 + 3.60 + 0.80 + 0.80) / 12 ≈ 0.4500. This proves the two paths
+    // are wired separately and the per-key path is what the dashboard uses.
+    expect(today!.avgUtilization!).toBeCloseTo(5.4 / 12, 6);
+    expect(today!.avgUtilization!).not.toBeCloseTo(today!.avgUtilizationPerKey!, 2);
+
+    // Max stays the highest single-key max in the day.
+    expect(today!.maxUtilization).toBe(0.80);
+  });
+
+  test("queryCapacityTimeseries per-key avg treats each key equally regardless of sample count", async () => {
+    // Key A: 1 sample at 0.10. Key B: 5 samples averaging 0.90. Sample-weighted
+    // mean = (0.10 + 5 × 0.90) / 6 ≈ 0.767. Per-key mean = (0.10 + 0.90) / 2 = 0.50.
+    // The dashboard wants the per-key view so each key counts as one capacity unit.
+    const km = create();
+    const a = km.addKey(VALID_KEY_1, "cap-equal-a");
+    const b = km.addKey(VALID_KEY_2, "cap-equal-b");
+
+    km.recordCapacityObservation(a, {
+      seenAt: unixMs(1_000),
+      httpStatus: 200,
+      windows: [{ windowName: "unified", status: "allowed", utilization: 0.10, resetAt: unixMs(Date.now() + 60_000) }],
+    });
+    for (let i = 0; i < 5; i++) {
+      km.recordCapacityObservation(b, {
+        seenAt: unixMs(2_000 + i),
+        httpStatus: 200,
+        windows: [{ windowName: "unified", status: "allowed", utilization: 0.90, resetAt: unixMs(Date.now() + 60_000) }],
+      });
+    }
+
+    await waitForSave();
+
+    const buckets = km.queryCapacityTimeseries({ hours: 24, resolution: "hour" });
+    const unified = buckets.find((bk) => bk.windowName === "unified");
+    expect(unified).toBeDefined();
+    expect(unified!.keysObserved).toBe(2);
+    expect(unified!.avgUtilization!).toBeCloseTo((0.10 + 5 * 0.90) / 6, 6);
+    expect(unified!.avgUtilizationPerKey!).toBeCloseTo(0.5, 6);
   });
 
   test("getNextAvailableKey ignores capacity analytics and keeps the original sticky selection logic", () => {

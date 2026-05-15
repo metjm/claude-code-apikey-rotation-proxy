@@ -395,6 +395,174 @@ describe("Dashboard fleet-pressure gradient (real browser)", () => {
     }
   }, 60_000);
 
+  test("Capacity Headroom chart plots fleet headroom across both 5h and 7d windows", async () => {
+    // Build a fleet of 4 keys. Two produce telemetry on BOTH 5h and 7d windows
+    // — one running hot, one cool — leaving two with no observations. Under
+    // the new headroom math, unobserved keys count as 100% remaining, so a
+    // single hot account on a small fleet must NOT crater the chart to "the
+    // highest account's utilization". We then verify the API surfaces
+    // fleetSize and the new per-key/keysObserved fields, that the dashboard
+    // panel is relabeled, AND that the chart's actual plotted y-values match
+    // the expected headroom math (not just the dataset labels).
+    const dataDir = makeTempDir();
+    const upstream = startMockUpstream();
+    const proxy = startProxy({ dataDir, upstream: upstream.url, adminToken: ADMIN_TOKEN });
+
+    try {
+      const hot = proxy.km.addKey(VALID_KEY_1, "headroom-hot");
+      const cool = proxy.km.addKey(VALID_KEY_2, "headroom-cool");
+      proxy.km.addKey(VALID_KEY_3, "headroom-quiet-1");
+      proxy.km.addKey("sk-ant-api03-dddddddddddddddddddddddddddddddddd", "headroom-quiet-2");
+
+      const resetAt5h = Date.now() + 60 * 60 * 1000;
+      const resetAt7d = Date.now() + 3 * 24 * 60 * 60 * 1000;
+      // hot @ 0.9 / 0.5, cool @ 0.1 / 0.3 → 5h per-key avg = 0.5, 7d = 0.4.
+      // Two of four keys observed → 5h fleet headroom = 1 - 0.5*2/4 = 0.75;
+      // 7d fleet headroom = 1 - 0.4*2/4 = 0.80. The two windows must plot
+      // distinct y-values so we know the per-window aggregation is real.
+      proxy.km.recordCapacityObservation(hot, {
+        seenAt: unixMs(Date.now()),
+        httpStatus: 200,
+        windows: [
+          { windowName: "unified-5h", status: "allowed_warning", utilization: 0.9, resetAt: unixMs(resetAt5h) },
+          { windowName: "unified-7d", status: "allowed", utilization: 0.5, resetAt: unixMs(resetAt7d) },
+        ],
+      });
+      proxy.km.recordCapacityObservation(cool, {
+        seenAt: unixMs(Date.now()),
+        httpStatus: 200,
+        windows: [
+          { windowName: "unified-5h", status: "allowed", utilization: 0.1, resetAt: unixMs(resetAt5h) },
+          { windowName: "unified-7d", status: "allowed", utilization: 0.3, resetAt: unixMs(resetAt7d) },
+        ],
+      });
+
+      // Flush the in-memory accumulator into capacity_window_timeseries so the
+      // query endpoint actually sees the seeded rows.
+      proxy.stop();
+      const reloaded = startProxy({ dataDir, upstream: upstream.url, adminToken: ADMIN_TOKEN });
+
+      try {
+        const tsRes = await fetch(`${reloaded.url}/admin/capacity/timeseries?hours=24&resolution=hour`, {
+          headers: { Authorization: `Bearer ${ADMIN_TOKEN}` },
+        });
+        expect(tsRes.status).toBe(200);
+        const tsBody = await tsRes.json() as {
+          fleetSize: number;
+          buckets: Array<{
+            windowName: string;
+            maxUtilization: number | null;
+            avgUtilization: number | null;
+            avgUtilizationPerKey: number | null;
+            keysObserved: number;
+          }>;
+        };
+        expect(tsBody.fleetSize).toBe(4);
+        const fiveH = tsBody.buckets.find((b) => b.windowName === "unified-5h");
+        const sevenD = tsBody.buckets.find((b) => b.windowName === "unified-7d");
+        expect(fiveH).toBeDefined();
+        expect(sevenD).toBeDefined();
+        expect(fiveH!.keysObserved).toBe(2);
+        expect(sevenD!.keysObserved).toBe(2);
+        expect(fiveH!.avgUtilizationPerKey!).toBeCloseTo(0.5, 6);
+        expect(sevenD!.avgUtilizationPerKey!).toBeCloseTo(0.4, 6);
+        expect(fiveH!.maxUtilization).toBe(0.9);
+
+        // Fleet headroom the dashboard plots: 1 - (perKeyAvg * observed /
+        // fleetSize). For 5h: 1 - 0.5*2/4 = 0.75. For 7d: 1 - 0.4*2/4 = 0.80.
+        // The OLD chart would have plotted maxUtilization 0.9 → 0.5 i.e. as
+        // if the worst account spoke for the whole fleet.
+        const expected5h = 1 - (fiveH!.avgUtilizationPerKey! * fiveH!.keysObserved / tsBody.fleetSize);
+        const expected7d = 1 - (sevenD!.avgUtilizationPerKey! * sevenD!.keysObserved / tsBody.fleetSize);
+        expect(expected5h).toBeCloseTo(0.75, 6);
+        expect(expected7d).toBeCloseTo(0.80, 6);
+
+        const page = await openDashboard(browser, reloaded.url, ADMIN_TOKEN);
+        await page.waitForSelector("#chart-capacity", { timeout: 15_000 });
+
+        // Panel title was renamed.
+        const panelTitle = await page.$eval(
+          "#chart-capacity",
+          (canvas) => canvas.closest(".panel")?.querySelector(".panel-title")?.textContent?.trim() ?? "",
+        );
+        expect(panelTitle).toBe("Capacity Headroom");
+
+        // Read the chart's dataset labels AND their actual plotted y-values
+        // (not just the labels) so a bug in the bucketHeadroom JS that left
+        // labels correct but plotted nonsense would be caught.
+        const chartShape = await page.waitForFunction(
+          () => {
+            const canvas = document.getElementById("chart-capacity");
+            if (!canvas) return false;
+            const chart = (window as unknown as { Chart: { getChart: (c: Element) => unknown } }).Chart.getChart(canvas);
+            if (!chart) return false;
+            const datasets = (chart as { data: { datasets: { label: string; data: number[] }[] } }).data.datasets;
+            if (!datasets || datasets.length === 0) return false;
+            return datasets.map((d) => ({
+              label: d.label,
+              data: Array.from(d.data),
+            }));
+          },
+          { timeout: 15_000 },
+        ).then((handle) => handle.jsonValue() as Promise<Array<{ label: string; data: number[] }>>);
+
+        // Both windows must have their own line.
+        expect(chartShape.length).toBeGreaterThanOrEqual(2);
+        const ds5h = chartShape.find((d) => d.label.toLowerCase().includes("5h"));
+        const ds7d = chartShape.find((d) => d.label.toLowerCase().includes("7d"));
+        expect(ds5h).toBeDefined();
+        expect(ds7d).toBeDefined();
+        for (const ds of chartShape) {
+          expect(ds.label.toLowerCase()).toContain("headroom");
+          expect(ds.label.toLowerCase()).not.toContain("max util");
+        }
+
+        // The chart fills in all bucket slots over the requested range — only
+        // the most-recent bucket(s) carry real telemetry, the rest are gaps
+        // and must plot at headroom = 1 ("unknown = 100% remaining"). We
+        // identify the data-bearing bucket as the one whose 5h value matches
+        // the expected 0.75; every OTHER bucket must equal exactly 1.
+        const observed5h = ds5h!.data.find((v) => Math.abs(v - expected5h) < 1e-6);
+        expect(observed5h).toBeDefined();
+        const gapCount5h = ds5h!.data.filter((v) => v === 1).length;
+        expect(gapCount5h).toBeGreaterThan(0);
+
+        // 7d: identify the data-bearing bucket and verify its value.
+        const observed7d = ds7d!.data.find((v) => Math.abs(v - expected7d) < 1e-6);
+        expect(observed7d).toBeDefined();
+        // 7d must plot a DIFFERENT y-value than 5h in that same bucket, proving
+        // the chart computes per-window headroom (not one shared aggregate).
+        expect(expected7d).not.toBeCloseTo(expected5h, 2);
+
+        // Pure-function check on the dashboard's bucketHeadroom: empty/null
+        // row → 1; a row with keysObserved exceeding fleetSize is clamped
+        // (rather than going negative and being floored to 0).
+        const fnChecks = await page.evaluate(() => {
+          const fn = (window as unknown as { __capacityHeadroom: (row: unknown) => number }).__capacityHeadroom;
+          return {
+            nullRow: fn(null),
+            emptyRow: fn({}),
+            unknownUtil: fn({ avgUtilizationPerKey: null, keysObserved: 0 }),
+            clamped: fn({ avgUtilizationPerKey: 1.0, keysObserved: 99 }), // observed >> fleetSize=4
+          };
+        });
+        expect(fnChecks.nullRow).toBe(1);
+        expect(fnChecks.emptyRow).toBe(1);
+        expect(fnChecks.unknownUtil).toBe(1);
+        // observed=99 clamped to fleetSize=4 → fleetUtil = 1.0 * 4 / 4 = 1 →
+        // headroom = 0 (a fully-saturated fleet, not a misleading -negative).
+        expect(fnChecks.clamped).toBe(0);
+
+        await page.close();
+      } finally {
+        reloaded.stop();
+      }
+    } finally {
+      upstream.stop();
+      cleanupTempDir(dataDir);
+    }
+  }, 60_000);
+
   test("serves /admin/capacity/forecast with 168 slots and reflects Tuesday 2pm UTC spike", async () => {
     // Pure API assertion guarding the data contract the dashboard relies on.
     const dataDir = makeTempDir();

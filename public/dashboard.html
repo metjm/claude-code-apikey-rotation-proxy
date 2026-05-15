@@ -772,7 +772,8 @@
     </div>
     <div class="panel" style="min-height:280px">
       <div class="panel-header">
-        <span class="panel-title">Capacity Pressure</span>
+        <span class="panel-title">Capacity Headroom</span>
+        <span class="header-stat" title="Fleet headroom = mean (1 − per-key utilization) across the whole fleet. Keys with no telemetry in a bucket count as 100% remaining.">% of fleet capacity available</span>
       </div>
       <div style="flex:1;position:relative;min-height:200px"><canvas id="chart-capacity"></canvas></div>
     </div>
@@ -3236,6 +3237,7 @@ async function loadCharts() {
   });
 
   const capacityRows = capacityData?.buckets || [];
+  const fleetSize = Math.max(1, Number(capacityData?.fleetSize) || 0);
   const bucketKeys = fillGaps([], hours, resolution).map(b => b.bucket);
   const labelByBucket = new Map(bucketKeys.map(bucket => [bucket, formatBucketLabel(bucket, resolution)]));
   const windows = [...new Set(capacityRows.map(row => row.windowName))];
@@ -3243,15 +3245,40 @@ async function loadCharts() {
   const pressureWindowList = pressureWindows.length > 0 ? pressureWindows : windows.slice(0, 3);
   const statusWindow = windows.includes('unified') ? 'unified' : (windows[0] || null);
 
+  // Fleet headroom per bucket = mean of (1 - per-key utilization) across the
+  // whole fleet. Keys with no telemetry in the bucket count as 100% remaining,
+  // so an unobserved fleet reads as full capacity, not a gap.
+  //
+  //   headroom = 1 - (avgUtilizationPerKey * keysObserved / fleetSize)
+  //
+  // When fleetSize is unknown (single-key drill-in or empty fleet), we fall
+  // back to the per-key avg directly so the line still has meaning. We also
+  // clamp keysObserved ≤ fleetSize because deleted/renamed keys can leave
+  // historical rows that outnumber the current roster — without the clamp,
+  // those buckets would compute a negative-then-clamped-to-zero headroom and
+  // mislead operators about how stressed the fleet "really was" back then.
+  function bucketHeadroom(row) {
+    if (!row || row.avgUtilizationPerKey === null || row.avgUtilizationPerKey === undefined) {
+      return 1;
+    }
+    const observed = Number(row.keysObserved) || 0;
+    const denom = fleetSize > 0 ? fleetSize : Math.max(observed, 1);
+    const effectiveObserved = Math.min(observed, denom);
+    const fleetUtil = Number(row.avgUtilizationPerKey) * effectiveObserved / denom;
+    return Math.max(0, Math.min(1, 1 - fleetUtil));
+  }
+  // Exposed for e2e/unit tests — pure function of the row + closed-over fleetSize.
+  window.__capacityHeadroom = bucketHeadroom;
+
   capacityChart = new Chart(document.getElementById('chart-capacity'), {
     type: 'line',
     data: {
       labels: bucketKeys.map(bucket => labelByBucket.get(bucket)),
       datasets: pressureWindowList.map((windowName, idx) => ({
-        label: `${humanizeWindowName(windowName)} max util`,
+        label: `${humanizeWindowName(windowName)} headroom`,
         data: bucketKeys.map(bucket => {
           const row = capacityRows.find(entry => entry.bucket === bucket && entry.windowName === windowName);
-          return row?.maxUtilization ?? null;
+          return bucketHeadroom(row);
         }),
         borderColor: ['#58a6ff', '#39d2c0', '#d2a8ff', '#ffa657'][idx % 4],
         backgroundColor: 'transparent',
@@ -3266,11 +3293,18 @@ async function loadCharts() {
         x: { ticks: { maxRotation: 45, maxTicksLimit: 24 } },
         y: {
           beginAtZero: true,
-          suggestedMax: 1,
+          max: 1,
           ticks: { callback: value => `${Math.round(Number(value) * 100)}%` },
         },
       },
-      plugins: { legend: { position: 'bottom', labels: { boxWidth: 12 } } }
+      plugins: {
+        legend: { position: 'bottom', labels: { boxWidth: 12 } },
+        tooltip: {
+          callbacks: {
+            label: (ctx) => `${ctx.dataset.label}: ${Math.round(Number(ctx.parsed.y) * 100)}% remaining`,
+          },
+        },
+      },
     }
   });
 

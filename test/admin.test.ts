@@ -445,6 +445,19 @@ describe("Capacity admin payloads", () => {
     expect(body.buckets).toHaveLength(1);
     expect(body.buckets[0].windowName).toBe("unified");
     expect(body.buckets[0].allowed).toBe(1);
+    expect(body.buckets[0].keysObserved).toBe(1);
+    expect(body.buckets[0].avgUtilizationPerKey).toBeCloseTo(0.4, 6);
+    // key= drill-in: response reports a fleet of 1 so the dashboard plots
+    // the single key's headroom verbatim instead of diluting by N.
+    expect(body.fleetSize).toBe(1);
+  });
+
+  test("GET /admin/capacity/timeseries reports current fleetSize when no key filter is set", async () => {
+    km.addKey(VALID_KEY, "cap-fleet-a");
+    km.addKey(VALID_KEY_2, "cap-fleet-b");
+    const res = await handleAdminRoute(makeReq("GET", "/admin/capacity/timeseries?hours=24&resolution=hour"), km, makeConfig(), st);
+    const body = await jsonBody(res!);
+    expect(body.fleetSize).toBe(2);
   });
 });
 

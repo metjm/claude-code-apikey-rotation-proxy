@@ -338,6 +338,15 @@ export interface CapacityTimeseriesBucket {
   readonly rejected: number;
   readonly avgUtilization: number | null;
   readonly maxUtilization: number | null;
+  /** Mean of per-key average utilizations in this bucket. Differs from
+   *  avgUtilization (sample-weighted) when some keys produced far more
+   *  telemetry than others. Each key contributes equally — operator
+   *  intuition is "fleet of N keys, each one slot of capacity". */
+  readonly avgUtilizationPerKey: number | null;
+  /** Number of distinct keys that produced any utilization telemetry in
+   *  this bucket. Used together with the response-level fleetSize to
+   *  derive fleet-wide headroom (keys with no data count as 100% remaining). */
+  readonly keysObserved: number;
 }
 
 // ── Seasonal request factors (traffic pattern by day-of-week × hour) ─────

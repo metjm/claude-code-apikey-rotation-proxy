@@ -484,7 +484,8 @@ function handleCapacityTimeseries(
     resolution,
     ...(keyLabel !== undefined ? { keyLabel } : {}),
   });
-  return json({ resolution, buckets });
+  const fleetSize = keyLabel === undefined ? keyManager.listKeys().length : 1;
+  return json({ resolution, fleetSize, buckets });
 }
 
 function handleCapacityForecast(

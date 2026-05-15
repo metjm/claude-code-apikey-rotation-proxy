@@ -117,6 +117,8 @@ interface CapacityTsRow {
   utilization_sum: number;
   utilization_samples: number;
   utilization_max: number;
+  per_key_avg_sum: number;
+  keys_observed: number;
 }
 
 interface ConversationAffinityRow {
@@ -1782,20 +1784,44 @@ export class KeyManager {
       params.push(opts.keyLabel);
     }
 
+    // Two-level aggregation:
+    //   inner — per (bucket, key, window): the key's average utilization
+    //           in that bucket (sample-weighted, but only within one key)
+    //   outer — per (bucket, window): sum of those per-key averages and a
+    //           distinct-key count, so the caller can derive a per-key
+    //           fleet mean that treats every key as one equal capacity unit
+    // We also pass through the simpler sample-weighted totals for back-compat.
     const sql = `
-      SELECT ${groupExpr} AS b,
-        window_name,
-        SUM(samples) AS samples,
-        SUM(allowed_count) AS allowed_count,
-        SUM(warning_count) AS warning_count,
-        SUM(rejected_count) AS rejected_count,
-        SUM(utilization_sum) AS utilization_sum,
-        SUM(utilization_samples) AS utilization_samples,
-        MAX(utilization_max) AS utilization_max
-      FROM capacity_window_timeseries
-      WHERE ${conditions.join(" AND ")}
-      GROUP BY b, window_name
-      ORDER BY b, window_name
+      SELECT pre.b AS b,
+        pre.window_name AS window_name,
+        SUM(pre.samples) AS samples,
+        SUM(pre.allowed_count) AS allowed_count,
+        SUM(pre.warning_count) AS warning_count,
+        SUM(pre.rejected_count) AS rejected_count,
+        SUM(pre.utilization_sum) AS utilization_sum,
+        SUM(pre.utilization_samples) AS utilization_samples,
+        MAX(pre.utilization_max) AS utilization_max,
+        SUM(CASE WHEN pre.utilization_samples > 0
+                 THEN pre.utilization_sum * 1.0 / pre.utilization_samples
+                 ELSE 0 END) AS per_key_avg_sum,
+        SUM(CASE WHEN pre.utilization_samples > 0 THEN 1 ELSE 0 END) AS keys_observed
+      FROM (
+        SELECT ${groupExpr} AS b,
+          key_label,
+          window_name,
+          SUM(samples) AS samples,
+          SUM(allowed_count) AS allowed_count,
+          SUM(warning_count) AS warning_count,
+          SUM(rejected_count) AS rejected_count,
+          SUM(utilization_sum) AS utilization_sum,
+          SUM(utilization_samples) AS utilization_samples,
+          MAX(utilization_max) AS utilization_max
+        FROM capacity_window_timeseries
+        WHERE ${conditions.join(" AND ")}
+        GROUP BY b, key_label, window_name
+      ) AS pre
+      GROUP BY pre.b, pre.window_name
+      ORDER BY pre.b, pre.window_name
     `;
 
     const rows = this.db.query(sql).all(...params) as CapacityTsRow[];
@@ -1808,6 +1834,8 @@ export class KeyManager {
       rejected: row.rejected_count,
       avgUtilization: row.utilization_samples > 0 ? row.utilization_sum / row.utilization_samples : null,
       maxUtilization: row.utilization_samples > 0 ? row.utilization_max : null,
+      avgUtilizationPerKey: row.keys_observed > 0 ? row.per_key_avg_sum / row.keys_observed : null,
+      keysObserved: row.keys_observed,
     }));
   }
 
