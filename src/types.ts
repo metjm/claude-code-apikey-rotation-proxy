@@ -347,6 +347,25 @@ export interface CapacityTimeseriesBucket {
    *  this bucket. Used together with the response-level fleetSize to
    *  derive fleet-wide headroom (keys with no data count as 100% remaining). */
   readonly keysObserved: number;
+  /** Fleet-wide effective utilization for this (bucket, window), expressed
+   *  as a 0..1 fraction of total fleet capacity, computed server-side and
+   *  ready for `headroom = 1 - effectiveFleetUtilization`. Two corrections
+   *  over the raw sample average:
+   *   - Forward-fill: a key with persisted utilization (lastSeenAt < bucket
+   *     end, resetAt > bucket start) but no sample in this bucket is treated
+   *     as still sitting at that utilization, instead of disappearing and
+   *     boosting apparent headroom.
+   *   - Cross-window fold: in the 5h line, a key whose 7d utilization is at
+   *     the cap counts as 100% util regardless of 5h state, because a
+   *     weekly-blocked key can't serve any traffic. The 7d line is unaffected
+   *     by 5h state.
+   *  Null when fleet size is zero. */
+  readonly effectiveFleetUtilization: number | null;
+  /** Number of distinct keys whose effective utilization is known for this
+   *  (bucket, window) — either sampled directly OR forward-filled from
+   *  persisted state. The remainder of the fleet (fleetSize - keysAccounted)
+   *  is treated as 0% utilization (unknown = full headroom). */
+  readonly keysAccounted: number;
 }
 
 // ── Seasonal request factors (traffic pattern by day-of-week × hour) ─────

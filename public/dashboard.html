@@ -773,7 +773,7 @@
     <div class="panel" style="min-height:280px">
       <div class="panel-header">
         <span class="panel-title">Capacity Headroom</span>
-        <span class="header-stat" title="Fleet headroom = mean (1 − per-key utilization) across the whole fleet. Keys with no telemetry in a bucket count as 100% remaining.">% of fleet capacity available</span>
+        <span class="header-stat" title="Fleet headroom = 1 − effective fleet utilization. A key in cooldown still counts at its last known utilization until reset, and a 7d-exhausted key counts as 100% on the 5h line too.">% of fleet capacity available</span>
       </div>
       <div style="flex:1;position:relative;min-height:200px"><canvas id="chart-capacity"></canvas></div>
     </div>
@@ -3245,20 +3245,20 @@ async function loadCharts() {
   const pressureWindowList = pressureWindows.length > 0 ? pressureWindows : windows.slice(0, 3);
   const statusWindow = windows.includes('unified') ? 'unified' : (windows[0] || null);
 
-  // Fleet headroom per bucket = mean of (1 - per-key utilization) across the
-  // whole fleet. Keys with no telemetry in the bucket count as 100% remaining,
-  // so an unobserved fleet reads as full capacity, not a gap.
-  //
-  //   headroom = 1 - (avgUtilizationPerKey * keysObserved / fleetSize)
-  //
-  // When fleetSize is unknown (single-key drill-in or empty fleet), we fall
-  // back to the per-key avg directly so the line still has meaning. We also
-  // clamp keysObserved ≤ fleetSize because deleted/renamed keys can leave
-  // historical rows that outnumber the current roster — without the clamp,
-  // those buckets would compute a negative-then-clamped-to-zero headroom and
-  // mislead operators about how stressed the fleet "really was" back then.
+  // Fleet headroom per bucket. The server computes effectiveFleetUtilization
+  // with two corrections that pure-sample math misses:
+  //   - forward-fill: a key in cooldown stops emitting samples, but its
+  //     persisted utilization still consumes fleet capacity until reset.
+  //   - cross-window fold: a 7d-exhausted key counts as 100% util on the 5h
+  //     line too, since a weekly-blocked key can't serve any traffic.
+  // We prefer that field. Legacy rows (no effectiveFleetUtilization) fall
+  // back to the raw sample formula so older data still renders.
   function bucketHeadroom(row) {
-    if (!row || row.avgUtilizationPerKey === null || row.avgUtilizationPerKey === undefined) {
+    if (!row) return 1;
+    if (typeof row.effectiveFleetUtilization === 'number') {
+      return Math.max(0, Math.min(1, 1 - row.effectiveFleetUtilization));
+    }
+    if (row.avgUtilizationPerKey === null || row.avgUtilizationPerKey === undefined) {
       return 1;
     }
     const observed = Number(row.keysObserved) || 0;

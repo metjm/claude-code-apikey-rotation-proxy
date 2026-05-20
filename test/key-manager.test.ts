@@ -2166,6 +2166,324 @@ describe("Capacity telemetry", () => {
     expect(unified!.avgUtilizationPerKey!).toBeCloseTo(0.5, 6);
   });
 
+  // Effective fleet headroom: forward-fill + cross-window fold ─────────────
+  //
+  // The dashboard chart needs to reflect 5h headroom honestly even when keys
+  // stop emitting samples (cooldown / weekly exhaustion). Two corrections:
+  //   - forward-fill: a key with persisted utilization (lastSeenAt within the
+  //     bucket's end, resetAt past the bucket's start) but no sample in the
+  //     bucket should still be counted at that utilization.
+  //   - cross-window fold: a key whose 7d window is exhausted counts as 100%
+  //     on the 5h line, because a weekly-blocked key can serve no traffic.
+  //
+  // These tests insert capacity_window_timeseries rows directly so we can pin
+  // bucket placement without juggling now(); persisted state goes through
+  // recordCapacityObservation so the merge logic stays under test too.
+  describe("queryCapacityTimeseries effective fleet utilization", () => {
+    type RowFn = (
+      bucket: string,
+      keyLabel: string,
+      windowName: string,
+      utilizationSum: number,
+      utilizationSamples: number,
+      utilizationMax: number,
+    ) => void;
+
+    function makeRowFn(db: Database): RowFn {
+      return (bucket, keyLabel, windowName, utilizationSum, utilizationSamples, utilizationMax) => {
+        db.run(
+          `INSERT INTO capacity_window_timeseries
+            (bucket, key_label, window_name, samples, allowed_count, warning_count, rejected_count, utilization_sum, utilization_samples, utilization_max)
+            VALUES (?, ?, ?, ?, 0, 0, 0, ?, ?, ?)`,
+          [bucket, keyLabel, windowName, utilizationSamples, utilizationSum, utilizationSamples, utilizationMax],
+        );
+      };
+    }
+
+    // Pick an hour bucket within the last few hours so it falls within the
+    // default query cutoff. Returns the bucket string plus start/end ms.
+    function recentBucket(hoursAgo: number): { bucket: string; startMs: number; endMs: number } {
+      const ref = new Date();
+      const start = new Date(Date.UTC(
+        ref.getUTCFullYear(),
+        ref.getUTCMonth(),
+        ref.getUTCDate(),
+        ref.getUTCHours() - hoursAgo,
+        0, 0, 0,
+      ));
+      const startMs = start.getTime();
+      return {
+        bucket: start.toISOString().slice(0, 13),
+        startMs,
+        endMs: startMs + 60 * 60 * 1000,
+      };
+    }
+
+    test("forward-fills a key with persisted utilization but no sample in the bucket", async () => {
+      // Two-key fleet. Key ff-b has a 5h sample at 50% in bucket B. Key ff-a
+      // has persisted 5h utilization of 100% from before B started and a reset
+      // well past now — it's in active cooldown but emitting no samples. The
+      // effective fleet 5h util should be (1.0 + 0.5) / 2 = 0.75.
+      const km = create();
+      const db = (km as unknown as { db: Database }).db;
+      const row = makeRowFn(db);
+
+      const a = km.addKey(VALID_KEY_1, "ff-a");
+      km.addKey(VALID_KEY_2, "ff-b");
+
+      const B = recentBucket(2);
+      const futureReset = unixMs(Date.now() + 4 * 60 * 60_000);
+
+      km.recordCapacityObservation(a, {
+        seenAt: unixMs(B.startMs - 5 * 60_000),
+        httpStatus: 200,
+        windows: [{
+          windowName: "unified-5h",
+          status: "rejected",
+          utilization: 1.0,
+          resetAt: futureReset,
+        }],
+      });
+      await waitForSave();
+
+      row(B.bucket, "ff-b", "unified-5h", 0.5, 1, 0.5);
+
+      const buckets = km.queryCapacityTimeseries({ hours: 24, resolution: "hour" });
+      const target = buckets.find((b) => b.bucket === B.bucket && b.windowName === "unified-5h");
+      expect(target).toBeDefined();
+      expect(target!.effectiveFleetUtilization!).toBeCloseTo(0.75, 6);
+      expect(target!.keysAccounted).toBe(2);
+      expect(target!.keysObserved).toBe(1);
+    });
+
+    test("forward-fill does not apply past the persisted resetAt", async () => {
+      // We need persisted state whose resetAt is BEFORE the bucket we query.
+      // sanitizeCapacityWindows drops past-resetAt entries at observation
+      // time, so to test the forward-fill bound itself we record the
+      // observation under a faked clock where resetAt looks future, then run
+      // the query under real time. The forward-fill check inside
+      // queryCapacityTimeseries should still refuse to fill T1, since by then
+      // resetAt sits at T1's start.
+      const km = create();
+      const db = (km as unknown as { db: Database }).db;
+      const row = makeRowFn(db);
+
+      const c = km.addKey(VALID_KEY_1, "ff-c");
+      km.addKey(VALID_KEY_2, "ff-d");
+
+      const T1 = recentBucket(1);
+
+      const originalNow = Date.now;
+      Date.now = () => T1.startMs - 60 * 60_000;
+      try {
+        km.recordCapacityObservation(c, {
+          seenAt: unixMs(T1.startMs - 30 * 60_000),
+          httpStatus: 200,
+          windows: [{
+            windowName: "unified-5h",
+            status: "rejected",
+            utilization: 1.0,
+            resetAt: unixMs(T1.startMs),
+          }],
+        });
+        await waitForSave();
+      } finally {
+        Date.now = originalNow;
+      }
+
+      row(T1.bucket, "ff-d", "unified-5h", 0.5, 1, 0.5);
+
+      const buckets = km.queryCapacityTimeseries({ hours: 24, resolution: "hour" });
+      const target = buckets.find((b) => b.bucket === T1.bucket && b.windowName === "unified-5h");
+      expect(target).toBeDefined();
+      // Only ff-d contributes: 0.5 / 2 = 0.25.
+      expect(target!.effectiveFleetUtilization!).toBeCloseTo(0.25, 6);
+      expect(target!.keysAccounted).toBe(1);
+    });
+
+    test("forward-fill does not apply before the persisted lastSeenAt", async () => {
+      // The persisted state was set AFTER the bucket we're asking about — we
+      // can't retroactively claim the key was utilized then. lastSeenAt sits
+      // past T2's end (the observation came in after the bucket closed), so
+      // ff-e must not appear there. resetAt is in the future so the persisted
+      // state survives sanitize and the forward-fill code actually runs.
+      const km = create();
+      const db = (km as unknown as { db: Database }).db;
+      const row = makeRowFn(db);
+
+      const e = km.addKey(VALID_KEY_1, "ff-e");
+      km.addKey(VALID_KEY_2, "ff-f");
+
+      const T2 = recentBucket(3);
+      const futureReset = unixMs(Date.now() + 4 * 60 * 60_000);
+
+      km.recordCapacityObservation(e, {
+        seenAt: unixMs(T2.endMs + 5 * 60_000),
+        httpStatus: 200,
+        windows: [{
+          windowName: "unified-5h",
+          status: "rejected",
+          utilization: 1.0,
+          resetAt: futureReset,
+        }],
+      });
+      await waitForSave();
+
+      row(T2.bucket, "ff-f", "unified-5h", 0.3, 1, 0.3);
+
+      const buckets = km.queryCapacityTimeseries({ hours: 24, resolution: "hour" });
+      const target = buckets.find((b) => b.bucket === T2.bucket && b.windowName === "unified-5h");
+      expect(target).toBeDefined();
+      // Only ff-f counts in T2: 0.3 / 2 = 0.15.
+      expect(target!.effectiveFleetUtilization!).toBeCloseTo(0.15, 6);
+      expect(target!.keysAccounted).toBe(1);
+
+      // Sanity: the more recent bucket where ff-e's persisted state IS active
+      // should pick up the forward-fill. Find a bucket that contains the
+      // observation's lastSeenAt.
+      const liveBucket = buckets.find((b) =>
+        b.windowName === "unified-5h" && b.bucket > T2.bucket && b.effectiveFleetUtilization !== null,
+      );
+      if (liveBucket !== undefined) {
+        expect(liveBucket.effectiveFleetUtilization!).toBeGreaterThan(0);
+      }
+    });
+
+    test("cross-window fold: a 7d-exhausted key counts as 100% on the 5h line", async () => {
+      // xf-a's weekly window is fully consumed. Even if its 5h state looks
+      // healthy on paper (say 30%), the key can serve zero traffic so it
+      // belongs at 100% on the 5h headroom chart. xf-b is healthy.
+      const km = create();
+      const db = (km as unknown as { db: Database }).db;
+      const row = makeRowFn(db);
+
+      const a = km.addKey(VALID_KEY_1, "xf-a");
+      km.addKey(VALID_KEY_2, "xf-b");
+
+      const T = recentBucket(1);
+      const futureReset5h = unixMs(Date.now() + 4 * 60 * 60_000);
+      const futureReset7d = unixMs(Date.now() + 5 * 24 * 60 * 60_000);
+
+      km.recordCapacityObservation(a, {
+        seenAt: unixMs(T.startMs + 10 * 60_000),
+        httpStatus: 200,
+        windows: [
+          {
+            windowName: "unified-7d",
+            status: "rejected",
+            utilization: 1.0,
+            resetAt: futureReset7d,
+          },
+          {
+            windowName: "unified-5h",
+            status: "allowed",
+            utilization: 0.3,
+            resetAt: futureReset5h,
+          },
+        ],
+      });
+      await waitForSave();
+
+      row(T.bucket, "xf-b", "unified-5h", 0.4, 1, 0.4);
+      row(T.bucket, "xf-b", "unified-7d", 0.2, 1, 0.2);
+
+      const buckets = km.queryCapacityTimeseries({ hours: 24, resolution: "hour" });
+      const fiveH = buckets.find((b) => b.bucket === T.bucket && b.windowName === "unified-5h");
+      const sevenD = buckets.find((b) => b.bucket === T.bucket && b.windowName === "unified-7d");
+
+      // 5h line: xf-a folds to 1.0 (not its persisted 0.3), xf-b at 0.4.
+      // Effective fleet util = (1.0 + 0.4) / 2 = 0.70.
+      expect(fiveH).toBeDefined();
+      expect(fiveH!.effectiveFleetUtilization!).toBeCloseTo(0.70, 6);
+
+      // 7d line: xf-a forward-fills at 1.0, xf-b sample at 0.2.
+      // Effective fleet util = (1.0 + 0.2) / 2 = 0.60.
+      expect(sevenD).toBeDefined();
+      expect(sevenD!.effectiveFleetUtilization!).toBeCloseTo(0.60, 6);
+    });
+
+    test("a sample for the same (key, window, bucket) overrides forward-fill — no double-count", async () => {
+      // ov-a has both a 20% sample in bucket T and persisted 95% utilization.
+      // The sample is the more recent truth in this bucket; we must not stack
+      // them. Effective fleet util in a 1-key fleet = 0.20.
+      const km = create();
+      const db = (km as unknown as { db: Database }).db;
+      const row = makeRowFn(db);
+
+      const a = km.addKey(VALID_KEY_1, "ov-a");
+
+      const T = recentBucket(1);
+      const futureReset = unixMs(Date.now() + 4 * 60 * 60_000);
+
+      km.recordCapacityObservation(a, {
+        seenAt: unixMs(T.startMs - 5 * 60_000),
+        httpStatus: 200,
+        windows: [{
+          windowName: "unified-5h",
+          status: "rejected",
+          utilization: 0.95,
+          resetAt: futureReset,
+        }],
+      });
+      await waitForSave();
+
+      row(T.bucket, "ov-a", "unified-5h", 0.20, 1, 0.20);
+
+      const buckets = km.queryCapacityTimeseries({ hours: 24, resolution: "hour" });
+      const target = buckets.find((b) => b.bucket === T.bucket && b.windowName === "unified-5h");
+      expect(target).toBeDefined();
+      expect(target!.effectiveFleetUtilization!).toBeCloseTo(0.20, 6);
+      expect(target!.keysAccounted).toBe(1);
+    });
+
+    test("unobserved fleet members count as 0% utilization", async () => {
+      // Four-key fleet, only u-a has telemetry at 80%. The other three never
+      // emitted samples and have no persisted state. They count as 0% util
+      // (unknown = full headroom), so effective fleet util = 0.80 / 4 = 0.20.
+      const km = create();
+      const db = (km as unknown as { db: Database }).db;
+      const row = makeRowFn(db);
+
+      km.addKey(VALID_KEY_1, "u-a");
+      km.addKey(VALID_KEY_2, "u-b");
+      km.addKey(VALID_KEY_3, "u-c");
+      km.addKey("sk-ant-api03-dddddddddddddddddddddddddddddddddd", "u-d");
+
+      const T = recentBucket(1);
+      row(T.bucket, "u-a", "unified-5h", 0.80, 1, 0.80);
+
+      const buckets = km.queryCapacityTimeseries({ hours: 24, resolution: "hour" });
+      const target = buckets.find((b) => b.bucket === T.bucket && b.windowName === "unified-5h");
+      expect(target).toBeDefined();
+      expect(target!.effectiveFleetUtilization!).toBeCloseTo(0.20, 6);
+      expect(target!.keysAccounted).toBe(1);
+    });
+
+    test("deleted keys with leftover sample rows do not contribute to the live fleet", async () => {
+      // History of a now-removed key is still in capacity_window_timeseries.
+      // It must not silently inflate the apparent fleet size or contribute a
+      // ghost sample.
+      const km = create();
+      const db = (km as unknown as { db: Database }).db;
+      const row = makeRowFn(db);
+
+      km.addKey(VALID_KEY_1, "live-a");
+
+      const T = recentBucket(1);
+      row(T.bucket, "live-a", "unified-5h", 0.50, 1, 0.50);
+      row(T.bucket, "removed-ghost", "unified-5h", 0.90, 1, 0.90);
+
+      const buckets = km.queryCapacityTimeseries({ hours: 24, resolution: "hour" });
+      const target = buckets.find((b) => b.bucket === T.bucket && b.windowName === "unified-5h");
+      expect(target).toBeDefined();
+      // The ghost sample is still reflected in the raw avgUtilization (DB sum
+      // is what it is), but effective fleet util is computed over the LIVE
+      // roster — so it sees only live-a at 0.50, divided by fleetSize=1.
+      expect(target!.effectiveFleetUtilization!).toBeCloseTo(0.50, 6);
+      expect(target!.keysAccounted).toBe(1);
+    });
+  });
+
   test("getNextAvailableKey ignores capacity analytics and keeps the original sticky selection logic", () => {
     const km = create();
     const warning = km.addKey(VALID_KEY_1, "warning-first");

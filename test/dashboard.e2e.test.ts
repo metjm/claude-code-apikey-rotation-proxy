@@ -563,6 +563,109 @@ describe("Dashboard fleet-pressure gradient (real browser)", () => {
     }
   }, 60_000);
 
+  test("Capacity Headroom chart drops a 7d-exhausted key onto the 5h line via the API's effectiveFleetUtilization", async () => {
+    // Regression guard for the original report: a key that has burned through
+    // its weekly quota stops sending samples (cooldown), and naive math then
+    // boosts apparent 5h headroom because the exhausted key just disappears.
+    // Server-computed effectiveFleetUtilization counts a 7d-exhausted key as
+    // 100% on the 5h line too, so the chart reflects the real ceiling.
+    const dataDir = makeTempDir();
+    const upstream = startMockUpstream();
+    const proxy = startProxy({ dataDir, upstream: upstream.url, adminToken: ADMIN_TOKEN });
+
+    try {
+      const fried = proxy.km.addKey(VALID_KEY_1, "headroom-fried");
+      const healthy = proxy.km.addKey(VALID_KEY_2, "headroom-healthy");
+
+      const resetAt5h = Date.now() + 60 * 60 * 1000;
+      const resetAt7d = Date.now() + 3 * 24 * 60 * 60 * 1000;
+
+      // fried: 7d cap reached (util=1.0). 5h sample looks healthy (0.2) but
+      // shouldn't matter — the key is weekly-blocked.
+      proxy.km.recordCapacityObservation(fried, {
+        seenAt: unixMs(Date.now()),
+        httpStatus: 200,
+        windows: [
+          { windowName: "unified-5h", status: "allowed", utilization: 0.2, resetAt: unixMs(resetAt5h) },
+          { windowName: "unified-7d", status: "allowed_warning", utilization: 1.0, resetAt: unixMs(resetAt7d) },
+        ],
+      });
+      proxy.km.recordCapacityObservation(healthy, {
+        seenAt: unixMs(Date.now()),
+        httpStatus: 200,
+        windows: [
+          { windowName: "unified-5h", status: "allowed", utilization: 0.4, resetAt: unixMs(resetAt5h) },
+          { windowName: "unified-7d", status: "allowed", utilization: 0.4, resetAt: unixMs(resetAt7d) },
+        ],
+      });
+
+      proxy.stop();
+      const reloaded = startProxy({ dataDir, upstream: upstream.url, adminToken: ADMIN_TOKEN });
+      try {
+        const tsRes = await fetch(`${reloaded.url}/admin/capacity/timeseries?hours=24&resolution=hour`, {
+          headers: { Authorization: `Bearer ${ADMIN_TOKEN}` },
+        });
+        expect(tsRes.status).toBe(200);
+        const tsBody = await tsRes.json() as {
+          fleetSize: number;
+          buckets: Array<{
+            windowName: string;
+            effectiveFleetUtilization: number | null;
+            keysAccounted: number;
+          }>;
+        };
+        expect(tsBody.fleetSize).toBe(2);
+
+        const fiveH = tsBody.buckets.find((b) => b.windowName === "unified-5h");
+        const sevenD = tsBody.buckets.find((b) => b.windowName === "unified-7d");
+        expect(fiveH).toBeDefined();
+        expect(sevenD).toBeDefined();
+
+        // 5h with cross-fold: fried counts as 1.0 (weekly-blocked), healthy 0.4.
+        // Effective fleet util = (1.0 + 0.4) / 2 = 0.70 → headroom = 0.30.
+        expect(fiveH!.effectiveFleetUtilization!).toBeCloseTo(0.70, 6);
+        // 7d: fried 1.0, healthy 0.4 → 0.70 → headroom = 0.30.
+        expect(sevenD!.effectiveFleetUtilization!).toBeCloseTo(0.70, 6);
+        expect(fiveH!.keysAccounted).toBe(2);
+
+        const page = await openDashboard(browser, reloaded.url, ADMIN_TOKEN);
+        await page.waitForSelector("#chart-capacity", { timeout: 15_000 });
+
+        const chartShape = await page.waitForFunction(
+          () => {
+            const canvas = document.getElementById("chart-capacity");
+            if (!canvas) return false;
+            const chart = (window as unknown as { Chart: { getChart: (c: Element) => unknown } }).Chart.getChart(canvas);
+            if (!chart) return false;
+            const datasets = (chart as { data: { datasets: { label: string; data: number[] }[] } }).data.datasets;
+            if (!datasets || datasets.length === 0) return false;
+            return datasets.map((d) => ({ label: d.label, data: Array.from(d.data) }));
+          },
+          { timeout: 15_000 },
+        ).then((handle) => handle.jsonValue() as Promise<Array<{ label: string; data: number[] }>>);
+
+        const ds5h = chartShape.find((d) => d.label.toLowerCase().includes("5h"));
+        expect(ds5h).toBeDefined();
+
+        // The 5h line in the data-bearing bucket must show 0.30 headroom
+        // (cross-fold from 7d), NOT 0.80 (which is what a naïve 1 - 0.4*1/2
+        // calculation that ignored the exhausted key would produce).
+        const expected5h = 0.30;
+        const plottedExpected = ds5h!.data.find((v) => Math.abs(v - expected5h) < 1e-6);
+        expect(plottedExpected).toBeDefined();
+        const wrongValue = ds5h!.data.find((v) => Math.abs(v - 0.80) < 1e-6);
+        expect(wrongValue).toBeUndefined();
+
+        await page.close();
+      } finally {
+        reloaded.stop();
+      }
+    } finally {
+      upstream.stop();
+      cleanupTempDir(dataDir);
+    }
+  }, 60_000);
+
   test("serves /admin/capacity/forecast with 168 slots and reflects Tuesday 2pm UTC spike", async () => {
     // Pure API assertion guarding the data contract the dashboard relies on.
     const dataDir = makeTempDir();

@@ -107,20 +107,6 @@ interface CapacityWindowRow {
   last_seen_at: number | null;
 }
 
-interface CapacityTsRow {
-  b: string;
-  window_name: string;
-  samples: number;
-  allowed_count: number;
-  warning_count: number;
-  rejected_count: number;
-  utilization_sum: number;
-  utilization_samples: number;
-  utilization_max: number;
-  per_key_avg_sum: number;
-  keys_observed: number;
-}
-
 interface ConversationAffinityRow {
   conversation_key: string;
   key: string;
@@ -1784,59 +1770,223 @@ export class KeyManager {
       params.push(opts.keyLabel);
     }
 
-    // Two-level aggregation:
-    //   inner — per (bucket, key, window): the key's average utilization
-    //           in that bucket (sample-weighted, but only within one key)
-    //   outer — per (bucket, window): sum of those per-key averages and a
-    //           distinct-key count, so the caller can derive a per-key
-    //           fleet mean that treats every key as one equal capacity unit
-    // We also pass through the simpler sample-weighted totals for back-compat.
-    const sql = `
-      SELECT pre.b AS b,
-        pre.window_name AS window_name,
-        SUM(pre.samples) AS samples,
-        SUM(pre.allowed_count) AS allowed_count,
-        SUM(pre.warning_count) AS warning_count,
-        SUM(pre.rejected_count) AS rejected_count,
-        SUM(pre.utilization_sum) AS utilization_sum,
-        SUM(pre.utilization_samples) AS utilization_samples,
-        MAX(pre.utilization_max) AS utilization_max,
-        SUM(CASE WHEN pre.utilization_samples > 0
-                 THEN pre.utilization_sum * 1.0 / pre.utilization_samples
-                 ELSE 0 END) AS per_key_avg_sum,
-        SUM(CASE WHEN pre.utilization_samples > 0 THEN 1 ELSE 0 END) AS keys_observed
-      FROM (
-        SELECT ${groupExpr} AS b,
-          key_label,
-          window_name,
-          SUM(samples) AS samples,
-          SUM(allowed_count) AS allowed_count,
-          SUM(warning_count) AS warning_count,
-          SUM(rejected_count) AS rejected_count,
-          SUM(utilization_sum) AS utilization_sum,
-          SUM(utilization_samples) AS utilization_samples,
-          MAX(utilization_max) AS utilization_max
-        FROM capacity_window_timeseries
-        WHERE ${conditions.join(" AND ")}
-        GROUP BY b, key_label, window_name
-      ) AS pre
-      GROUP BY pre.b, pre.window_name
-      ORDER BY pre.b, pre.window_name
+    // Pull per-(bucket, key, window) aggregates rather than per-(bucket, window).
+    // We need each key's contribution individually so we can:
+    //  - forward-fill: when a key has persisted utilization but no sample in
+    //    this bucket (typical for a key in cooldown), still count it against
+    //    fleet capacity. Otherwise an idle exhausted key silently disappears
+    //    from the chart and boosts apparent headroom.
+    //  - cross-window fold: a key whose 7d window is exhausted can't serve
+    //    any traffic, so its 5h contribution must be 100% regardless of what
+    //    the 5h sample says.
+    const perKeySql = `
+      SELECT ${groupExpr} AS b,
+        key_label,
+        window_name,
+        SUM(samples) AS samples,
+        SUM(allowed_count) AS allowed_count,
+        SUM(warning_count) AS warning_count,
+        SUM(rejected_count) AS rejected_count,
+        SUM(utilization_sum) AS utilization_sum,
+        SUM(utilization_samples) AS utilization_samples,
+        MAX(utilization_max) AS utilization_max
+      FROM capacity_window_timeseries
+      WHERE ${conditions.join(" AND ")}
+      GROUP BY b, key_label, window_name
+      ORDER BY b
     `;
 
-    const rows = this.db.query(sql).all(...params) as CapacityTsRow[];
-    return rows.map((row) => ({
-      bucket: row.b,
-      windowName: row.window_name,
-      samples: row.samples,
-      allowed: row.allowed_count,
-      warning: row.warning_count,
-      rejected: row.rejected_count,
-      avgUtilization: row.utilization_samples > 0 ? row.utilization_sum / row.utilization_samples : null,
-      maxUtilization: row.utilization_samples > 0 ? row.utilization_max : null,
-      avgUtilizationPerKey: row.keys_observed > 0 ? row.per_key_avg_sum / row.keys_observed : null,
-      keysObserved: row.keys_observed,
-    }));
+    const perKeyRows = this.db.query(perKeySql).all(...params) as Array<{
+      b: string;
+      key_label: string;
+      window_name: string;
+      samples: number;
+      allowed_count: number;
+      warning_count: number;
+      rejected_count: number;
+      utilization_sum: number;
+      utilization_samples: number;
+      utilization_max: number;
+    }>;
+
+    // bucket → window → key → per-key avg utilization (from samples).
+    const sampledUtil = new Map<string, Map<string, Map<string, number>>>();
+    // bucket → window → aggregate (existing dashboard fields).
+    type WindowAgg = {
+      samples: number;
+      allowed: number;
+      warning: number;
+      rejected: number;
+      utilizationSum: number;
+      utilizationSamples: number;
+      utilizationMax: number;
+    };
+    const aggregates = new Map<string, Map<string, WindowAgg>>();
+    const allBuckets = new Set<string>();
+    const windowSet = new Set<string>();
+
+    for (const row of perKeyRows) {
+      allBuckets.add(row.b);
+      windowSet.add(row.window_name);
+
+      const perKeyUtil = row.utilization_samples > 0
+        ? row.utilization_sum / row.utilization_samples
+        : null;
+      if (perKeyUtil !== null) {
+        let bWin = sampledUtil.get(row.b);
+        if (bWin === undefined) { bWin = new Map(); sampledUtil.set(row.b, bWin); }
+        let kMap = bWin.get(row.window_name);
+        if (kMap === undefined) { kMap = new Map(); bWin.set(row.window_name, kMap); }
+        kMap.set(row.key_label, perKeyUtil);
+      }
+
+      let aggBucket = aggregates.get(row.b);
+      if (aggBucket === undefined) { aggBucket = new Map(); aggregates.set(row.b, aggBucket); }
+      const agg = aggBucket.get(row.window_name) ?? {
+        samples: 0, allowed: 0, warning: 0, rejected: 0,
+        utilizationSum: 0, utilizationSamples: 0, utilizationMax: 0,
+      };
+      agg.samples += row.samples;
+      agg.allowed += row.allowed_count;
+      agg.warning += row.warning_count;
+      agg.rejected += row.rejected_count;
+      agg.utilizationSum += row.utilization_sum;
+      agg.utilizationSamples += row.utilization_samples;
+      agg.utilizationMax = Math.max(agg.utilizationMax, row.utilization_max);
+      aggBucket.set(row.window_name, agg);
+    }
+
+    // Persisted per-(key, window) state for forward-fill and the cross-window
+    // fold. We only consider keys still on the roster — a deleted key with
+    // leftover sample rows should not also pick up forward-fill from a
+    // persisted state that no longer exists.
+    type PersistedWindow = {
+      utilization: number | null;
+      resetAt: number | null;
+      lastSeenAt: number | null;
+    };
+    const persistedByKeyWindow = new Map<string, Map<string, PersistedWindow>>();
+    const fleetKeyLabels = new Set<string>();
+    for (const entry of this.keys) {
+      if (opts.keyLabel !== undefined && entry.label !== opts.keyLabel) continue;
+      fleetKeyLabels.add(entry.label);
+      const windowMap = new Map<string, PersistedWindow>();
+      for (const window of entry.capacity.windows) {
+        if (!PRIMARY_CAPACITY_WINDOW_NAMES.has(window.windowName)) continue;
+        windowMap.set(window.windowName, {
+          utilization: window.utilization,
+          resetAt: window.resetAt,
+          lastSeenAt: window.lastSeenAt,
+        });
+        windowSet.add(window.windowName);
+      }
+      persistedByKeyWindow.set(entry.label, windowMap);
+    }
+
+    const fleetSize = opts.keyLabel === undefined
+      ? this.keys.length
+      : (fleetKeyLabels.has(opts.keyLabel) ? 1 : 0);
+
+    // Forward-fill rule: persisted state applies to a bucket iff the
+    // observation existed by the end of the bucket (lastSeenAt < bucketEnd)
+    // and the cycle hadn't yet reset by the start of the bucket
+    // (resetAt is null or strictly later than bucketStart). A bucket-shaped
+    // sample for the same (key, window) overrides forward-fill.
+    const forwardFillUtil = (
+      bucket: string,
+      keyLabel: string,
+      windowName: string,
+      bucketRange: { startMs: number; endMs: number },
+    ): number | null => {
+      const sampled = sampledUtil.get(bucket)?.get(windowName)?.get(keyLabel);
+      if (sampled !== undefined) return sampled;
+      const persisted = persistedByKeyWindow.get(keyLabel)?.get(windowName);
+      if (persisted === undefined) return null;
+      if (persisted.utilization === null) return null;
+      if (persisted.lastSeenAt === null) return null;
+      if (persisted.lastSeenAt >= bucketRange.endMs) return null;
+      if (persisted.resetAt !== null && persisted.resetAt <= bucketRange.startMs) return null;
+      return persisted.utilization;
+    };
+
+    const bucketRangeOf = (bucket: string): { startMs: number; endMs: number } => {
+      if (resolution === "day") {
+        const y = Number(bucket.slice(0, 4));
+        const m = Number(bucket.slice(5, 7));
+        const d = Number(bucket.slice(8, 10));
+        const startMs = Date.UTC(y, m - 1, d, 0, 0, 0, 0);
+        return { startMs, endMs: startMs + 24 * 60 * 60 * 1000 };
+      }
+      const startMs = new Date(bucket + ":00:00.000Z").getTime();
+      return { startMs, endMs: startMs + 60 * 60 * 1000 };
+    };
+
+    const result: CapacityTimeseriesBucket[] = [];
+    const sortedBuckets = [...allBuckets].sort();
+    const sortedWindows = [...windowSet].sort();
+
+    for (const bucket of sortedBuckets) {
+      const range = bucketRangeOf(bucket);
+
+      const weeklyExhausted = new Set<string>();
+      for (const keyLabel of fleetKeyLabels) {
+        const weeklyUtil = forwardFillUtil(bucket, keyLabel, "unified-7d", range);
+        if (weeklyUtil !== null && weeklyUtil >= 1.0) weeklyExhausted.add(keyLabel);
+      }
+
+      for (const windowName of sortedWindows) {
+        const agg = aggregates.get(bucket)?.get(windowName);
+        const sampledForWindow = sampledUtil.get(bucket)?.get(windowName);
+        const observedKeyCount = sampledForWindow?.size ?? 0;
+
+        let sumEffective = 0;
+        let keysAccounted = 0;
+        for (const keyLabel of fleetKeyLabels) {
+          let effective = forwardFillUtil(bucket, keyLabel, windowName, range);
+          if (windowName === "unified-5h" && weeklyExhausted.has(keyLabel)) {
+            effective = 1.0;
+          }
+          if (effective !== null) {
+            sumEffective += effective;
+            keysAccounted += 1;
+          }
+        }
+        const effectiveFleetUtilization = fleetSize > 0
+          ? Math.max(0, Math.min(1, sumEffective / fleetSize))
+          : null;
+
+        // Suppress emitting a bucket+window row that conveys nothing — no
+        // samples AND no key forward-filled into it. Otherwise the response
+        // grows quadratically with bucket count for windows that never had
+        // any telemetry in range.
+        if (agg === undefined && keysAccounted === 0) continue;
+
+        const avgUtilizationPerKey = (sampledForWindow !== undefined && sampledForWindow.size > 0)
+          ? [...sampledForWindow.values()].reduce((s, v) => s + v, 0) / sampledForWindow.size
+          : null;
+
+        result.push({
+          bucket,
+          windowName,
+          samples: agg?.samples ?? 0,
+          allowed: agg?.allowed ?? 0,
+          warning: agg?.warning ?? 0,
+          rejected: agg?.rejected ?? 0,
+          avgUtilization: (agg !== undefined && agg.utilizationSamples > 0)
+            ? agg.utilizationSum / agg.utilizationSamples
+            : null,
+          maxUtilization: (agg !== undefined && agg.utilizationSamples > 0)
+            ? agg.utilizationMax
+            : null,
+          avgUtilizationPerKey,
+          keysObserved: observedKeyCount,
+          effectiveFleetUtilization,
+          keysAccounted,
+        });
+      }
+    }
+
+    return result;
   }
 
   /** Seasonal request-volume factor table — one entry per (dow, hour) slot
