@@ -32,6 +32,7 @@ export function loadConfig(): ProxyConfig {
     dataDir: env("DATA_DIR") ?? join(process.cwd(), "data"),
     maxRetriesPerRequest: envInt("MAX_RETRIES", 10),
     firstChunkTimeoutMs: envInt("FIRST_CHUNK_TIMEOUT_MS", 16_000),
+    firstChunkTimeoutMsContext1m: envInt("FIRST_CHUNK_TIMEOUT_MS_CONTEXT_1M", 120_000),
     streamIdleTimeoutMs: envInt("STREAM_IDLE_TIMEOUT_MS", 120_000),
     maxFirstChunkRetries: envInt("MAX_FIRST_CHUNK_RETRIES", 2),
     webhookUrl: env("WEBHOOK_URL") ?? null,

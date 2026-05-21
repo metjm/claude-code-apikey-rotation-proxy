@@ -65,6 +65,7 @@ function startProxy(opts: {
     dataDir: opts.dataDir,
     maxRetriesPerRequest: 10,
     firstChunkTimeoutMs: 16_000,
+    firstChunkTimeoutMsContext1m: 120_000,
     maxFirstChunkRetries: 2,
     webhookUrl: null,
   };

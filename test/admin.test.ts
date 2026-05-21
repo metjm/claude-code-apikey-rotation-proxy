@@ -53,6 +53,7 @@ function makeConfig(overrides?: Partial<ProxyConfig>): ProxyConfig {
     dataDir: "/tmp",
     maxRetriesPerRequest: 3,
     firstChunkTimeoutMs: 16_000,
+    firstChunkTimeoutMsContext1m: 120_000,
     streamIdleTimeoutMs: 120_000,
     maxFirstChunkRetries: 2,
     webhookUrl: null,

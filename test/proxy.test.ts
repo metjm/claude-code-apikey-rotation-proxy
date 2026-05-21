@@ -80,6 +80,7 @@ function makeConfig(upstream: string, overrides?: Partial<ProxyConfig>): ProxyCo
     dataDir: "/tmp",
     maxRetriesPerRequest: 10,
     firstChunkTimeoutMs: 16_000,
+    firstChunkTimeoutMsContext1m: 120_000,
     streamIdleTimeoutMs: 120_000,
     maxFirstChunkRetries: 2,
     webhookUrl: null,
@@ -2408,6 +2409,80 @@ describe("Token Tracking - Streaming (SSE)", () => {
       const [keyA, keyB] = km.listKeys();
       expect(keyA!.stats.errors).toBe(2);
       expect(keyB!.stats.errors).toBe(0);
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
+  test("requests carrying context-1m beta wait for firstChunkTimeoutMsContext1m, not firstChunkTimeoutMs", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(async () => {
+      const encoder = new TextEncoder();
+      let cancelled = false;
+      return new Response(new ReadableStream({
+        start(controller) {
+          setTimeout(() => {
+            if (cancelled) return;
+            controller.enqueue(encoder.encode('data: {"type":"message_start","message":{"usage":{"input_tokens":1}}}\n\n'));
+            controller.enqueue(encoder.encode('data: {"type":"message_delta","usage":{"output_tokens":1}}\n\n'));
+            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+            controller.close();
+          }, 120);
+        },
+        cancel() {
+          cancelled = true;
+        },
+      }), {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      });
+    });
+
+    try {
+      const config = makeConfig("http://mocked-upstream.local", {
+        firstChunkTimeoutMs: 20,
+        firstChunkTimeoutMsContext1m: 5_000,
+        maxFirstChunkRetries: 0,
+      });
+
+      const withContext1m = await proxyRequest(
+        makeRequest("/v1/messages", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "anthropic-beta": "claude-code-20250219,context-1m-2025-08-07,interleaved-thinking-2025-05-14",
+          },
+          body: JSON.stringify({ stream: true, messages: [] }),
+        }),
+        km,
+        config,
+        st,
+      );
+      expect(withContext1m.kind).toBe("success");
+      if (withContext1m.kind === "success") {
+        await withContext1m.response.text();
+      }
+
+      const withoutContext1m = await proxyRequest(
+        makeRequest("/v1/messages", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "anthropic-beta": "claude-code-20250219,interleaved-thinking-2025-05-14",
+          },
+          body: JSON.stringify({ stream: true, messages: [] }),
+        }),
+        km,
+        config,
+        st,
+      );
+      expect(withoutContext1m.kind).toBe("error");
+      if (withoutContext1m.kind === "error") {
+        expect(withoutContext1m.status).toBe(504);
+        expect(JSON.parse(withoutContext1m.body).error.message).toContain("20ms");
+      }
     } finally {
       fetchSpy.mockRestore();
     }

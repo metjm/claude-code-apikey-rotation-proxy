@@ -242,6 +242,7 @@ export interface ProxyConfig {
   readonly dataDir: string;
   readonly maxRetriesPerRequest: number;
   readonly firstChunkTimeoutMs: number;
+  readonly firstChunkTimeoutMsContext1m: number;
   readonly streamIdleTimeoutMs: number;
   readonly maxFirstChunkRetries: number;
   readonly webhookUrl: string | null;

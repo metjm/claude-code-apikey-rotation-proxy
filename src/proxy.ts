@@ -145,6 +145,10 @@ type ActiveStreamState = {
 
 type BufferedRequestBody = Uint8Array | null;
 
+function requestUsesContext1m(headers: Headers): boolean {
+  return (headers.get("anthropic-beta") ?? "").includes("context-1m");
+}
+
 function getStreamReader(source: ReadableStream<Uint8Array>) {
   return source.getReader();
 }
@@ -322,6 +326,10 @@ export async function proxyRequest(
     });
   }
 
+  const requestFirstChunkTimeoutMs = requestUsesContext1m(req.headers)
+    ? config.firstChunkTimeoutMsContext1m
+    : config.firstChunkTimeoutMs;
+
   let attempts = 0;
   let firstChunkRetries = 0;
   let sawRateLimit = false;
@@ -417,7 +425,7 @@ export async function proxyRequest(
       }
       if (lastStreamStartFailure !== null && !sawRateLimit) {
         if (proxyUser) keyManager.recordTokenError(proxyUser);
-        return firstChunkFailureResult(lastStreamStartFailure, config.firstChunkTimeoutMs);
+        return firstChunkFailureResult(lastStreamStartFailure, requestFirstChunkTimeoutMs);
       }
       if (proxyUser) keyManager.recordTokenError(proxyUser);
       return allExhaustedResult(keyManager);
@@ -808,7 +816,7 @@ export async function proxyRequest(
       }
       const firstChunk = await waitForFirstStreamChunk(
         upstream.body,
-        config.firstChunkTimeoutMs,
+        requestFirstChunkTimeoutMs,
         abortController,
       );
       if (firstChunk.kind === "retry") {
@@ -845,7 +853,7 @@ export async function proxyRequest(
           sessionId,
           conversationKey,
           durationMs: Date.now() - fetchStartedAt,
-          firstChunkTimeoutMs: config.firstChunkTimeoutMs,
+          firstChunkTimeoutMs: requestFirstChunkTimeoutMs,
           maxFirstChunkRetries: config.maxFirstChunkRetries,
           firstChunkRetries,
           retryStrategy: "sticky_same_key_unless_unavailable",
@@ -864,13 +872,13 @@ export async function proxyRequest(
           attempt: attempts,
           traceId,
           error: firstChunk.reason,
-          firstChunkTimeoutMs: config.firstChunkTimeoutMs,
+          firstChunkTimeoutMs: requestFirstChunkTimeoutMs,
           firstChunkRetries,
         }, keyManager.listKeys());
 
         if (firstChunkRetries > config.maxFirstChunkRetries) {
           if (proxyUser) keyManager.recordTokenError(proxyUser);
-          return firstChunkFailureResult(lastStreamStartFailure, config.firstChunkTimeoutMs);
+          return firstChunkFailureResult(lastStreamStartFailure, requestFirstChunkTimeoutMs);
         }
         continue;
       }
@@ -914,7 +922,7 @@ export async function proxyRequest(
 
   if (lastStreamStartFailure !== null && !sawRateLimit) {
     if (proxyUser) keyManager.recordTokenError(proxyUser);
-    return firstChunkFailureResult(lastStreamStartFailure, config.firstChunkTimeoutMs);
+    return firstChunkFailureResult(lastStreamStartFailure, requestFirstChunkTimeoutMs);
   }
 
   if (proxyUser) keyManager.recordTokenError(proxyUser);

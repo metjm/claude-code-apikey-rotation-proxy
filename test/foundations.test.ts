@@ -265,6 +265,10 @@ describe("config", () => {
       expect(loadConfig().firstChunkTimeoutMs).toBe(16_000);
     });
 
+    test("firstChunkTimeoutMsContext1m defaults to 120000", () => {
+      expect(loadConfig().firstChunkTimeoutMsContext1m).toBe(120_000);
+    });
+
     test("maxFirstChunkRetries defaults to 2", () => {
       expect(loadConfig().maxFirstChunkRetries).toBe(2);
     });
@@ -305,6 +309,11 @@ describe("config", () => {
     test("FIRST_CHUNK_TIMEOUT_MS is respected", () => {
       process.env["FIRST_CHUNK_TIMEOUT_MS"] = "2500";
       expect(loadConfig().firstChunkTimeoutMs).toBe(2500);
+    });
+
+    test("FIRST_CHUNK_TIMEOUT_MS_CONTEXT_1M is respected", () => {
+      process.env["FIRST_CHUNK_TIMEOUT_MS_CONTEXT_1M"] = "180000";
+      expect(loadConfig().firstChunkTimeoutMsContext1m).toBe(180_000);
     });
 
     test("STREAM_IDLE_TIMEOUT_MS is respected", () => {

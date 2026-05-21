@@ -27,6 +27,7 @@ function makeConfig(dataDir: string, adminToken: string | null): ProxyConfig {
     dataDir,
     maxRetriesPerRequest: 3,
     firstChunkTimeoutMs: 16_000,
+    firstChunkTimeoutMsContext1m: 120_000,
     streamIdleTimeoutMs: 120_000,
     maxFirstChunkRetries: 2,
     webhookUrl: null,
