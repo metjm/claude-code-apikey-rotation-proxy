@@ -261,8 +261,8 @@ describe("config", () => {
       expect(loadConfig().maxRetriesPerRequest).toBe(10);
     });
 
-    test("firstChunkTimeoutMs defaults to 16000", () => {
-      expect(loadConfig().firstChunkTimeoutMs).toBe(16_000);
+    test("firstChunkTimeoutMs defaults to 45000", () => {
+      expect(loadConfig().firstChunkTimeoutMs).toBe(45_000);
     });
 
     test("firstChunkTimeoutMsContext1m defaults to 120000", () => {

@@ -36,7 +36,7 @@ incoming `anthropic-beta` header:
 - Header contains `context-1m` → `config.firstChunkTimeoutMsContext1m`
   (env `FIRST_CHUNK_TIMEOUT_MS_CONTEXT_1M`, default **120 000 ms**).
 - Otherwise → `config.firstChunkTimeoutMs`
-  (env `FIRST_CHUNK_TIMEOUT_MS`, default **16 000 ms**).
+  (env `FIRST_CHUNK_TIMEOUT_MS`, default **45 000 ms**).
 
 The chosen value is used for the abandon deadline, the failure-result
 message, and all retry-diagnostic log entries within the same request, so
