@@ -1037,15 +1037,19 @@ describe("Dashboard sessions cell (Vue render)", () => {
         btn.click();
       }, sessionId);
 
-      // The next routing decision for this session should land on a key with a
-      // different label, and affinity should hit (the new key is sticky).
-      await page.waitForFunction(
-        (label: string) => {
-          return new Promise((resolve) => setTimeout(() => resolve(true), 200));
-        },
-        { timeout: 2_000 },
-        originalKeyLabel,
-      ).catch(() => {});
+      await page.waitForSelector(".picker-overlay .picker-row:not(.disabled)", { timeout: 5_000 });
+      await page.evaluate((sid: string, fromLabel: string) => {
+        const group = [...document.querySelectorAll(".session-group")].find(
+          (el) => el.querySelector(".cell-id")?.getAttribute("title") === sid,
+        );
+        const rows = [...(group?.querySelectorAll(".picker-overlay .picker-row:not(.disabled)") ?? [])];
+        const target = rows.find((r) => (r.querySelector(".picker-label")?.textContent ?? "").trim() !== fromLabel)
+          ?? rows[0];
+        if (!target) throw new Error("no picker row available");
+        (target as HTMLElement).click();
+      }, sessionId, originalKeyLabel);
+
+      await page.waitForFunction(() => !document.querySelector(".picker-overlay"), { timeout: 2_000 });
 
       const after = proxy.km.getKeyForConversation(
         `till@trainly:${sessionId}:${hash}`, sessionId,

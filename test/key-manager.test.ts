@@ -667,6 +667,82 @@ describe("Key Selection", () => {
     const result = km.reassignSessionAffinity("session-x");
     expect(result).toEqual({ error: "no_other_key_available" });
   });
+
+  test("reassignSessionAffinity() moves session to a specific masked target when provided", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "a");
+    km.addKey(VALID_KEY_2, "b");
+    km.addKey(VALID_KEY_3, "c");
+
+    const initial = km.getKeyForConversation(
+      "user-1:session-x:1111111111111111", "session-x",
+    );
+    const initialKey = initial.entry!.key;
+    const target = km.listKeys().find((k) =>
+      (k.label === "a" && initialKey !== VALID_KEY_1)
+      || (k.label === "b" && initialKey !== VALID_KEY_2)
+      || (k.label === "c" && initialKey !== VALID_KEY_3),
+    )!;
+
+    const result = km.reassignSessionAffinity("session-x", target.maskedKey);
+    expect("error" in result).toBe(false);
+    if ("error" in result) return;
+    expect(result.toMaskedKey).toBe(target.maskedKey);
+    expect(result.toKeyLabel).toBe(target.label);
+
+    const after = km.getKeyForConversation(
+      "user-1:session-x:1111111111111111", "session-x",
+    );
+    expect(after.entry?.key).not.toBe(initialKey);
+    expect(after.affinityHit).toBe(true);
+  });
+
+  test("reassignSessionAffinity() returns target_unknown for a masked key that doesn't exist", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "a");
+    km.addKey(VALID_KEY_2, "b");
+    km.getKeyForConversation("user-1:session-x:1111111111111111", "session-x");
+
+    const result = km.reassignSessionAffinity("session-x", "sk-ant-xxx...nope");
+    expect(result).toEqual({ error: "target_unknown" });
+  });
+
+  test("reassignSessionAffinity() returns target_same_as_current when target is the pinned key", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "a");
+    km.addKey(VALID_KEY_2, "b");
+
+    const initial = km.getKeyForConversation(
+      "user-1:session-x:1111111111111111", "session-x",
+    );
+    const initialKey = initial.entry!.key;
+    const currentMasked = km.listKeys().find(
+      (k) => (k.label === "a" && initialKey === VALID_KEY_1)
+        || (k.label === "b" && initialKey === VALID_KEY_2),
+    )!.maskedKey;
+
+    const result = km.reassignSessionAffinity("session-x", currentMasked);
+    expect(result).toEqual({ error: "target_same_as_current" });
+  });
+
+  test("reassignSessionAffinity() returns target_unavailable when chosen key is in cooldown", () => {
+    const km = create();
+    km.addKey(VALID_KEY_1, "a");
+    const b = km.addKey(VALID_KEY_2, "b");
+
+    const initial = km.getKeyForConversation(
+      "user-1:session-x:1111111111111111", "session-x",
+    );
+
+    const targetEntry = initial.entry!.key === VALID_KEY_2
+      ? km.addKey(VALID_KEY_3, "c-cooldown")
+      : b;
+    km.recordRateLimit(targetEntry, 99999);
+    const targetMasked = km.listKeys().find((k) => k.label === targetEntry.label)!.maskedKey;
+
+    const result = km.reassignSessionAffinity("session-x", targetMasked);
+    expect(result).toEqual({ error: "target_unavailable" });
+  });
 });
 
 // ── Key Stats Recording ─────────────────────────────────────────────────────

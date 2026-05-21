@@ -923,12 +923,19 @@ export class KeyManager {
    *  Auto-picks the least-loaded available key, excluding the one currently
    *  serving the session. Returns null if no affinities match the session-id
    *  or there is no other available key to move to. */
-  reassignSessionAffinity(sessionId: string): {
+  reassignSessionAffinity(sessionId: string, toMaskedKey?: string): {
     movedConversations: number;
     fromKeyLabel: string;
     toKeyLabel: string;
     toMaskedKey: string;
-  } | { error: "session_not_found" | "no_other_key_available" } {
+  } | {
+    error:
+      | "session_not_found"
+      | "no_other_key_available"
+      | "target_unknown"
+      | "target_same_as_current"
+      | "target_unavailable";
+  } {
     const matching: ConversationAffinityEntry[] = [];
     for (const affinity of this.conversationAffinities.values()) {
       if (affinity.sessionId === sessionId) matching.push(affinity);
@@ -940,18 +947,27 @@ export class KeyManager {
     const fromLabel = currentEntry?.label ?? "(unknown)";
 
     const currentTime = now();
-    const candidates = this.keys.filter(
-      (entry) => entry.key !== currentKey && this.isKeyAvailable(entry),
-    );
-    if (candidates.length === 0) return { error: "no_other_key_available" };
+    let target: ApiKeyEntry;
+    if (typeof toMaskedKey === "string" && toMaskedKey.length > 0) {
+      const requested = this.keys.find((k) => maskKey(k.key) === toMaskedKey);
+      if (requested === undefined) return { error: "target_unknown" };
+      if (requested.key === currentKey) return { error: "target_same_as_current" };
+      if (!this.isKeyAvailable(requested)) return { error: "target_unavailable" };
+      target = requested;
+    } else {
+      const candidates = this.keys.filter(
+        (entry) => entry.key !== currentKey && this.isKeyAvailable(entry),
+      );
+      if (candidates.length === 0) return { error: "no_other_key_available" };
 
-    const sessionCounts = this.countRecentSessionsByKey(
-      unixMs(currentTime - RECENT_SESSION_WINDOW_MS),
-    );
-    const sorted = [...candidates].sort((a, b) =>
-      this.compareForSort(a, b, sessionCounts, currentTime),
-    );
-    const target = sorted[0]!;
+      const sessionCounts = this.countRecentSessionsByKey(
+        unixMs(currentTime - RECENT_SESSION_WINDOW_MS),
+      );
+      const sorted = [...candidates].sort((a, b) =>
+        this.compareForSort(a, b, sessionCounts, currentTime),
+      );
+      target = sorted[0]!;
+    }
 
     for (const affinity of matching) {
       affinity.key = target.key;

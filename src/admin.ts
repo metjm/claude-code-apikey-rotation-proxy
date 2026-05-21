@@ -312,17 +312,28 @@ async function handleReassignSessionAffinity(
   req: Request,
   keyManager: KeyManager,
 ): Promise<Response> {
-  const body = await parseJsonBody<{ sessionId?: string }>(req);
+  const body = await parseJsonBody<{ sessionId?: string; toMaskedKey?: string }>(req);
   if (body === null) return json({ error: "Invalid JSON body" }, 400);
   if (typeof body.sessionId !== "string" || body.sessionId.length === 0) {
     return json({ error: "Missing or empty 'sessionId' field" }, 400);
   }
-  const result = keyManager.reassignSessionAffinity(body.sessionId);
+  const toMaskedKey = typeof body.toMaskedKey === "string" && body.toMaskedKey.length > 0
+    ? body.toMaskedKey
+    : undefined;
+  const result = keyManager.reassignSessionAffinity(body.sessionId, toMaskedKey);
   if ("error" in result) {
-    if (result.error === "session_not_found") {
-      return json({ error: "Session not found" }, 404);
+    switch (result.error) {
+      case "session_not_found":
+        return json({ error: "Session not found" }, 404);
+      case "target_unknown":
+        return json({ error: "Target key not found" }, 404);
+      case "target_same_as_current":
+        return json({ error: "Target key is the same as the current key" }, 409);
+      case "target_unavailable":
+        return json({ error: "Target key is not available" }, 409);
+      case "no_other_key_available":
+        return json({ error: "No other available key to reassign to" }, 409);
     }
-    return json({ error: "No other available key to reassign to" }, 409);
   }
   return json({ reassigned: true, ...result });
 }

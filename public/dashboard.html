@@ -604,6 +604,21 @@
   .modal-box pre { background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 12px; color: var(--text); font-size: 12px; overflow-x: auto; margin-bottom: 12px; white-space: pre-wrap; word-break: break-all; }
   .modal-actions { display: flex; gap: 8px; }
 
+  /* Affinity-target picker modal */
+  .picker-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.7); z-index: 200; display: flex; align-items: center; justify-content: center; }
+  .picker-box { background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; padding: 16px 20px; max-width: 560px; width: 92%; max-height: 80vh; display: flex; flex-direction: column; }
+  .picker-box h3 { color: var(--text-bright); margin: 0 0 4px; font-size: 13px; }
+  .picker-box .picker-sub { color: var(--text-dim); font-size: 11px; margin-bottom: 12px; }
+  .picker-list { display: flex; flex-direction: column; gap: 4px; overflow-y: auto; margin-bottom: 12px; min-height: 0; }
+  .picker-row { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 4px; background: var(--bg); cursor: pointer; font-size: 12px; }
+  .picker-row:hover:not(.disabled) { background: rgba(88,166,255,0.06); border-color: var(--blue); }
+  .picker-row.disabled { opacity: 0.5; cursor: not-allowed; }
+  .picker-row .picker-label { flex: 1; color: var(--text); font-weight: 600; }
+  .picker-row .picker-state { color: var(--text-dim); font-size: 11px; }
+  .picker-row .picker-meta { color: var(--text-dim); font-size: 11px; min-width: 110px; text-align: right; }
+  .picker-empty { color: var(--text-dim); font-size: 12px; padding: 16px; text-align: center; }
+  .picker-error { color: var(--red); font-size: 11px; margin-bottom: 8px; }
+
   /* Key colors */
   .kc0 { color: #39d2c0; } .kc1 { color: #d2a8ff; } .kc2 { color: #ffa657; }
   .kc3 { color: #79c0ff; } .kc4 { color: #f778ba; } .kc5 { color: #7ee787; }
@@ -2255,7 +2270,11 @@ function ensureKeysApp() {
   };
 
   const SessionGroupComponent = {
-    props: { session: { type: Object, required: true } },
+    props: {
+      session: { type: Object, required: true },
+      currentMaskedKey: { type: String, required: true },
+      currentKeyLabel: { type: String, required: true },
+    },
     components: { 'throughput-chart': ThroughputChartComponent },
     computed: {
       convs() {
@@ -2291,22 +2310,70 @@ function ensureKeysApp() {
         const c = this.convs[0];
         return throughputConvKey(this.session.sessionId, c ? c.hash : null);
       },
+      pickerCandidates() {
+        // Snapshot is reactive via `pickerRev`: each call to refreshPickerRev
+        // bumps the counter, forcing this computed to re-read the global keys.
+        void this.pickerRev;
+        const nowMs = Date.now();
+        return (keys || [])
+          .filter((k) => k.maskedKey !== this.currentMaskedKey)
+          .map((k) => {
+            const w5 = capacityWindow(k, 'unified-5h');
+            const w7 = capacityWindow(k, 'unified-7d');
+            const util5 = w5 && typeof w5.utilization === 'number' ? Math.round(w5.utilization * 100) : null;
+            const util7 = w7 && typeof w7.utilization === 'number' ? Math.round(w7.utilization * 100) : null;
+            const sessionCount = Array.isArray(k.recentSessions) ? k.recentSessions.length : 0;
+            let state;
+            if (Number(k.priority) === 4) state = 'Disabled';
+            else if (!k.isAvailable && k.availableAt && k.availableAt > nowMs) state = 'Cooldown ' + fmtCountdown(k.availableAt - nowMs);
+            else if (!k.isAvailable) state = 'Unavailable today';
+            else state = 'Available';
+            return {
+              maskedKey: k.maskedKey,
+              label: k.label,
+              colorClass: keyColor(k.label),
+              isAvailable: !!k.isAvailable,
+              state,
+              util5,
+              util7,
+              sessionCount,
+            };
+          })
+          .sort((a, b) => {
+            if (a.isAvailable !== b.isAvailable) return a.isAvailable ? -1 : 1;
+            return String(a.label).localeCompare(String(b.label));
+          });
+      },
     },
     data() {
-      return { moving: false };
+      return { moving: false, pickerOpen: false, pickerError: '', pickerRev: 0 };
     },
     methods: {
       convIdHead(c) { return idHead(c.hash || '(no hash)', 8, 8); },
       convIdTail(c) { return idTail(c.hash || '(no hash)', 8, 8); },
       ageTitle(iso) { return iso ? 'First seen ' + iso : ''; },
       convKey(c) { return throughputConvKey(this.session.sessionId, c.hash); },
-      async moveSession() {
+      openPicker() {
+        this.pickerError = '';
+        this.pickerRev++;
+        this.pickerOpen = true;
+      },
+      closePicker() {
         if (this.moving) return;
+        this.pickerOpen = false;
+      },
+      async moveTo(target) {
+        if (this.moving || !target || !target.isAvailable) return;
         this.moving = true;
+        this.pickerError = '';
         try {
-          await api('POST', '/admin/affinities/reassign', { sessionId: this.session.sessionId });
+          await api('POST', '/admin/affinities/reassign', {
+            sessionId: this.session.sessionId,
+            toMaskedKey: target.maskedKey,
+          });
+          this.pickerOpen = false;
         } catch (err) {
-          alert('Failed to move session: ' + (err && err.message ? err.message : err));
+          this.pickerError = (err && err.message ? err.message : String(err));
         } finally {
           this.moving = false;
         }
@@ -2314,14 +2381,15 @@ function ensureKeysApp() {
       fmtAge: fmtAge,
       fmtRelative: fmtRelative,
       fmtNum: fmtNum,
+      keyColor: keyColor,
     },
     template: `
       <div class="session-group" :style="sessionGroupStyle">
         <span class="cell-id" :title="session.sessionId">{{ idHead }}<span v-if="idTailText" class="id-tail">{{ idTailText }}</span></span>
         <span class="cell-right">
           <span v-if="hasMultipleConvs" class="session-count">×{{ convs.length }}</span>
-          <button class="session-move" :disabled="moving" @click="moveSession"
-            title="Detach this session and reattach to another available key">↻</button>
+          <button class="session-move" :disabled="moving" @click="openPicker"
+            title="Move this session to a different key">↻</button>
           <span>{{ fmtRelative(session.lastSeenAt) }}</span>
         </span>
         <span class="cell-meta-row">
@@ -2343,12 +2411,45 @@ function ensureKeysApp() {
           </span>
           <throughput-chart :conv-key="convKey(c)"></throughput-chart>
         </template>
+        <div v-if="pickerOpen" class="picker-overlay" @click.self="closePicker">
+          <div class="picker-box">
+            <h3>Move session to another key</h3>
+            <div class="picker-sub">
+              Session <code>{{ idHead }}{{ idTailText }}</code> is currently pinned to
+              <b :class="keyColor(currentKeyLabel)">{{ currentKeyLabel }}</b>.
+              Pick where to move it.
+            </div>
+            <div v-if="pickerError" class="picker-error">{{ pickerError }}</div>
+            <div v-if="pickerCandidates.length === 0" class="picker-empty">No other keys configured.</div>
+            <div v-else class="picker-list">
+              <div v-for="c in pickerCandidates" :key="c.maskedKey"
+                   :class="['picker-row', { disabled: !c.isAvailable || moving }]"
+                   @click="moveTo(c)">
+                <span :class="['picker-label', c.colorClass]">{{ c.label }}</span>
+                <span class="picker-meta">
+                  <span v-if="c.util5 !== null" :title="'5h utilization'">5h {{ c.util5 }}%</span>
+                  <span v-if="c.util5 !== null && c.util7 !== null"> · </span>
+                  <span v-if="c.util7 !== null" :title="'7d utilization'">7d {{ c.util7 }}%</span>
+                  <span v-if="c.sessionCount > 0"> · {{ c.sessionCount }} sess</span>
+                </span>
+                <span class="picker-state">{{ c.state }}</span>
+              </div>
+            </div>
+            <div class="modal-actions">
+              <button class="btn" @click="closePicker" :disabled="moving">Cancel</button>
+            </div>
+          </div>
+        </div>
       </div>
     `,
   };
 
   const SessionsCellComponent = {
-    props: { sessions: { type: Array, default: () => [] } },
+    props: {
+      sessions: { type: Array, default: () => [] },
+      currentMaskedKey: { type: String, required: true },
+      currentKeyLabel: { type: String, required: true },
+    },
     components: { 'session-group': SessionGroupComponent },
     computed: {
       hasAny() { return Array.isArray(this.sessions) && this.sessions.length > 0; },
@@ -2372,7 +2473,7 @@ function ensureKeysApp() {
           <span>{{ summaryLeft }}</span>
           <span class="sessions-summary-right">{{ summaryRight }}</span>
         </div>
-        <session-group v-for="s in sessions" :key="s.sessionId" :session="s"></session-group>
+        <session-group v-for="s in sessions" :key="s.sessionId" :session="s" :current-masked-key="currentMaskedKey" :current-key-label="currentKeyLabel"></session-group>
       </div>
     `,
   };
@@ -2531,7 +2632,7 @@ function ensureKeysApp() {
           </div>
         </td>
         <td>
-          <sessions-cell :sessions="k.recentSessions"></sessions-cell>
+          <sessions-cell :sessions="k.recentSessions" :current-masked-key="k.maskedKey" :current-key-label="k.label"></sessions-cell>
         </td>
         <td>
           <div class="table-controls">

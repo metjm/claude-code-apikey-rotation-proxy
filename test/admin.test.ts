@@ -190,6 +190,63 @@ describe("Route Dispatch", () => {
     expect(res!.status).toBe(400);
   });
 
+  test("POST /admin/affinities/reassign honors toMaskedKey when supplied", async () => {
+    km.addKey(VALID_KEY, "a");
+    km.addKey(VALID_KEY_2, "b");
+    const initial = km.getKeyForConversation(
+      "user-1:session-x:1111111111111111", "session-x",
+    );
+    const initialKey = initial.entry!.key;
+    const target = km.listKeys().find((k) =>
+      (k.label === "a" && initialKey !== VALID_KEY)
+      || (k.label === "b" && initialKey !== VALID_KEY_2),
+    )!;
+
+    const req = makeReq("POST", "/admin/affinities/reassign", {
+      sessionId: "session-x",
+      toMaskedKey: target.maskedKey,
+    });
+    const res = await handleAdminRoute(req, km, config, st);
+    expect(res!.status).toBe(200);
+    const body = await jsonBody(res!) as {
+      reassigned: boolean; toKeyLabel: string; toMaskedKey: string;
+    };
+    expect(body.toMaskedKey).toBe(target.maskedKey);
+    expect(body.toKeyLabel).toBe(target.label);
+  });
+
+  test("POST /admin/affinities/reassign returns 404 when toMaskedKey is unknown", async () => {
+    km.addKey(VALID_KEY, "a");
+    km.addKey(VALID_KEY_2, "b");
+    km.getKeyForConversation("user-1:session-x:1111111111111111", "session-x");
+    const req = makeReq("POST", "/admin/affinities/reassign", {
+      sessionId: "session-x",
+      toMaskedKey: "sk-ant-xxx...nope",
+    });
+    const res = await handleAdminRoute(req, km, config, st);
+    expect(res!.status).toBe(404);
+  });
+
+  test("POST /admin/affinities/reassign returns 409 when toMaskedKey is the current key", async () => {
+    km.addKey(VALID_KEY, "a");
+    km.addKey(VALID_KEY_2, "b");
+    const initial = km.getKeyForConversation(
+      "user-1:session-x:1111111111111111", "session-x",
+    );
+    const initialKey = initial.entry!.key;
+    const currentMasked = km.listKeys().find(
+      (k) => (k.label === "a" && initialKey === VALID_KEY)
+        || (k.label === "b" && initialKey === VALID_KEY_2),
+    )!.maskedKey;
+
+    const req = makeReq("POST", "/admin/affinities/reassign", {
+      sessionId: "session-x",
+      toMaskedKey: currentMasked,
+    });
+    const res = await handleAdminRoute(req, km, config, st);
+    expect(res!.status).toBe(409);
+  });
+
   test("routes GET /admin/tokens", async () => {
     const req = makeReq("GET", "/admin/tokens");
     const res = await handleAdminRoute(req, km, config, st);
