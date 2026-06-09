@@ -10,6 +10,8 @@ import {
   resetProxyDebugStateForTests,
   summarizeRequestBody,
   countCacheControlSegments,
+  reapStaleActiveStreams,
+  activeStreamCountForTests,
 } from "../src/proxy.ts";
 import { subscribe, type ProxyEvent } from "../src/events.ts";
 import type { ProxyConfig, ProxyTokenEntry } from "../src/types.ts";
@@ -4617,5 +4619,176 @@ describe("Non-/v1/messages session traffic", () => {
     expect(recent.length).toBe(1);
     expect(recent[0]!.conversations.length).toBe(1);
     expect(recent[0]!.conversations[0]!.hash).not.toBeNull();
+  });
+});
+
+describe("Upstream stream reaper", () => {
+  // Real upstream that delivers exactly one SSE chunk then goes silent forever
+  // (a never-resolving pull keeps the TCP connection open) — the production
+  // stall. Records whether its request was aborted, i.e. the socket torn down.
+  function silentAfterFirstChunkUpstream(): { mock: MockUpstream; aborted: () => boolean } {
+    let abortCount = 0;
+    const enc = new TextEncoder();
+    const mock = upstream((req) => {
+      req.signal.addEventListener("abort", () => { abortCount++; });
+      let sent = false;
+      const body = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (sent) return new Promise<void>(() => {});
+          sent = true;
+          controller.enqueue(enc.encode('data: {"type":"message_start","message":{"usage":{"input_tokens":7}}}\n\n'));
+        },
+      });
+      return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+    });
+    return { mock, aborted: () => abortCount > 0 };
+  }
+
+  async function waitUntil(pred: () => boolean, timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (pred()) return true;
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    return pred();
+  }
+
+  test("reaps a stream that went silent with no consumer, tearing down the upstream", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    const { mock, aborted } = silentAfterFirstChunkUpstream();
+    const config = makeConfig(mock.url, { streamIdleTimeoutMs: 150 });
+
+    const result = await proxyRequest(
+      makeRequest("/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-request-id": "reaper-orphan-1" },
+        body: JSON.stringify({ stream: true, messages: [{ role: "user", content: "hi" }] }),
+      }),
+      km, config, st,
+    );
+
+    expect(result.kind).toBe("success");
+    // Consumer never reads result.response.body — the orphan condition.
+    expect(activeStreamCountForTests()).toBe(1);
+
+    // A sweep before the idle window elapses must NOT reap.
+    reapStaleActiveStreams(Date.now() + 50);
+    expect(activeStreamCountForTests()).toBe(1);
+    expect(aborted()).toBe(false);
+
+    // A sweep past the idle window MUST reap and abort the upstream socket.
+    reapStaleActiveStreams(Date.now() + 5_000);
+    expect(activeStreamCountForTests()).toBe(0);
+    expect(await waitUntil(aborted, 1_000)).toBe(true);
+    expect(km.listKeys()[0]!.stats.successfulRequests).toBe(0);
+
+    await result.response.body?.cancel().catch(() => {});
+  });
+
+  test("a downstream cancel aborts the upstream, independent of the reaper", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    const { mock, aborted } = silentAfterFirstChunkUpstream();
+    // Long idle timeout so the reaper can't be the cause — only cancel() can.
+    const config = makeConfig(mock.url, { streamIdleTimeoutMs: 120_000 });
+
+    const result = await proxyRequest(
+      makeRequest("/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-request-id": "reaper-disconnect-1" },
+        body: JSON.stringify({ stream: true, messages: [{ role: "user", content: "hi" }] }),
+      }),
+      km, config, st,
+    );
+
+    expect(result.kind).toBe("success");
+    const reader = result.response.body!.getReader();
+    expect((await reader.read()).done).toBe(false);
+
+    await reader.cancel("client-disconnect");
+
+    expect(await waitUntil(aborted, 1_000)).toBe(true);
+    expect(await waitUntil(() => activeStreamCountForTests() === 0, 1_000)).toBe(true);
+  });
+
+  test("a normal multi-chunk stream completes; tokens recorded, never aborted or reaped", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    let abortCount = 0;
+    const enc = new TextEncoder();
+    const events = [
+      'data: {"type":"message_start","message":{"usage":{"input_tokens":11}}}\n\n',
+      'data: {"type":"message_delta","usage":{"output_tokens":4}}\n\n',
+      'data: {"type":"message_delta","usage":{"output_tokens":5}}\n\n',
+      "data: [DONE]\n\n",
+    ];
+    const mock = upstream((req) => {
+      req.signal.addEventListener("abort", () => { abortCount++; });
+      return new Response(new ReadableStream<Uint8Array>({
+        start(c) { for (const e of events) c.enqueue(enc.encode(e)); c.close(); },
+      }), { status: 200, headers: { "content-type": "text/event-stream" } });
+    });
+    const config = makeConfig(mock.url, { streamIdleTimeoutMs: 150 });
+
+    const result = await proxyRequest(
+      makeRequest("/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-request-id": "reaper-happy-1" },
+        body: JSON.stringify({ stream: true, messages: [{ role: "user", content: "hi" }] }),
+      }),
+      km, config, st,
+    );
+
+    expect(result.kind).toBe("success");
+    expect(await result.response.text()).toContain('"output_tokens":5');
+    // A sweep after the stream closed is a harmless no-op.
+    reapStaleActiveStreams(Date.now() + 10_000);
+    expect(activeStreamCountForTests()).toBe(0);
+    expect(abortCount).toBe(0);
+    expect(km.listKeys()[0]!.stats.successfulRequests).toBe(1);
+    expect(km.listKeys()[0]!.stats.totalTokensIn).toBe(11);
+  });
+
+  test("a slow stream whose chunks arrive under the idle timeout is not reaped", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    let abortCount = 0;
+    const enc = new TextEncoder();
+    const chunks = [
+      'data: {"type":"message_start","message":{"usage":{"input_tokens":9}}}\n\n',
+      'data: {"type":"message_delta","usage":{"output_tokens":1}}\n\n',
+      'data: {"type":"message_delta","usage":{"output_tokens":1}}\n\n',
+      "data: [DONE]\n\n",
+    ];
+    const gapMs = 80;
+    const mock = upstream((req) => {
+      req.signal.addEventListener("abort", () => { abortCount++; });
+      let i = 0;
+      return new Response(new ReadableStream<Uint8Array>({
+        async pull(c) {
+          if (i === 0) { c.enqueue(enc.encode(chunks[i++]!)); return; }
+          await new Promise((r) => setTimeout(r, gapMs));
+          if (i < chunks.length) c.enqueue(enc.encode(chunks[i++]!));
+          if (i >= chunks.length) c.close();
+        },
+      }), { status: 200, headers: { "content-type": "text/event-stream" } });
+    });
+    const config = makeConfig(mock.url, { streamIdleTimeoutMs: 500 });
+
+    const result = await proxyRequest(
+      makeRequest("/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-request-id": "reaper-slow-1" },
+        body: JSON.stringify({ stream: true, messages: [{ role: "user", content: "hi" }] }),
+      }),
+      km, config, st,
+    );
+    expect(result.kind).toBe("success");
+
+    expect(await result.response.text()).toContain("[DONE]");
+    expect(abortCount).toBe(0);
+    expect(activeStreamCountForTests()).toBe(0);
+    expect(km.listKeys()[0]!.stats.successfulRequests).toBe(1);
   });
 });

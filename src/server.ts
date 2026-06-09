@@ -2,7 +2,7 @@
 import { loadConfig } from "./config.ts";
 import { KeyManager } from "./key-manager.ts";
 import { handleAdminRoute } from "./admin.ts";
-import { proxyRequest } from "./proxy.ts";
+import { proxyRequest, reapStaleActiveStreams, STREAM_REAPER_INTERVAL_MS } from "./proxy.ts";
 import { log } from "./logger.ts";
 import { SchemaTracker } from "./schema-tracker.ts";
 import { join } from "node:path";
@@ -85,9 +85,11 @@ function startServer(): void {
   const schemaTracker = new SchemaTracker(keyManager.dbPath, config.webhookUrl);
 
   let shuttingDown = false;
+  let reaper: ReturnType<typeof setInterval> | null = null;
   const shutdown = async () => {
     if (shuttingDown) return;
     shuttingDown = true;
+    if (reaper !== null) clearInterval(reaper);
     try {
       await Promise.race([
         schemaTracker.flushAllWebhooks(),
@@ -202,6 +204,9 @@ function startServer(): void {
       return errorResponse(500, "Internal proxy error");
     },
   });
+
+  reaper = setInterval(() => reapStaleActiveStreams(Date.now()), STREAM_REAPER_INTERVAL_MS);
+  reaper.unref();
 
   log("info", `Proxy listening on http://localhost:${server.port}`, {
     upstream: config.upstream,

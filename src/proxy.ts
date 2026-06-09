@@ -22,6 +22,12 @@ const AFFINITY_COOLDOWN_WAIT_CAP_MS = 200_000;
 // Saves the client from a forced retry when the wait is short.
 const ALL_KEYS_HOLD_THRESHOLD_MS = 60_000;
 const ACTIVE_STREAM_SNAPSHOT_INTERVAL_MS = 2_000;
+// How often the background sweep walks activeStreams to reap upstreams that
+// went silent past their idle timeout. Detection latency only — the stream is
+// already dead by streamIdleTimeoutMs by the time the sweep finds it, so a
+// coarse cadence is fine. The sweep is also the only time-driven heartbeat for
+// the active-stream snapshot (otherwise it only logs on chunk arrival).
+export const STREAM_REAPER_INTERVAL_MS = 30_000;
 const RECENT_STREAM_ACTIVITY_WINDOW_MS = 1_000;
 const SLOW_STREAM_SILENCE_LOG_MS = 5_000;
 const SLOW_FIRST_CHUNK_LOG_MS = 5_000;
@@ -141,6 +147,12 @@ type ActiveStreamState = {
   chunkCount: number;
   eventCount: number;
   bytesReceived: number;
+  // Set once the upstream reader is attached (the success path). Until then the
+  // stream is waiting for its first chunk and is owned by the first-chunk
+  // timeout, not the reaper — so idleTimeoutMs stays Infinity and reap stays
+  // null, and the sweep leaves it alone.
+  idleTimeoutMs: number;
+  reap: ((reason: string) => void) | null;
 };
 
 type BufferedRequestBody = Uint8Array | null;
@@ -224,6 +236,7 @@ const activeStreams = new Map<string, ActiveStreamState>();
 const activeRequests = new Map<string, ActiveRequestState>();
 const recentStreamStartHistory: StreamStartHistoryEntry[] = [];
 let lastActiveStreamSnapshotAt = 0;
+let totalStreamsReaped = 0;
 
 /**
  * Headers we strip from the outgoing request — they get replaced with our key
@@ -884,12 +897,13 @@ export async function proxyRequest(
       }
 
       lastStreamStartFailure = null;
+      attachUpstreamReaper(traceId, firstChunk.reader, abortController, observer, config.streamIdleTimeoutMs);
       observer.observeChunk(firstChunk.firstChunk);
       body = createTrackedStreamFromReader(
+        traceId,
         firstChunk.reader,
         firstChunk.firstChunk,
         observer,
-        abortController,
         config.streamIdleTimeoutMs,
       );
     } else if (upstream.body !== null) {
@@ -936,6 +950,11 @@ export function resetProxyDebugStateForTests(): void {
   activeRequests.clear();
   recentStreamStartHistory.length = 0;
   lastActiveStreamSnapshotAt = 0;
+  totalStreamsReaped = 0;
+}
+
+export function activeStreamCountForTests(): number {
+  return activeStreams.size;
 }
 
 function allExhaustedResult(keyManager: KeyManager): ProxyResult {
@@ -1418,8 +1437,26 @@ function maybeLogActiveStreamSnapshot(now: number): void {
     activeStreams: activeStreams.size,
     recentlyActiveStreams: countRecentlyActiveStreams(now),
     recentWindowMs: RECENT_STREAM_ACTIVITY_WINDOW_MS,
+    totalStreamsReaped,
     streams,
   });
+}
+
+// Lifecycle-independent backstop: walks the live registry and tears down any
+// upstream that has gone silent past its idle timeout. This is the guarantee
+// that a stream nobody is pulling (client gone, half-open peer) cannot leak —
+// the in-pull idle timeout only fires while the consumer keeps pulling. Reaps
+// only flowing streams (lastChunkAt set, reaper attached); streams still
+// waiting for their first chunk are owned by the first-chunk timeout.
+export function reapStaleActiveStreams(now: number): void {
+  for (const stream of [...activeStreams.values()]) {
+    if (stream.reap === null || stream.lastChunkAt === null) continue;
+    if (now - stream.lastChunkAt >= stream.idleTimeoutMs) {
+      totalStreamsReaped++;
+      stream.reap("reaped_idle");
+    }
+  }
+  maybeLogActiveStreamSnapshot(now);
 }
 
 function registerActiveStream(
@@ -1442,6 +1479,8 @@ function registerActiveStream(
     chunkCount: 0,
     eventCount: 0,
     bytesReceived: 0,
+    idleTimeoutMs: Number.POSITIVE_INFINITY,
+    reap: null,
   });
 
   log("info", "Stream opened", {
@@ -1452,6 +1491,32 @@ function registerActiveStream(
     activeStreams: activeStreams.size,
   });
   maybeLogActiveStreamSnapshot(now);
+}
+
+// Arms the reaper for a stream once its upstream reader exists. Builds the one
+// idempotent teardown every path converges on: abort the upstream fetch (the
+// real lever that closes the Anthropic socket), best-effort cancel/release the
+// reader, then abandon the registry entry. reader.cancel is never awaited — it
+// stalls on exactly the dead streams we're reaping. Idempotent via registry
+// membership: reap runs synchronously and abandon deletes the entry, so any
+// later caller bails.
+function attachUpstreamReaper(
+  traceId: string,
+  reader: UpstreamReader,
+  abortController: AbortController,
+  observer: StreamObserver,
+  idleTimeoutMs: number,
+): void {
+  const stream = activeStreams.get(traceId);
+  if (stream === undefined) return;
+  stream.idleTimeoutMs = idleTimeoutMs;
+  stream.reap = (reason: string): void => {
+    if (!activeStreams.has(traceId)) return;
+    abortController.abort(reason);
+    void reader.cancel(reason).catch(() => {});
+    try { reader.releaseLock(); } catch {}
+    observer.abandon(reason);
+  };
 }
 
 function recordActiveStreamChunk(traceId: string, chunkBytes: number): void {
@@ -2284,10 +2349,10 @@ function createTokenTrackingObserver(
 }
 
 function createTrackedStreamFromReader(
+  traceId: string,
   reader: UpstreamReader,
   firstChunk: Uint8Array,
   observer: StreamObserver,
-  abortController: AbortController,
   streamIdleTimeoutMs: number,
 ): ReadableStream<Uint8Array> {
   let sentFirstChunk = false;
@@ -2306,16 +2371,13 @@ function createTrackedStreamFromReader(
       const nextChunk = await readNextChunkWithTimeout(reader, streamIdleTimeoutMs);
       if (nextChunk.kind === "timeout") {
         closed = true;
-        abortController.abort("stream_idle_timeout");
-        try { await reader.cancel("stream_idle_timeout"); } catch {}
-        try { reader.releaseLock(); } catch {}
-        observer.abandon("stream_idle_timeout");
+        activeStreams.get(traceId)?.reap?.("stream_idle_timeout");
         controller.error(new Error(`Upstream stream idle timeout after ${streamIdleTimeoutMs}ms`));
         return;
       }
       if (nextChunk.kind === "error") {
         closed = true;
-        observer.abandon("stream_read_failed_after_first_chunk");
+        activeStreams.get(traceId)?.reap?.("stream_read_failed_after_first_chunk");
         controller.error(nextChunk.error);
         return;
       }
@@ -2332,12 +2394,10 @@ function createTrackedStreamFromReader(
       controller.enqueue(chunk);
     },
 
-    async cancel(reason) {
+    cancel() {
       if (closed) return;
       closed = true;
-      try { await reader.cancel(reason); } catch {}
-      try { reader.releaseLock(); } catch {}
-      observer.abandon("downstream_cancelled");
+      activeStreams.get(traceId)?.reap?.("downstream_cancelled");
     },
   });
 }
