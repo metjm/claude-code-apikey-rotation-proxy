@@ -65,9 +65,11 @@ wall-clock timer instead of consumer demand:
   (`STREAM_REAPER_INTERVAL_MS`, 30 s; `.unref()`d; cleared on shutdown). It
   abandons any flowing stream whose silence (`now - lastChunkAt`) exceeds its
   `idleTimeoutMs` (`config.streamIdleTimeoutMs`, env `STREAM_IDLE_TIMEOUT_MS`,
-  default **120 000 ms**). It is also the only time-driven heartbeat for the
-  "Active stream snapshot" — which is otherwise emitted only on chunk arrival,
-  so a silent leaking fleet logged nothing.
+  default **120 000 ms**). It also drives the periodic "Active stream snapshot"
+  when more than one stream is active (the snapshot is otherwise emitted only on
+  chunk arrival, and early-returns when `activeStreams.size <= 1`). A single
+  silent stream is therefore not surfaced via the snapshot, but it is still
+  logged as "Stream abandoned" when the sweep reaps it.
 
 - **One idempotent `reap(reason)`** per entry (built in `attachUpstreamReaper`
   once the upstream reader exists): `abortController.abort` (the real lever
@@ -78,7 +80,7 @@ wall-clock timer instead of consumer demand:
   `cancel()`, and the reaper. Only the natural `done` path calls
   `observer.finish()`. Distinct reasons (`reaped_idle`, `stream_idle_timeout`,
   `downstream_cancelled`, `stream_read_failed_after_first_chunk`) plus a
-  `totalStreamsReaped` counter in the snapshot quantify what the old
+  `totalStreamsReapedBySweep` counter in the snapshot quantify what the old
   consumer-driven path was missing.
 
 A stream waiting for its first chunk is owned by the first-chunk timeout, not

@@ -4791,4 +4791,121 @@ describe("Upstream stream reaper", () => {
     expect(activeStreamCountForTests()).toBe(0);
     expect(km.listKeys()[0]!.stats.successfulRequests).toBe(1);
   });
+
+  test("STREAM_IDLE_TIMEOUT_MS=0 disables reaping, even a sweep far in the future", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    const { mock, aborted } = silentAfterFirstChunkUpstream();
+    const config = makeConfig(mock.url, { streamIdleTimeoutMs: 0 });
+
+    const result = await proxyRequest(
+      makeRequest("/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-request-id": "reaper-disabled-1" },
+        body: JSON.stringify({ stream: true, messages: [{ role: "user", content: "hi" }] }),
+      }),
+      km, config, st,
+    );
+
+    expect(result.kind).toBe("success");
+    expect(activeStreamCountForTests()).toBe(1);
+
+    // 0 means "no idle timeout" — the sweep must leave the stream alone no
+    // matter how far ahead `now` is.
+    reapStaleActiveStreams(Date.now() + 10_000_000);
+    expect(activeStreamCountForTests()).toBe(1);
+    expect(aborted()).toBe(false);
+
+    await result.response.body?.cancel().catch(() => {});
+  });
+
+  test("a stream still waiting for its first chunk is not reaped", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+
+    // A real Bun HTTP upstream can't register this state: Bun withholds the
+    // 200 headers until the first body byte, so the stream isn't even in the
+    // registry until its first chunk lands. To hold a stream genuinely
+    // registered-but-pre-first-chunk (reap=null, idleTimeoutMs=Infinity) we
+    // hand proxyRequest an in-process Response whose headers resolve at once
+    // but whose body never enqueues — the same upstream substitution the
+    // existing first-chunk-timeout tests use. The first-chunk timeout, not the
+    // reaper, owns it; the sweep must leave it alone.
+    let bodyCancelled = false;
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(async () =>
+      new Response(new ReadableStream<Uint8Array>({
+        cancel() { bodyCancelled = true; },
+      }), { status: 200, headers: { "content-type": "text/event-stream" } }),
+    );
+
+    try {
+      // Long enough that the stream sits in reap=null across the poll + sweep;
+      // no retries so it fails cleanly once the first-chunk timeout fires.
+      const config = makeConfig("http://mocked-upstream.local", {
+        firstChunkTimeoutMs: 3_000,
+        maxFirstChunkRetries: 0,
+      });
+
+      const pending = proxyRequest(
+        makeRequest("/v1/messages", {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-request-id": "reaper-prefirst-1" },
+          body: JSON.stringify({ stream: true, messages: [{ role: "user", content: "hi" }] }),
+        }),
+        km, config, st,
+      );
+
+      // Registered at observer creation, before the first chunk: reap=null.
+      expect(await waitUntil(() => activeStreamCountForTests() === 1, 1_000)).toBe(true);
+
+      // The sweep must skip it — reap=null means it's owned by the first-chunk
+      // timeout, which hasn't fired yet, so the body is untouched here.
+      reapStaleActiveStreams(Date.now() + 10_000_000);
+      expect(activeStreamCountForTests()).toBe(1);
+      expect(bodyCancelled).toBe(false);
+
+      const result = await pending;
+      expect(result.kind).not.toBe("success");
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
+  test("a single sweep reaps only the stale stream among concurrent ones", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    const a = silentAfterFirstChunkUpstream();
+    const b = silentAfterFirstChunkUpstream();
+    const configA = makeConfig(a.mock.url, { streamIdleTimeoutMs: 50 });
+    const configB = makeConfig(b.mock.url, { streamIdleTimeoutMs: 120_000 });
+
+    const resultA = await proxyRequest(
+      makeRequest("/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-request-id": "reaper-multi-a" },
+        body: JSON.stringify({ stream: true, messages: [{ role: "user", content: "hi" }] }),
+      }),
+      km, configA, st,
+    );
+    const resultB = await proxyRequest(
+      makeRequest("/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-request-id": "reaper-multi-b" },
+        body: JSON.stringify({ stream: true, messages: [{ role: "user", content: "hi" }] }),
+      }),
+      km, configB, st,
+    );
+
+    expect(resultA.kind).toBe("success");
+    expect(resultB.kind).toBe("success");
+    expect(activeStreamCountForTests()).toBe(2);
+
+    // Past A's idle window, within B's: exactly one stream dies.
+    reapStaleActiveStreams(Date.now() + 1_000);
+    expect(activeStreamCountForTests()).toBe(1);
+    expect(await waitUntil(a.aborted, 1_000)).toBe(true);
+    expect(b.aborted()).toBe(false);
+
+    await resultB.response.body?.cancel().catch(() => {});
+  });
 });
