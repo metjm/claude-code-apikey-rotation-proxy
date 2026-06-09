@@ -46,3 +46,50 @@ Reason for the split: 1M-context requests have materially higher
 time-to-first-SSE-byte on Anthropic's side (KV-cache assembly). With a
 single 16 s threshold, 1M traffic abandons ~7% of the time on cold
 caches while normal traffic abandons <1%.
+
+## Upstream stream reaper: lifecycle-independent
+
+A streamed upstream's teardown used to be driven entirely by the downstream
+consumer: every cleanup path lived inside the response `ReadableStream`'s
+`pull()` (the in-pull idle check) or `cancel()`. Both only fire while the
+client keeps reading. When an upstream delivered its first SSE chunk then went
+silent and the client stopped pulling (gone, or a half-open peer Bun never
+detects), `pull()` was never called again, the idle timeout never armed, and
+the `ESTABLISHED` socket to Anthropic was held indefinitely — observed open
+15–72 h, accumulating and consuming per-key Anthropic concurrency.
+
+The fix makes `activeStreams` the authoritative registry and reaps off a
+wall-clock timer instead of consumer demand:
+
+- **`reapStaleActiveStreams(now)`** runs from a `setInterval` in `startServer`
+  (`STREAM_REAPER_INTERVAL_MS`, 30 s; `.unref()`d; cleared on shutdown). It
+  abandons any flowing stream whose silence (`now - lastChunkAt`) exceeds its
+  `idleTimeoutMs` (`config.streamIdleTimeoutMs`, env `STREAM_IDLE_TIMEOUT_MS`,
+  default **120 000 ms**). It also drives the periodic "Active stream snapshot"
+  when more than one stream is active (the snapshot is otherwise emitted only on
+  chunk arrival, and early-returns when `activeStreams.size <= 1`). A single
+  silent stream is therefore not surfaced via the snapshot, but it is still
+  logged as "Stream abandoned" when the sweep reaps it.
+
+- **One idempotent `reap(reason)`** per entry (built in `attachUpstreamReaper`
+  once the upstream reader exists): `abortController.abort` (the real lever
+  that closes the Anthropic socket) → fire-and-forget `reader.cancel` (never
+  awaited — it stalls on exactly these dead streams) → `releaseLock` →
+  `observer.abandon`. Idempotent via registry membership. Every teardown path
+  funnels through it: the in-pull idle timeout, a read error, the downstream
+  `cancel()`, and the reaper. Only the natural `done` path calls
+  `observer.finish()`. Distinct reasons (`reaped_idle`, `stream_idle_timeout`,
+  `downstream_cancelled`, `stream_read_failed_after_first_chunk`) plus a
+  `totalStreamsReapedBySweep` counter in the snapshot quantify what the old
+  consumer-driven path was missing.
+
+A stream waiting for its first chunk is owned by the first-chunk timeout, not
+the reaper: until the reader is attached its `idleTimeoutMs` is `Infinity` and
+its `reap` is null, so the sweep skips it.
+
+Two deliberate non-choices: there is **no** max-lifetime cap — silence, not
+age, is the kill criterion, so a legitimately long 1M-context generation that
+keeps emitting bytes is never reaped. And there is **no** `req.signal`
+disconnect handler — in Bun, `req.signal` and the response stream's `cancel()`
+share one disconnect detector and fire together, so it would be redundant with
+the (now-fixed) `cancel()` and still miss the half-open case the reaper covers.
