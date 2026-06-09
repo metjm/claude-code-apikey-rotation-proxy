@@ -1449,8 +1449,12 @@ export function reapStaleActiveStreams(now: number): void {
   for (const stream of [...activeStreams.values()]) {
     if (stream.reap === null || stream.lastChunkAt === null || stream.idleTimeoutMs <= 0) continue;
     if (now - stream.lastChunkAt >= stream.idleTimeoutMs) {
-      totalStreamsReapedBySweep++;
-      stream.reap("reaped_idle");
+      try {
+        stream.reap("reaped_idle");
+        totalStreamsReapedBySweep++;
+      } catch (err) {
+        log("error", "Stream reap threw", { traceId: stream.traceId, error: String(err) });
+      }
     }
   }
   maybeLogActiveStreamSnapshot(now);

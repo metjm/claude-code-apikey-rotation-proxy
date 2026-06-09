@@ -4669,21 +4669,25 @@ describe("Upstream stream reaper", () => {
     );
 
     expect(result.kind).toBe("success");
-    // Consumer never reads result.response.body — the orphan condition.
-    expect(activeStreamCountForTests()).toBe(1);
+    try {
+      // Consumer never reads result.response.body — the orphan condition.
+      expect(activeStreamCountForTests()).toBe(1);
 
-    // A sweep before the idle window elapses must NOT reap.
-    reapStaleActiveStreams(Date.now() + 50);
-    expect(activeStreamCountForTests()).toBe(1);
-    expect(aborted()).toBe(false);
+      // A sweep before the idle window elapses must NOT reap.
+      reapStaleActiveStreams(Date.now() + 50);
+      expect(activeStreamCountForTests()).toBe(1);
+      expect(aborted()).toBe(false);
 
-    // A sweep past the idle window MUST reap and abort the upstream socket.
-    reapStaleActiveStreams(Date.now() + 5_000);
-    expect(activeStreamCountForTests()).toBe(0);
-    expect(await waitUntil(aborted, 1_000)).toBe(true);
-    expect(km.listKeys()[0]!.stats.successfulRequests).toBe(0);
-
-    await result.response.body?.cancel().catch(() => {});
+      // A sweep past the idle window MUST reap and abort the upstream socket.
+      reapStaleActiveStreams(Date.now() + 5_000);
+      expect(activeStreamCountForTests()).toBe(0);
+      expect(await waitUntil(aborted, 1_000)).toBe(true);
+      expect(km.listKeys()[0]!.stats.successfulRequests).toBe(0);
+    } finally {
+      // Always tear down the never-closing body so a failed assertion can't
+      // poison afterEach (dangling socket → ECONNRESET / closed-DB in later tests).
+      await result.response.body?.cancel().catch(() => {});
+    }
   });
 
   test("a downstream cancel aborts the upstream, independent of the reaper", async () => {
@@ -4898,14 +4902,63 @@ describe("Upstream stream reaper", () => {
 
     expect(resultA.kind).toBe("success");
     expect(resultB.kind).toBe("success");
-    expect(activeStreamCountForTests()).toBe(2);
+    try {
+      expect(activeStreamCountForTests()).toBe(2);
 
-    // Past A's idle window, within B's: exactly one stream dies.
-    reapStaleActiveStreams(Date.now() + 1_000);
-    expect(activeStreamCountForTests()).toBe(1);
-    expect(await waitUntil(a.aborted, 1_000)).toBe(true);
-    expect(b.aborted()).toBe(false);
+      // Past A's idle window, within B's: exactly one stream dies.
+      reapStaleActiveStreams(Date.now() + 1_000);
+      expect(activeStreamCountForTests()).toBe(1);
+      expect(await waitUntil(a.aborted, 1_000)).toBe(true);
+      expect(b.aborted()).toBe(false);
+    } finally {
+      // Always tear down both never-closing bodies so a failed assertion can't
+      // poison afterEach (dangling socket → ECONNRESET / closed-DB in later tests).
+      await resultA.response.body?.cancel().catch(() => {});
+      await resultB.response.body?.cancel().catch(() => {});
+    }
+  });
 
-    await resultB.response.body?.cancel().catch(() => {});
+  test("the idle boundary is inclusive: now - lastChunkAt === idleTimeoutMs reaps", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    const { mock, aborted } = silentAfterFirstChunkUpstream();
+    const N = 150;
+    const config = makeConfig(mock.url, { streamIdleTimeoutMs: N });
+
+    // Pin Date.now to a constant T while proxyRequest records the first chunk,
+    // so lastChunkAt === T exactly. Restore before any polling/sweeping so
+    // waitUntil's real-clock deadline works and the sweep uses its injected now.
+    const T = 5_000_000;
+    const dateNowSpy = spyOn(Date, "now").mockImplementation(() => T);
+    let result: Awaited<ReturnType<typeof proxyRequest>>;
+    try {
+      result = await proxyRequest(
+        makeRequest("/v1/messages", {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-request-id": "reaper-boundary-1" },
+          body: JSON.stringify({ stream: true, messages: [{ role: "user", content: "hi" }] }),
+        }),
+        km, config, st,
+      );
+    } finally {
+      dateNowSpy.mockRestore();
+    }
+
+    expect(result.kind).toBe("success");
+    try {
+      expect(activeStreamCountForTests()).toBe(1);
+
+      // One millisecond short of the timeout: strictly not stale, must NOT reap.
+      reapStaleActiveStreams(T + N - 1);
+      expect(activeStreamCountForTests()).toBe(1);
+      expect(aborted()).toBe(false);
+
+      // Exactly at the timeout: the >= boundary is inclusive, so it MUST reap.
+      reapStaleActiveStreams(T + N);
+      expect(activeStreamCountForTests()).toBe(0);
+      expect(await waitUntil(aborted, 1_000)).toBe(true);
+    } finally {
+      await result.response.body?.cancel().catch(() => {});
+    }
   });
 });
