@@ -9,7 +9,7 @@ import {
 } from "./types.ts";
 import { log } from "./logger.ts";
 import { emitWithKeys } from "./events.ts";
-import { computeFirstMessageHash } from "./message-fingerprint.ts";
+import { computeFirstMessageHash, isQuotaProbe } from "./message-fingerprint.ts";
 import type { SchemaTracker } from "./schema-tracker.ts";
 
 const RATE_LIMIT_STATUS = 429 as const;
@@ -47,6 +47,7 @@ const REQUEST_BODY_SUMMARY_MAX_BYTES = 4_000_000;
 // we can see exactly what payload Anthropic is reacting to. 50KB fits a
 // typical Claude Code request's system prompt + first user message.
 const RATE_LIMIT_REQUEST_BODY_LOG_BYTES = 50_000;
+const QUOTA_PROBE_RESPONSE_LOG_BYTES = 4_000;
 // Threshold above which a Sonnet request hitting "Extra usage is required
 // for long context requests" is treated as unrecoverable and short-circuited
 // with a 500 + model-readable message asking the caller to switch to Opus.
@@ -319,6 +320,8 @@ export async function proxyRequest(
     ? computeFirstMessageHash(requestBody, url.pathname)
     : null;
   const conversationKey = buildConversationKey(proxyUser, sessionId, firstMessageHash);
+  const requestBodySummary = summarizeRequestBody(requestBody);
+  const requestIsQuotaProbe = isQuotaProbe(requestBody, url.pathname);
   const requestFirstChunkTimeoutMs = requestUsesContext1m(req.headers)
     ? config.firstChunkTimeoutMsContext1m
     : config.firstChunkTimeoutMs;
@@ -491,7 +494,35 @@ export async function proxyRequest(
       requestContentLength,
       requestBodyState,
       headers: allHeaders,
+      ...(requestIsQuotaProbe ? {
+        quotaProbe: true,
+        requestBodySummary,
+        requestBody: previewRequestBody(requestBody),
+        requestBodyPreviewTruncated: requestBody !== null
+          && requestBody.byteLength > RATE_LIMIT_REQUEST_BODY_LOG_BYTES,
+      } : {}),
     });
+    if (requestIsQuotaProbe) {
+      log("warn", "Claude quota probe outbound diagnostic", {
+        label: entry.label,
+        user: proxyUser?.label,
+        method: req.method,
+        path: url.pathname,
+        attempt: attempts,
+        traceId,
+        sessionId,
+        conversationKey,
+        routingDecision: selection.routingDecision,
+        upstreamUrl,
+        requestContentLength,
+        requestBodyState,
+        requestBodySummary,
+        requestBody: previewRequestBody(requestBody),
+        requestBodyPreviewTruncated: requestBody !== null
+          && requestBody.byteLength > RATE_LIMIT_REQUEST_BODY_LOG_BYTES,
+        headers: allHeaders,
+      });
+    }
     registerActiveRequest(
       traceId,
       entry.label,
@@ -683,11 +714,31 @@ export async function proxyRequest(
         responseBodyTruncated: responseBody.length > RATE_LIMIT_BODY_LOG_BYTES,
         responseHeaders: collectResponseHeaders(upstream.headers),
         capacityObservation,
-        requestBodySummary: summarizeRequestBody(requestBody),
+        requestBodySummary,
         requestBody: previewRequestBody(requestBody),
         requestBodyPreviewTruncated: requestBody !== null
           && requestBody.byteLength > RATE_LIMIT_REQUEST_BODY_LOG_BYTES,
       });
+      if (requestIsQuotaProbe) {
+        log("warn", "Claude quota probe upstream response diagnostic", {
+          label: entry.label,
+          user: proxyUser?.label,
+          status: upstream.status,
+          method: req.method,
+          path: url.pathname,
+          attempt: attempts,
+          traceId,
+          sessionId,
+          conversationKey,
+          durationMs: Date.now() - fetchStartedAt,
+          retryAfter,
+          responseBody: responseBody.slice(0, QUOTA_PROBE_RESPONSE_LOG_BYTES),
+          responseBodyTruncated: responseBody.length > QUOTA_PROBE_RESPONSE_LOG_BYTES,
+          responseHeaders: collectResponseHeaders(upstream.headers),
+          capacityObservation,
+          requestBodySummary,
+        });
+      }
       emitWithKeys({
         type: "rate_limit", ts: new Date().toISOString(), label: entry.label,
         user: proxyUser?.label, retryAfter, availableKeys: keyManager.availableCount(),
@@ -720,11 +771,30 @@ export async function proxyRequest(
         bodyTruncated: body.length > UPSTREAM_ERROR_BODY_LOG_BYTES,
         responseHeaders: collectResponseHeaders(upstream.headers),
         capacityObservation,
-        requestBodySummary: summarizeRequestBody(requestBody),
+        requestBodySummary,
         requestBody: previewRequestBody(requestBody),
         requestBodyPreviewTruncated: requestBody !== null
           && requestBody.byteLength > RATE_LIMIT_REQUEST_BODY_LOG_BYTES,
       });
+      if (requestIsQuotaProbe) {
+        log("warn", "Claude quota probe upstream response diagnostic", {
+          label: entry.label,
+          user: proxyUser?.label,
+          status: upstream.status,
+          method: req.method,
+          path: url.pathname,
+          attempt: attempts,
+          traceId,
+          sessionId,
+          conversationKey,
+          durationMs: Date.now() - fetchStartedAt,
+          responseBody: body.slice(0, QUOTA_PROBE_RESPONSE_LOG_BYTES),
+          responseBodyTruncated: body.length > QUOTA_PROBE_RESPONSE_LOG_BYTES,
+          responseHeaders: collectResponseHeaders(upstream.headers),
+          capacityObservation,
+          requestBodySummary,
+        });
+      }
       emitWithKeys({
         type: "error", ts: new Date().toISOString(), label: entry.label,
         user: proxyUser?.label, status: upstream.status,
@@ -857,6 +927,25 @@ export async function proxyRequest(
       );
     } else if (upstream.body !== null) {
       const text = await upstream.text();
+      if (requestIsQuotaProbe) {
+        log("warn", "Claude quota probe upstream response diagnostic", {
+          label: entry.label,
+          user: proxyUser?.label,
+          status: upstream.status,
+          method: req.method,
+          path: url.pathname,
+          attempt: attempts,
+          traceId,
+          sessionId,
+          conversationKey,
+          durationMs: Date.now() - fetchStartedAt,
+          responseBody: text.slice(0, QUOTA_PROBE_RESPONSE_LOG_BYTES),
+          responseBodyTruncated: text.length > QUOTA_PROBE_RESPONSE_LOG_BYTES,
+          responseHeaders: collectResponseHeaders(upstream.headers),
+          capacityObservation,
+          requestBodySummary,
+        });
+      }
       extractTokensFromJson(text, entry, keyManager, proxyUser, sessionId, firstMessageHash);
       const bodyChanges = schemaTracker.recordResponseJson(url.pathname, text);
       if (bodyChanges.length > 0) {

@@ -2,7 +2,7 @@
 import { loadConfig } from "./config.ts";
 import { KeyManager } from "./key-manager.ts";
 import { handleAdminRoute } from "./admin.ts";
-import { proxyRequest, reapStaleActiveStreams, STREAM_REAPER_INTERVAL_MS } from "./proxy.ts";
+import { proxyRequest, reapStaleActiveStreams, STREAM_REAPER_INTERVAL_MS, summarizeRequestBody } from "./proxy.ts";
 import { log } from "./logger.ts";
 import { SchemaTracker } from "./schema-tracker.ts";
 import { join } from "node:path";
@@ -11,6 +11,7 @@ import { claudeConfigInstall, claudeConfigUninstall, claudeConfigStatus } from "
 import type { ProxyTokenEntry, UnixMs } from "./types.ts";
 
 const subcommand = process.argv[2];
+const AUTH_REJECT_BODY_PREVIEW_BYTES = 4_000;
 
 if (subcommand === "service") {
   const action = process.argv[3];
@@ -155,16 +156,19 @@ function startServer(): void {
       if (keyManager.hasTokens()) {
         const incoming = extractProxyToken(req);
         if (incoming === null) {
+          const rejectedRequestBody = await summarizeRejectedRequestBody(req);
           log("warn", "Proxy auth rejected", {
             ...requestLogContext,
             ...incomingAuth,
             authRequired: true,
             reason: "missing_proxy_token",
+            ...rejectedRequestBody,
           });
           return errorResponse(401, "Proxy authentication required. Set your API key to a valid proxy token.");
         }
         proxyUser = keyManager.validateToken(incoming.value);
         if (proxyUser === null) {
+          const rejectedRequestBody = await summarizeRejectedRequestBody(req);
           log("warn", "Proxy auth rejected", {
             ...requestLogContext,
             ...incomingAuth,
@@ -172,7 +176,17 @@ function startServer(): void {
             authSource: incoming.source,
             tokenKind: incoming.tokenKind,
             reason: "invalid_proxy_token",
+            ...rejectedRequestBody,
           });
+          if (incoming.tokenKind === "anthropic_oauth") {
+            log("warn", "Claude auth fallback diagnostic", {
+              ...requestLogContext,
+              authSource: incoming.source,
+              tokenKind: incoming.tokenKind,
+              reason: "invalid_proxy_token",
+              ...rejectedRequestBody,
+            });
+          }
           return errorResponse(401, "Invalid proxy token.");
         }
       }
@@ -288,16 +302,60 @@ function buildRequestLogContext(req: Request, url: URL): {
   readonly method: string;
   readonly path: string;
   readonly traceId: string | null;
+  readonly claudeSessionId: string | null;
+  readonly claudeAgentId: string | null;
+  readonly claudeParentAgentId: string | null;
   readonly userAgent: string | null;
   readonly contentLength: string | null;
+  readonly realIp: string | null;
+  readonly forwardedFor: string | null;
 } {
   return {
     method: req.method,
     path: url.pathname,
     traceId: req.headers.get("x-request-id"),
+    claudeSessionId: req.headers.get("x-claude-code-session-id"),
+    claudeAgentId: req.headers.get("x-claude-code-agent-id"),
+    claudeParentAgentId: req.headers.get("x-claude-code-parent-agent-id"),
     userAgent: req.headers.get("user-agent"),
     contentLength: req.headers.get("content-length"),
+    realIp: req.headers.get("x-real-ip"),
+    forwardedFor: req.headers.get("x-forwarded-for"),
   };
+}
+
+async function summarizeRejectedRequestBody(req: Request): Promise<Record<string, unknown>> {
+  if (req.method === "GET" || req.method === "HEAD" || req.body === null) {
+    return {
+      rejectedRequestBodySummary: summarizeRequestBody(null),
+      rejectedRequestBodyBytes: 0,
+      rejectedRequestBodyPreview: null,
+      rejectedRequestBodyPreviewTruncated: false,
+    };
+  }
+
+  try {
+    const body = new Uint8Array(await req.arrayBuffer());
+    return {
+      rejectedRequestBodySummary: summarizeRequestBody(body),
+      rejectedRequestBodyBytes: body.byteLength,
+      rejectedRequestBodyPreview: previewRejectedRequestBody(body),
+      rejectedRequestBodyPreviewTruncated: body.byteLength > AUTH_REJECT_BODY_PREVIEW_BYTES,
+    };
+  } catch (err) {
+    return {
+      rejectedRequestBodySummary: null,
+      rejectedRequestBodyBytes: null,
+      rejectedRequestBodyPreview: null,
+      rejectedRequestBodyPreviewTruncated: null,
+      rejectedRequestBodyReadError: String(err),
+    };
+  }
+}
+
+function previewRejectedRequestBody(body: Uint8Array): string | null {
+  if (body.byteLength > AUTH_REJECT_BODY_PREVIEW_BYTES) return null;
+  return new TextDecoder().decode(body);
 }
 
 function errorResponse(

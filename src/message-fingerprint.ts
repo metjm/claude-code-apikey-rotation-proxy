@@ -43,9 +43,7 @@ export function extractActorFromConversationKey(conversationKey: string): string
 
 /**
  * Detect Claude Code's "quota" probe: a POST /v1/messages with max_tokens=1
- * and a single user message whose content is literally "quota". In a rotating
- * proxy this probe is a client compatibility check, not a useful upstream
- * capacity signal, so proxy.ts answers it locally.
+ * and a single user message whose content is literally "quota".
  */
 export function isQuotaProbe(body: Uint8Array | null, path: string): boolean {
   if (body === null) return false;
