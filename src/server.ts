@@ -12,7 +12,7 @@ import type { ProxyTokenEntry, UnixMs } from "./types.ts";
 
 const subcommand = process.argv[2];
 const AUTH_REJECT_BODY_PREVIEW_BYTES = 4_000;
-const PEER_PROXY_AUTH_TTL_MS = 2 * 60 * 60 * 1000;
+const PEER_PROXY_AUTH_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 interface RecentPeerProxyAuth {
   readonly proxyUser: ProxyTokenEntry;
