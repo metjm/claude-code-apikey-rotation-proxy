@@ -144,26 +144,41 @@ function startServer(): void {
       // Disable Bun's idle timeout for these request lifetimes specifically.
       server.timeout(req, 0);
 
+      const requestLogContext = buildRequestLogContext(req, url);
+      const incomingAuth = summarizeIncomingAuth(req);
+
       // Auth gate: if proxy tokens are configured, require a valid one
       let proxyUser: ProxyTokenEntry | null = null;
       if (keyManager.hasTokens()) {
         const incoming = extractProxyToken(req);
         if (incoming === null) {
+          log("warn", "Proxy auth rejected", {
+            ...requestLogContext,
+            ...incomingAuth,
+            authRequired: true,
+            reason: "missing_proxy_token",
+          });
           return errorResponse(401, "Proxy authentication required. Set your API key to a valid proxy token.");
         }
-        proxyUser = keyManager.validateToken(incoming);
+        proxyUser = keyManager.validateToken(incoming.value);
         if (proxyUser === null) {
+          log("warn", "Proxy auth rejected", {
+            ...requestLogContext,
+            ...incomingAuth,
+            authRequired: true,
+            authSource: incoming.source,
+            tokenKind: incoming.tokenKind,
+            reason: "invalid_proxy_token",
+          });
           return errorResponse(401, "Invalid proxy token.");
         }
       }
 
-      const incomingXApiKey = req.headers.get("x-api-key");
-      const incomingAuth = req.headers.get("authorization");
       log("info", "Incoming request auth", {
-        hasXApiKey: !!incomingXApiKey,
-        xApiKeyPrefix: incomingXApiKey?.slice(0, 20),
-        hasAuthorization: !!incomingAuth,
-        authorizationPrefix: incomingAuth?.slice(0, 30),
+        ...requestLogContext,
+        ...incomingAuth,
+        authRequired: keyManager.hasTokens(),
+        user: proxyUser?.label,
       });
 
       const result = await proxyRequest(req, keyManager, config, schemaTracker, proxyUser);
@@ -215,14 +230,71 @@ function startServer(): void {
   });
 }
 
-function extractProxyToken(req: Request): string | null {
+type IncomingAuthSource = "x-api-key" | "authorization";
+type IncomingTokenKind = "anthropic_api_key" | "anthropic_oauth" | "other";
+
+interface ExtractedProxyToken {
+  readonly value: string;
+  readonly source: IncomingAuthSource;
+  readonly tokenKind: IncomingTokenKind;
+}
+
+function extractProxyToken(req: Request): ExtractedProxyToken | null {
   const xApiKey = req.headers.get("x-api-key");
-  if (xApiKey) return xApiKey;
+  if (xApiKey) {
+    return {
+      value: xApiKey,
+      source: "x-api-key",
+      tokenKind: classifyIncomingToken(xApiKey),
+    };
+  }
 
   const auth = req.headers.get("authorization");
-  if (auth && auth.startsWith("Bearer ")) return auth.slice(7);
+  if (auth && auth.startsWith("Bearer ")) {
+    const value = auth.slice(7);
+    return {
+      value,
+      source: "authorization",
+      tokenKind: classifyIncomingToken(value),
+    };
+  }
 
   return null;
+}
+
+function classifyIncomingToken(token: string): IncomingTokenKind {
+  if (token.startsWith("sk-ant-api")) return "anthropic_api_key";
+  if (token.startsWith("sk-ant-oat")) return "anthropic_oauth";
+  return "other";
+}
+
+function summarizeIncomingAuth(req: Request): {
+  readonly hasXApiKey: boolean;
+  readonly hasAuthorization: boolean;
+  readonly authorizationScheme: string | null;
+} {
+  const auth = req.headers.get("authorization");
+  return {
+    hasXApiKey: req.headers.has("x-api-key"),
+    hasAuthorization: auth !== null,
+    authorizationScheme: auth?.split(/\s+/, 1)[0] ?? null,
+  };
+}
+
+function buildRequestLogContext(req: Request, url: URL): {
+  readonly method: string;
+  readonly path: string;
+  readonly traceId: string | null;
+  readonly userAgent: string | null;
+  readonly contentLength: string | null;
+} {
+  return {
+    method: req.method,
+    path: url.pathname,
+    traceId: req.headers.get("x-request-id"),
+    userAgent: req.headers.get("user-agent"),
+    contentLength: req.headers.get("content-length"),
+  };
 }
 
 function errorResponse(

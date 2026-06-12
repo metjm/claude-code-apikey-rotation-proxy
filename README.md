@@ -41,15 +41,16 @@ curl -X POST http://localhost:4080/admin/tokens \
   -d '{"token": "alice-secret-token", "label": "alice"}'
 ```
 
-Each user sets their Claude Code auth token to their proxy token. Use
-`ANTHROPIC_AUTH_TOKEN`, not `ANTHROPIC_API_KEY`. For example, put this in
-`~/.claude/settings.json`:
+Each user sets one Claude Code bearer-token setting to their proxy token.
+`ANTHROPIC_AUTH_TOKEN` works when Claude honors host/gateway auth directly;
+`CLAUDE_CODE_OAUTH_TOKEN` works for Claude Code paths that send OAuth-style
+bearer auth. For example, put this in `~/.claude/settings.json`:
 
 ```json
 {
   "env": {
     "ANTHROPIC_BASE_URL": "http://localhost:4080",
-    "ANTHROPIC_AUTH_TOKEN": "alice-secret-token"
+    "CLAUDE_CODE_OAUTH_TOKEN": "alice-secret-token"
   }
 }
 ```

@@ -43,11 +43,9 @@ export function extractActorFromConversationKey(conversationKey: string): string
 
 /**
  * Detect Claude Code's "quota" probe: a POST /v1/messages with max_tokens=1
- * and a single user message whose content is literally "quota". Anthropic
- * always returns 429 to these regardless of actual quota state, so we use
- * this to skip the rate-limit accounting that would otherwise contaminate
- * a perfectly-healthy key (60s cooldown + AIMD gap growth) for traffic
- * the upstream never intended us to retry.
+ * and a single user message whose content is literally "quota". In a rotating
+ * proxy this probe is a client compatibility check, not a useful upstream
+ * capacity signal, so proxy.ts answers it locally.
  */
 export function isQuotaProbe(body: Uint8Array | null, path: string): boolean {
   if (body === null) return false;

@@ -1250,12 +1250,12 @@ describe("Rate Limit Handling (429)", () => {
   }
 });
 
-describe("Quota-probe 429 passthrough", () => {
+describe("Quota-probe local response", () => {
   // Claude Code sends a small `/v1/messages` request with max_tokens=1 and
-  // a single user message of literally "quota". Anthropic always 429s these
-  // regardless of real quota state. We must proxy them as normal but skip
-  // the rate-limit accounting so a healthy key isn't poisoned by a phantom
-  // cooldown + AIMD gap growth on every probe.
+  // a single user message of literally "quota". In a rotating proxy this
+  // probe is not meaningful per upstream account, and newer Claude Code
+  // versions treat probe failures as auth/subscription failures. Answer it
+  // locally so it cannot poison key state or trigger client auth fallback.
 
   function quotaProbeBody(): string {
     return JSON.stringify({
@@ -1265,7 +1265,7 @@ describe("Quota-probe 429 passthrough", () => {
     });
   }
 
-  test("on 429: returns response unchanged without touching key state or retrying", async () => {
+  test("returns synthetic success without calling upstream or touching key state", async () => {
     const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
     km.addKey(FAKE_KEY_B, "key-b");
@@ -1285,39 +1285,54 @@ describe("Quota-probe 429 passthrough", () => {
       km, config, st,
     );
 
-    // Must NOT retry the next key — only one upstream call.
-    expect(callCount).toBe(1);
-    // Result is a success kind with the 429 response forwarded.
+    // Must not leak the probe to any upstream key.
+    expect(callCount).toBe(0);
     expect(result.kind).toBe("success");
     if (result.kind !== "success") return;
-    expect(result.response.status).toBe(429);
-    const body = await result.response.text();
-    expect(body).toContain("rate_limit_error");
+    expect(result.response.status).toBe(200);
+    expect(result.response.headers.get("x-claude-proxy-quota-probe")).toBe("synthetic");
+    const body = await result.response.json() as {
+      type: string;
+      role: string;
+      model: string;
+      content: Array<{ type: string; text: string }>;
+      usage: { input_tokens: number; output_tokens: number };
+    };
+    expect(body.type).toBe("message");
+    expect(body.role).toBe("assistant");
+    expect(body.model).toBe("claude-opus-4-7");
+    expect(body.content).toEqual([{ type: "text", text: "ok" }]);
+    expect(body.usage.input_tokens).toBe(1);
+    expect(body.usage.output_tokens).toBe(1);
 
-    // Critical: neither key should have a cooldown set, and neither should
-    // have grown its inter-request gap. The probe must not poison state.
+    // Critical: neither key should have any request, cooldown, or AIMD state.
     for (const k of km.listKeys()) {
       expect(k.availableAt).toBe(0 as unknown as typeof k.availableAt);
       expect(k.interRequestGapMs).toBe(0);
-      // Hit stat also unchanged (the probe didn't even count as a rate-limit
-      // hit on the key).
+      expect(k.stats.totalRequests).toBe(0);
+      expect(k.stats.successfulRequests).toBe(0);
       expect(k.stats.rateLimitHits).toBe(0);
     }
   });
 
-  test("on 200: probe behaves like a normal request (no special passthrough)", async () => {
+  test("does not call upstream even if upstream would have returned 200", async () => {
     const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
 
-    const mock = upstream(() => new Response(JSON.stringify({ id: "ok" }), {
+    let callCount = 0;
+    const mock = upstream(() => {
+      callCount++;
+      return new Response(JSON.stringify({ id: "ok" }), {
       status: 200, headers: { "content-type": "application/json" },
-    }));
+      });
+    });
 
     const config = makeConfig(mock.url);
     const result = await proxyRequest(
       makeRequest("/v1/messages", { method: "POST", body: quotaProbeBody() }),
       km, config, st,
     );
+    expect(callCount).toBe(0);
     expect(result.kind).toBe("success");
     if (result.kind !== "success") return;
     expect(result.response.status).toBe(200);

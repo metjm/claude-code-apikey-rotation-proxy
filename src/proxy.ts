@@ -320,13 +320,36 @@ export async function proxyRequest(
     : null;
   const conversationKey = buildConversationKey(proxyUser, sessionId, firstMessageHash);
   // Claude Code's "quota" probe: small POST /v1/messages with content="quota"
-  // and max_tokens=1. Anthropic always 429s these regardless of real quota
-  // state. We proxy them normally but suppress the rate-limit accounting on
-  // a 429 response — otherwise every probe poisons a healthy key with a 60s
-  // cooldown + AIMD gap growth, queueing real traffic behind a phantom limit.
+  // and max_tokens=1. In a rotating proxy, a per-account quota probe is not a
+  // meaningful client-facing signal: one upstream account can reject the probe
+  // while the fleet still has usable capacity. Newer Claude Code builds also
+  // treat probe failures as auth/subscription failures and retry with a
+  // different bearer, which the proxy correctly rejects. Answer the probe
+  // locally so subscription rotation remains transparent to the client.
   const requestIsQuotaProbe = isQuotaProbe(requestBody, url.pathname);
   if (requestIsQuotaProbe) {
-    log("info", "Detected quota probe (will suppress rate-limit accounting on 429)", {
+    const entry = keyManager.getNextAvailableKey();
+    if (entry !== null) {
+      const summary = summarizeRequestBody(requestBody);
+      if (proxyUser) keyManager.recordTokenSuccess(proxyUser, 0, 0);
+      log("info", "Quota probe answered locally", {
+        label: entry.label,
+        user: proxyUser?.label,
+        method: req.method,
+        path: url.pathname,
+        traceId,
+        sessionId,
+        conversationKey,
+        requestContentLength,
+        model: summary.model,
+      });
+      return {
+        kind: "success",
+        response: syntheticQuotaProbeResponse(summary.model, traceId),
+        usedKey: entry,
+      };
+    }
+    log("info", "Detected quota probe but no key is currently available", {
       user: proxyUser?.label,
       method: req.method,
       path: url.pathname,
@@ -621,37 +644,6 @@ export async function proxyRequest(
     }
 
     if (upstream.status === RATE_LIMIT_STATUS) {
-      // Quota-probe passthrough: forward the upstream 429 to the client
-      // unchanged, but DO NOT call recordRateLimit and DO NOT retry. These
-      // probes always 429 on Anthropic's side, so the 429 isn't evidence
-      // that this key is rate-limited for real traffic.
-      if (requestIsQuotaProbe) {
-        clearActiveRequest(traceId);
-        log("info", "Quota-probe 429 — passing through without key state update", {
-          label: entry.label,
-          user: proxyUser?.label,
-          method: req.method,
-          path: url.pathname,
-          attempt: attempts,
-          traceId,
-          sessionId,
-          conversationKey,
-          durationMs: Date.now() - fetchStartedAt,
-        });
-        const responseHeaders = new Headers();
-        for (const [k, v] of upstream.headers.entries()) {
-          if (!STRIPPED_RESPONSE_HEADERS.has(k.toLowerCase())) responseHeaders.set(k, v);
-        }
-        const passthroughBody = await upstream.text();
-        return {
-          kind: "success",
-          response: new Response(passthroughBody, {
-            status: upstream.status,
-            headers: responseHeaders,
-          }),
-          usedKey: entry,
-        };
-      }
       sawRateLimit = true;
       const retryAfter = parseRetryAfter(upstream.headers);
       keyManager.recordRateLimit(entry, retryAfter);
@@ -1033,6 +1025,34 @@ async function bufferRequestBody(req: Request): Promise<BufferedRequestBody> {
   if (req.body === null) return null;
   const body = await req.arrayBuffer();
   return new Uint8Array(body);
+}
+
+function syntheticQuotaProbeResponse(model: string | null, traceId: string): Response {
+  const idSuffix = traceId.replace(/[^a-zA-Z0-9]/g, "").slice(0, 24) || "local";
+  return new Response(
+    JSON.stringify({
+      id: `msg_proxy_quota_${idSuffix}`,
+      type: "message",
+      role: "assistant",
+      model: model ?? "proxy-quota-probe",
+      content: [{ type: "text", text: "ok" }],
+      stop_reason: "end_turn",
+      stop_sequence: null,
+      usage: {
+        input_tokens: 1,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+        output_tokens: 1,
+      },
+    }),
+    {
+      status: 200,
+      headers: {
+        "content-type": "application/json",
+        "x-claude-proxy-quota-probe": "synthetic",
+      },
+    },
+  );
 }
 
 // Flatten Response Headers into a plain object so it survives JSON-stringify
