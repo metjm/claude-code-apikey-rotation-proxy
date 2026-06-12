@@ -1297,7 +1297,7 @@ describe("Quota-probe routing", () => {
     expect(await result.response.json()).toMatchObject({ id: "msg_ok" });
   });
 
-  test("quota probe 429 follows normal rotation", async () => {
+  test("quota probe with a Claude session id bypasses affinity and rotates after 429", async () => {
     const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
     km.addKey(FAKE_KEY_B, "key-b");
@@ -1317,7 +1317,11 @@ describe("Quota-probe routing", () => {
 
     const config = makeConfig(mock.url);
     const result = await proxyRequest(
-      makeRequest("/v1/messages", { method: "POST", body: quotaProbeBody() }),
+      makeRequest("/v1/messages", {
+        method: "POST",
+        headers: { "x-claude-code-session-id": "quota-session-1" },
+        body: quotaProbeBody(),
+      }),
       km, config, st,
     );
     expect(callCount).toBe(2);
