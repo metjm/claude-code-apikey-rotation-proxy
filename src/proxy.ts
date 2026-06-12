@@ -312,24 +312,33 @@ export async function proxyRequest(
   const requestBodyState = snapshotRequestBodyState(req, requestBody);
   const requestBodySummary = summarizeRequestBody(requestBody);
   const requestIsQuotaProbe = isQuotaProbe(requestBody, url.pathname);
+  if (requestIsQuotaProbe) {
+    if (proxyUser) keyManager.recordTokenSuccess(proxyUser, 0, 0);
+    log("info", "Quota probe answered locally", {
+      user: proxyUser?.label,
+      method: req.method,
+      path: url.pathname,
+      traceId,
+      sessionId,
+      requestContentLength,
+      requestBodyState,
+      requestBodySummary,
+    });
+    return {
+      kind: "local_response",
+      response: syntheticQuotaProbeResponse(requestBodySummary.model, traceId),
+    };
+  }
   // With per-conversation pinning off (default) every call in a session
   // shares one key — drop the message hash so buildConversationKey produces
   // a session-only 2-part key. With it on, /v1/messages calls get the
   // 3-part hashed form and sub-agents within a session can split across
   // keys. Sibling endpoints (count_tokens, etc.) always get the 2-part
   // form regardless of mode (computeFirstMessageHash returns null for them).
-  //
-  // Claude Code quota probes carry the real session id, but they are startup
-  // compatibility checks rather than conversation turns. Do not let them seed
-  // session affinity; if the first probed key returns a short 429, the probe
-  // must rotate to another key immediately instead of waiting on the pinned
-  // subscription and triggering Claude's auth fallback path.
-  const firstMessageHash = requestIsQuotaProbe || !config.perConversationPinning
+  const firstMessageHash = !config.perConversationPinning
     ? null
     : computeFirstMessageHash(requestBody, url.pathname);
-  const conversationKey = requestIsQuotaProbe
-    ? null
-    : buildConversationKey(proxyUser, sessionId, firstMessageHash);
+  const conversationKey = buildConversationKey(proxyUser, sessionId, firstMessageHash);
   const requestFirstChunkTimeoutMs = requestUsesContext1m(req.headers)
     ? config.firstChunkTimeoutMsContext1m
     : config.firstChunkTimeoutMs;
@@ -1006,6 +1015,34 @@ export function activeStreamCountForTests(): number {
 function allExhaustedResult(keyManager: KeyManager): ProxyResult {
   if (keyManager.totalCount() === 0) return { kind: "no_keys" };
   return { kind: "all_exhausted", earliestAvailableAt: keyManager.getEarliestAvailableAt() };
+}
+
+function syntheticQuotaProbeResponse(model: string | null, traceId: string): Response {
+  const idSuffix = traceId.replace(/[^a-zA-Z0-9]/g, "").slice(0, 24) || "local";
+  return new Response(
+    JSON.stringify({
+      id: `msg_proxy_quota_${idSuffix}`,
+      type: "message",
+      role: "assistant",
+      model: model ?? "proxy-quota-probe",
+      content: [{ type: "text", text: "ok" }],
+      stop_reason: "end_turn",
+      stop_sequence: null,
+      usage: {
+        input_tokens: 1,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+        output_tokens: 1,
+      },
+    }),
+    {
+      status: 200,
+      headers: {
+        "content-type": "application/json",
+        "x-claude-proxy-quota-probe": "synthetic",
+      },
+    },
+  );
 }
 
 function isKeyAvailableNow(entry: ApiKeyEntry): boolean {

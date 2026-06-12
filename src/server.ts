@@ -238,6 +238,7 @@ function startServer(): void {
 
       switch (result.kind) {
         case "success":
+        case "local_response":
           return result.response;
 
         case "no_keys":

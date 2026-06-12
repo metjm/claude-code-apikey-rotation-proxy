@@ -1250,11 +1250,11 @@ describe("Rate Limit Handling (429)", () => {
   }
 });
 
-describe("Quota-probe routing", () => {
+describe("Quota-probe local response", () => {
   // Claude Code sends a small `/v1/messages` request with max_tokens=1 and
-  // a single user message of literally "quota". These probes use the same
-  // upstream/auth path as normal messages; the server root HEAD preflight is
-  // handled separately so we do not need to fabricate Anthropic responses.
+  // a single user message of literally "quota". This startup check is not
+  // meaningful per upstream account in a rotating proxy, so answer it locally
+  // to avoid poisoning account cooldown state.
 
   function quotaProbeBody(): string {
     return JSON.stringify({
@@ -1264,20 +1264,18 @@ describe("Quota-probe routing", () => {
     });
   }
 
-  test("forwards quota probe through normal upstream routing", async () => {
+  test("returns synthetic success without calling upstream or touching key state", async () => {
     const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
+    km.addKey(FAKE_KEY_B, "key-b");
 
     let callCount = 0;
-    let forwardedBody = "";
-    const mock = upstream(async (req) => {
+    const mock = upstream(() => {
       callCount++;
-      forwardedBody = await req.text();
-      expect(req.headers.get("x-api-key")).toBe(FAKE_KEY_A);
-      return new Response(JSON.stringify({ id: "msg_ok", type: "message" }), {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      });
+      return new Response(
+        JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: "Error" } }),
+        { status: 429, headers: { "content-type": "application/json" } },
+      );
     });
 
     const config = makeConfig(mock.url);
@@ -1286,29 +1284,42 @@ describe("Quota-probe routing", () => {
       km, config, st,
     );
 
-    expect(callCount).toBe(1);
-    expect(JSON.parse(forwardedBody)).toMatchObject({
-      max_tokens: 1,
-      messages: [{ role: "user", content: "quota" }],
-    });
-    expect(result.kind).toBe("success");
-    if (result.kind !== "success") return;
+    expect(callCount).toBe(0);
+    expect(result.kind).toBe("local_response");
+    if (result.kind !== "local_response") return;
     expect(result.response.status).toBe(200);
-    expect(await result.response.json()).toMatchObject({ id: "msg_ok" });
+    expect(result.response.headers.get("x-claude-proxy-quota-probe")).toBe("synthetic");
+    const body = await result.response.json() as {
+      type: string;
+      role: string;
+      model: string;
+      content: Array<{ type: string; text: string }>;
+      usage: { input_tokens: number; output_tokens: number };
+    };
+    expect(body.type).toBe("message");
+    expect(body.role).toBe("assistant");
+    expect(body.model).toBe("claude-opus-4-7");
+    expect(body.content).toEqual([{ type: "text", text: "ok" }]);
+    expect(body.usage.input_tokens).toBe(1);
+    expect(body.usage.output_tokens).toBe(1);
+
+    for (const k of km.listKeys()) {
+      expect(k.availableAt).toBe(0 as unknown as typeof k.availableAt);
+      expect(k.interRequestGapMs).toBe(0);
+      expect(k.stats.totalRequests).toBe(0);
+      expect(k.stats.successfulRequests).toBe(0);
+      expect(k.stats.rateLimitHits).toBe(0);
+    }
   });
 
-  test("quota probe with a Claude session id bypasses affinity and rotates after 429", async () => {
+  test("does not call upstream even if all keys are already cooling down", async () => {
     const { km, st } = setup();
-    km.addKey(FAKE_KEY_A, "key-a");
-    km.addKey(FAKE_KEY_B, "key-b");
+    const entry = km.addKey(FAKE_KEY_A, "key-a");
+    km.recordRateLimit(entry, 60);
 
     let callCount = 0;
-    const mock = upstream((req) => {
+    const mock = upstream(() => {
       callCount++;
-      const key = req.headers.get("x-api-key");
-      if (key === FAKE_KEY_A) {
-        return new Response("rate limited", { status: 429, headers: { "retry-after": "30" } });
-      }
       return new Response(JSON.stringify({ id: "ok" }), {
         status: 200,
         headers: { "content-type": "application/json" },
@@ -1324,14 +1335,10 @@ describe("Quota-probe routing", () => {
       }),
       km, config, st,
     );
-    expect(callCount).toBe(2);
-    expect(result.kind).toBe("success");
-    if (result.kind !== "success") return;
+    expect(callCount).toBe(0);
+    expect(result.kind).toBe("local_response");
+    if (result.kind !== "local_response") return;
     expect(result.response.status).toBe(200);
-
-    const keyA = km.listKeys().find((k) => k.label === "key-a")!;
-    expect(keyA.availableAt).toBeGreaterThan(Date.now());
-    expect(keyA.stats.rateLimitHits).toBe(1);
   });
 
   test("non-probe 429 still triggers recordRateLimit + retry", async () => {

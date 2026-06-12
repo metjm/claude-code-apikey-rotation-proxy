@@ -192,6 +192,11 @@ interface ProxySuccess {
   readonly usedKey: ApiKeyEntry;
 }
 
+interface ProxyLocalResponse {
+  readonly kind: "local_response";
+  readonly response: Response;
+}
+
 interface ProxyRateLimited {
   readonly kind: "rate_limited";
   readonly retryAfterSecs: number;
@@ -216,6 +221,7 @@ interface ProxyAllExhausted {
 
 export type ProxyResult =
   | ProxySuccess
+  | ProxyLocalResponse
   | ProxyRateLimited
   | ProxyError
   | ProxyNoKeys

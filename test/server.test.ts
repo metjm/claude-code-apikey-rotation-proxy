@@ -214,6 +214,7 @@ function startProxy(opts: {
 
       switch (result.kind) {
         case "success":
+        case "local_response":
           return result.response;
         case "no_keys":
           return new Response(

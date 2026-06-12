@@ -121,7 +121,7 @@ function startProxy(opts: {
       }
 
       const result = await proxyRequest(req, km, config, st, proxyUser);
-      if (result.kind === "success") return result.response;
+      if (result.kind === "success" || result.kind === "local_response") return result.response;
       return new Response(JSON.stringify({ error: result }), { status: 500 });
     },
   });
