@@ -12,15 +12,14 @@ import type { ProxyTokenEntry, UnixMs } from "./types.ts";
 
 const subcommand = process.argv[2];
 const AUTH_REJECT_BODY_PREVIEW_BYTES = 4_000;
-const CLAUDE_SESSION_PROXY_AUTH_TTL_MS = 24 * 60 * 60 * 1000;
+const PEER_PROXY_AUTH_TTL_MS = 2 * 60 * 60 * 1000;
 
-interface RecentClaudeSessionAuth {
+interface RecentPeerProxyAuth {
   readonly proxyUser: ProxyTokenEntry;
-  readonly peerKey: string;
   readonly expiresAt: number;
 }
 
-const recentClaudeSessionAuth = new Map<string, RecentClaudeSessionAuth>();
+const recentPeerProxyAuth = new Map<string, RecentPeerProxyAuth>();
 
 if (subcommand === "service") {
   const action = process.argv[3];
@@ -168,16 +167,15 @@ function startServer(): void {
         if (incoming !== null) {
           proxyUser = keyManager.validateToken(incoming.value);
           if (proxyUser !== null) {
-            rememberClaudeSessionAuth(req, proxyUser);
+            rememberPeerProxyAuth(req, proxyUser);
           }
         }
 
         if (proxyUser === null) {
-          const whitelistedUser = resolveRecentClaudeSessionAuth(req);
+          const whitelistedUser = resolveRecentPeerProxyAuth(req);
           if (whitelistedUser !== null) {
             proxyUser = whitelistedUser;
-            rememberClaudeSessionAuth(req, proxyUser);
-            log("warn", "Proxy auth accepted via Claude session whitelist", {
+            log("warn", "Proxy auth accepted via IP whitelist", {
               ...requestLogContext,
               ...incomingAuth,
               authRequired: true,
@@ -186,7 +184,7 @@ function startServer(): void {
                 tokenKind: incoming.tokenKind,
               } : {}),
               user: proxyUser.label,
-              reason: "recent_valid_proxy_token_same_session_and_peer",
+              reason: "recent_valid_proxy_token_same_peer",
             });
           }
         }
@@ -322,39 +320,34 @@ function classifyIncomingToken(token: string): IncomingTokenKind {
   return "other";
 }
 
-function rememberClaudeSessionAuth(req: Request, proxyUser: ProxyTokenEntry): void {
-  const sessionId = req.headers.get("x-claude-code-session-id");
-  if (!sessionId) return;
+function rememberPeerProxyAuth(req: Request, proxyUser: ProxyTokenEntry): void {
   const peerKey = requestPeerKey(req);
   if (peerKey === null) return;
   const nowMs = Date.now();
-  cleanupExpiredClaudeSessionAuth(nowMs);
-  recentClaudeSessionAuth.set(sessionId, {
+  cleanupExpiredPeerProxyAuth(nowMs);
+  recentPeerProxyAuth.set(peerKey, {
     proxyUser,
-    peerKey,
-    expiresAt: nowMs + CLAUDE_SESSION_PROXY_AUTH_TTL_MS,
+    expiresAt: nowMs + PEER_PROXY_AUTH_TTL_MS,
   });
 }
 
-function resolveRecentClaudeSessionAuth(req: Request): ProxyTokenEntry | null {
-  const sessionId = req.headers.get("x-claude-code-session-id");
-  if (!sessionId) return null;
+function resolveRecentPeerProxyAuth(req: Request): ProxyTokenEntry | null {
+  const peerKey = requestPeerKey(req);
+  if (peerKey === null) return null;
   const nowMs = Date.now();
-  cleanupExpiredClaudeSessionAuth(nowMs);
-  const remembered = recentClaudeSessionAuth.get(sessionId);
+  cleanupExpiredPeerProxyAuth(nowMs);
+  const remembered = recentPeerProxyAuth.get(peerKey);
   if (remembered === undefined) return null;
   if (remembered.expiresAt <= nowMs) {
-    recentClaudeSessionAuth.delete(sessionId);
+    recentPeerProxyAuth.delete(peerKey);
     return null;
   }
-  const peerKey = requestPeerKey(req);
-  if (peerKey === null || remembered.peerKey !== peerKey) return null;
   return remembered.proxyUser;
 }
 
-function cleanupExpiredClaudeSessionAuth(nowMs: number): void {
-  for (const [sessionId, auth] of recentClaudeSessionAuth) {
-    if (auth.expiresAt <= nowMs) recentClaudeSessionAuth.delete(sessionId);
+function cleanupExpiredPeerProxyAuth(nowMs: number): void {
+  for (const [peerKey, auth] of recentPeerProxyAuth) {
+    if (auth.expiresAt <= nowMs) recentPeerProxyAuth.delete(peerKey);
   }
 }
 

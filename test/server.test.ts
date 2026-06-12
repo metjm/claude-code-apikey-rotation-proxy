@@ -119,7 +119,7 @@ function startProxy(opts: {
     maxFirstChunkRetries: 2,
     webhookUrl: null,
   };
-  const recentClaudeSessionAuth = new Map<string, { proxyUser: ProxyTokenEntry; peerKey: string }>();
+  const recentPeerProxyAuth = new Map<string, { proxyUser: ProxyTokenEntry }>();
 
   const server = Bun.serve({
     port: 0,
@@ -164,22 +164,17 @@ function startProxy(opts: {
         if (incoming !== null) {
           proxyUser = km.validateToken(incoming);
           if (proxyUser !== null) {
-            const sessionId = req.headers.get("x-claude-code-session-id");
             const peerKey = requestPeerKeyForTest(req);
-            if (sessionId !== null && peerKey !== null) {
-              recentClaudeSessionAuth.set(sessionId, {
-                proxyUser,
-                peerKey,
-              });
+            if (peerKey !== null) {
+              recentPeerProxyAuth.set(peerKey, { proxyUser });
             }
           }
         }
 
         if (!proxyUser) {
-          const sessionId = req.headers.get("x-claude-code-session-id");
-          const remembered = sessionId === null ? undefined : recentClaudeSessionAuth.get(sessionId);
           const peerKey = requestPeerKeyForTest(req);
-          if (remembered !== undefined && peerKey !== null && remembered.peerKey === peerKey) {
+          const remembered = peerKey === null ? undefined : recentPeerProxyAuth.get(peerKey);
+          if (remembered !== undefined) {
             proxyUser = remembered.proxyUser;
           }
         }
@@ -1076,13 +1071,14 @@ describe("Proxy Auth Gate", () => {
     expect(body.ok).toBe(true);
   });
 
-  test("valid proxy token whitelists Claude session for the same client IP", async () => {
+  test("valid proxy token whitelists the client IP for swapped Claude auth", async () => {
     const dir = makeTempDir();
     const u = startMockUpstream(jsonOkHandler());
     const p = startProxy({ dataDir: dir, upstream: u.url });
     p.km.addKey(FAKE_KEY_1, "session-key");
     p.km.addToken(PROXY_TOKEN_ALICE, "alice");
-    const sessionId = "claude-session-whitelist-1";
+    const probeSessionId = "claude-probe-session-1";
+    const realSessionId = "claude-real-session-2";
     const sameIp = "203.0.113.10";
     const differentIp = "203.0.113.11";
     const body = JSON.stringify({
@@ -1097,41 +1093,40 @@ describe("Proxy Auth Gate", () => {
         headers: {
           "content-type": "application/json",
           "x-api-key": PROXY_TOKEN_ALICE,
-          "x-claude-code-session-id": sessionId,
+          "x-claude-code-session-id": probeSessionId,
           "x-real-ip": sameIp,
         },
         body,
       });
       expect(seeded.status).toBe(200);
 
-      const noAuthSameIp = await fetch(`${p.url}/v1/messages`, {
+      const noAuthSameIpNoSession = await fetch(`${p.url}/v1/messages`, {
         method: "POST",
         headers: {
           "content-type": "application/json",
-          "x-claude-code-session-id": sessionId,
           "x-real-ip": sameIp,
         },
         body,
       });
-      expect(noAuthSameIp.status).toBe(200);
+      expect(noAuthSameIpNoSession.status).toBe(200);
 
-      const swappedOauthSameIp = await fetch(`${p.url}/v1/messages`, {
+      const swappedOauthSameIpDifferentSession = await fetch(`${p.url}/v1/messages`, {
         method: "POST",
         headers: {
           "content-type": "application/json",
           authorization: "Bearer sk-ant-oat-swapped-claude-token",
-          "x-claude-code-session-id": sessionId,
+          "x-claude-code-session-id": realSessionId,
           "x-real-ip": sameIp,
         },
         body,
       });
-      expect(swappedOauthSameIp.status).toBe(200);
+      expect(swappedOauthSameIpDifferentSession.status).toBe(200);
 
       const noAuthDifferentIp = await fetch(`${p.url}/v1/messages`, {
         method: "POST",
         headers: {
           "content-type": "application/json",
-          "x-claude-code-session-id": sessionId,
+          "x-claude-code-session-id": probeSessionId,
           "x-real-ip": differentIp,
         },
         body,
