@@ -12,6 +12,15 @@ import type { ProxyTokenEntry, UnixMs } from "./types.ts";
 
 const subcommand = process.argv[2];
 const AUTH_REJECT_BODY_PREVIEW_BYTES = 4_000;
+const CLAUDE_SESSION_PROXY_AUTH_TTL_MS = 24 * 60 * 60 * 1000;
+
+interface RecentClaudeSessionAuth {
+  readonly proxyUser: ProxyTokenEntry;
+  readonly peerKey: string;
+  readonly expiresAt: number;
+}
+
+const recentClaudeSessionAuth = new Map<string, RecentClaudeSessionAuth>();
 
 if (subcommand === "service") {
   const action = process.argv[3];
@@ -155,39 +164,66 @@ function startServer(): void {
       let proxyUser: ProxyTokenEntry | null = null;
       if (keyManager.hasTokens()) {
         const incoming = extractProxyToken(req);
-        if (incoming === null) {
-          const rejectedRequestBody = await summarizeRejectedRequestBody(req);
-          log("warn", "Proxy auth rejected", {
-            ...requestLogContext,
-            ...incomingAuth,
-            authRequired: true,
-            reason: "missing_proxy_token",
-            ...rejectedRequestBody,
-          });
-          return errorResponse(401, "Proxy authentication required. Set your API key to a valid proxy token.");
+
+        if (incoming !== null) {
+          proxyUser = keyManager.validateToken(incoming.value);
+          if (proxyUser !== null) {
+            rememberClaudeSessionAuth(req, proxyUser);
+          }
         }
-        proxyUser = keyManager.validateToken(incoming.value);
+
         if (proxyUser === null) {
-          const rejectedRequestBody = await summarizeRejectedRequestBody(req);
-          log("warn", "Proxy auth rejected", {
-            ...requestLogContext,
-            ...incomingAuth,
-            authRequired: true,
-            authSource: incoming.source,
-            tokenKind: incoming.tokenKind,
-            reason: "invalid_proxy_token",
-            ...rejectedRequestBody,
-          });
-          if (incoming.tokenKind === "anthropic_oauth") {
-            log("warn", "Claude auth fallback diagnostic", {
+          const whitelistedUser = resolveRecentClaudeSessionAuth(req);
+          if (whitelistedUser !== null) {
+            proxyUser = whitelistedUser;
+            rememberClaudeSessionAuth(req, proxyUser);
+            log("warn", "Proxy auth accepted via Claude session whitelist", {
               ...requestLogContext,
+              ...incomingAuth,
+              authRequired: true,
+              ...(incoming !== null ? {
+                authSource: incoming.source,
+                tokenKind: incoming.tokenKind,
+              } : {}),
+              user: proxyUser.label,
+              reason: "recent_valid_proxy_token_same_session_and_peer",
+            });
+          }
+        }
+
+        if (proxyUser === null) {
+          if (incoming === null) {
+            const rejectedRequestBody = await summarizeRejectedRequestBody(req);
+            log("warn", "Proxy auth rejected", {
+              ...requestLogContext,
+              ...incomingAuth,
+              authRequired: true,
+              reason: "missing_proxy_token",
+              ...rejectedRequestBody,
+            });
+            return errorResponse(401, "Proxy authentication required. Set your API key to a valid proxy token.");
+          } else {
+            const rejectedRequestBody = await summarizeRejectedRequestBody(req);
+            log("warn", "Proxy auth rejected", {
+              ...requestLogContext,
+              ...incomingAuth,
+              authRequired: true,
               authSource: incoming.source,
               tokenKind: incoming.tokenKind,
               reason: "invalid_proxy_token",
               ...rejectedRequestBody,
             });
+            if (incoming.tokenKind === "anthropic_oauth") {
+              log("warn", "Claude auth fallback diagnostic", {
+                ...requestLogContext,
+                authSource: incoming.source,
+                tokenKind: incoming.tokenKind,
+                reason: "invalid_proxy_token",
+                ...rejectedRequestBody,
+              });
+            }
+            return errorResponse(401, "Invalid proxy token.");
           }
-          return errorResponse(401, "Invalid proxy token.");
         }
       }
 
@@ -283,6 +319,48 @@ function classifyIncomingToken(token: string): IncomingTokenKind {
   if (token.startsWith("sk-ant-api")) return "anthropic_api_key";
   if (token.startsWith("sk-ant-oat")) return "anthropic_oauth";
   return "other";
+}
+
+function rememberClaudeSessionAuth(req: Request, proxyUser: ProxyTokenEntry): void {
+  const sessionId = req.headers.get("x-claude-code-session-id");
+  if (!sessionId) return;
+  const peerKey = requestPeerKey(req);
+  if (peerKey === null) return;
+  const nowMs = Date.now();
+  cleanupExpiredClaudeSessionAuth(nowMs);
+  recentClaudeSessionAuth.set(sessionId, {
+    proxyUser,
+    peerKey,
+    expiresAt: nowMs + CLAUDE_SESSION_PROXY_AUTH_TTL_MS,
+  });
+}
+
+function resolveRecentClaudeSessionAuth(req: Request): ProxyTokenEntry | null {
+  const sessionId = req.headers.get("x-claude-code-session-id");
+  if (!sessionId) return null;
+  const nowMs = Date.now();
+  cleanupExpiredClaudeSessionAuth(nowMs);
+  const remembered = recentClaudeSessionAuth.get(sessionId);
+  if (remembered === undefined) return null;
+  if (remembered.expiresAt <= nowMs) {
+    recentClaudeSessionAuth.delete(sessionId);
+    return null;
+  }
+  const peerKey = requestPeerKey(req);
+  if (peerKey === null || remembered.peerKey !== peerKey) return null;
+  return remembered.proxyUser;
+}
+
+function cleanupExpiredClaudeSessionAuth(nowMs: number): void {
+  for (const [sessionId, auth] of recentClaudeSessionAuth) {
+    if (auth.expiresAt <= nowMs) recentClaudeSessionAuth.delete(sessionId);
+  }
+}
+
+function requestPeerKey(req: Request): string | null {
+  const forwardedFor = req.headers.get("x-forwarded-for");
+  const firstForwardedFor = forwardedFor?.split(",", 1)[0]?.trim();
+  return req.headers.get("x-real-ip") ?? firstForwardedFor ?? null;
 }
 
 function summarizeIncomingAuth(req: Request): {

@@ -119,6 +119,7 @@ function startProxy(opts: {
     maxFirstChunkRetries: 2,
     webhookUrl: null,
   };
+  const recentClaudeSessionAuth = new Map<string, { proxyUser: ProxyTokenEntry; peerKey: string }>();
 
   const server = Bun.serve({
     port: 0,
@@ -159,29 +160,53 @@ function startProxy(opts: {
         const auth = req.headers.get("authorization");
         const incoming =
           xApiKey ?? (auth?.startsWith("Bearer ") ? auth.slice(7) : null);
-        if (!incoming) {
-          return new Response(
-            JSON.stringify({
-              error: {
-                type: "proxy_error",
-                message:
-                  "Proxy authentication required. Set your API key to a valid proxy token.",
-              },
-            }),
-            { status: 401, headers: { "content-type": "application/json" } },
-          );
+
+        if (incoming !== null) {
+          proxyUser = km.validateToken(incoming);
+          if (proxyUser !== null) {
+            const sessionId = req.headers.get("x-claude-code-session-id");
+            const peerKey = requestPeerKeyForTest(req);
+            if (sessionId !== null && peerKey !== null) {
+              recentClaudeSessionAuth.set(sessionId, {
+                proxyUser,
+                peerKey,
+              });
+            }
+          }
         }
-        proxyUser = km.validateToken(incoming);
+
         if (!proxyUser) {
-          return new Response(
-            JSON.stringify({
-              error: {
-                type: "proxy_error",
-                message: "Invalid proxy token.",
-              },
-            }),
-            { status: 401, headers: { "content-type": "application/json" } },
-          );
+          const sessionId = req.headers.get("x-claude-code-session-id");
+          const remembered = sessionId === null ? undefined : recentClaudeSessionAuth.get(sessionId);
+          const peerKey = requestPeerKeyForTest(req);
+          if (remembered !== undefined && peerKey !== null && remembered.peerKey === peerKey) {
+            proxyUser = remembered.proxyUser;
+          }
+        }
+
+        if (!proxyUser) {
+          if (incoming === null) {
+            return new Response(
+              JSON.stringify({
+                error: {
+                  type: "proxy_error",
+                  message:
+                    "Proxy authentication required. Set your API key to a valid proxy token.",
+                },
+              }),
+              { status: 401, headers: { "content-type": "application/json" } },
+            );
+          } else {
+            return new Response(
+              JSON.stringify({
+                error: {
+                  type: "proxy_error",
+                  message: "Invalid proxy token.",
+                },
+              }),
+              { status: 401, headers: { "content-type": "application/json" } },
+            );
+          }
         }
       }
 
@@ -253,6 +278,12 @@ function startProxy(opts: {
     config,
     stop: () => { server.stop(true); st.close(); km.close(); },
   };
+}
+
+function requestPeerKeyForTest(req: Request): string | null {
+  const forwardedFor = req.headers.get("x-forwarded-for");
+  const firstForwardedFor = forwardedFor?.split(",", 1)[0]?.trim();
+  return req.headers.get("x-real-ip") ?? firstForwardedFor ?? null;
 }
 
 function makeTempDir(): string {
@@ -1042,6 +1073,74 @@ describe("Proxy Auth Gate", () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.ok).toBe(true);
+  });
+
+  test("valid proxy token whitelists Claude session for the same client IP", async () => {
+    const dir = makeTempDir();
+    const u = startMockUpstream(jsonOkHandler());
+    const p = startProxy({ dataDir: dir, upstream: u.url });
+    p.km.addKey(FAKE_KEY_1, "session-key");
+    p.km.addToken(PROXY_TOKEN_ALICE, "alice");
+    const sessionId = "claude-session-whitelist-1";
+    const sameIp = "203.0.113.10";
+    const differentIp = "203.0.113.11";
+    const body = JSON.stringify({
+      model: "claude-3-haiku-20240307",
+      max_tokens: 1,
+      messages: [],
+    });
+
+    try {
+      const seeded = await fetch(`${p.url}/v1/messages`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": PROXY_TOKEN_ALICE,
+          "x-claude-code-session-id": sessionId,
+          "x-real-ip": sameIp,
+        },
+        body,
+      });
+      expect(seeded.status).toBe(200);
+
+      const noAuthSameIp = await fetch(`${p.url}/v1/messages`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-claude-code-session-id": sessionId,
+          "x-real-ip": sameIp,
+        },
+        body,
+      });
+      expect(noAuthSameIp.status).toBe(200);
+
+      const swappedOauthSameIp = await fetch(`${p.url}/v1/messages`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer sk-ant-oat-swapped-claude-token",
+          "x-claude-code-session-id": sessionId,
+          "x-real-ip": sameIp,
+        },
+        body,
+      });
+      expect(swappedOauthSameIp.status).toBe(200);
+
+      const noAuthDifferentIp = await fetch(`${p.url}/v1/messages`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-claude-code-session-id": sessionId,
+          "x-real-ip": differentIp,
+        },
+        body,
+      });
+      expect(noAuthDifferentIp.status).toBe(401);
+    } finally {
+      p.stop();
+      u.stop();
+      cleanupTempDir(dir);
+    }
   });
 
   test("after removing all tokens: proxy is open again", async () => {
