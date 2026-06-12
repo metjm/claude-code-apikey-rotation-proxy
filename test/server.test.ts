@@ -125,6 +125,10 @@ function startProxy(opts: {
     async fetch(req: Request): Promise<Response> {
       const url = new URL(req.url);
 
+      if (url.pathname === "/" && req.method === "HEAD") {
+        return new Response(null, { status: 204 });
+      }
+
       // Serve dashboard
       if (url.pathname === "/dashboard" || url.pathname === "/dashboard/") {
         return new Response("<html><body>dashboard</body></html>", {
@@ -370,6 +374,20 @@ describe("Dashboard", () => {
   test("GET /favicon.ico returns 204", async () => {
     const res = await fetch(`${proxy.url}/favicon.ico`);
     expect(res.status).toBe(204);
+  });
+
+  test("HEAD / returns 204 without proxy auth", async () => {
+    const p = startProxy({ dataDir: makeTempDir(), upstream: upstream.url });
+    try {
+      p.km.addToken(PROXY_TOKEN_ALICE, "alice");
+      const res = await fetch(`${p.url}/`, { method: "HEAD" });
+      expect(res.status).toBe(204);
+      expect(await res.text()).toBe("");
+    } finally {
+      const dir = p.config.dataDir;
+      p.stop();
+      cleanupTempDir(dir);
+    }
   });
 
   test("GET /dashboard/chart.umd.min.js.map returns 204", async () => {

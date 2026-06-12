@@ -9,7 +9,7 @@ import {
 } from "./types.ts";
 import { log } from "./logger.ts";
 import { emitWithKeys } from "./events.ts";
-import { computeFirstMessageHash, isQuotaProbe } from "./message-fingerprint.ts";
+import { computeFirstMessageHash } from "./message-fingerprint.ts";
 import type { SchemaTracker } from "./schema-tracker.ts";
 
 const RATE_LIMIT_STATUS = 429 as const;
@@ -319,47 +319,6 @@ export async function proxyRequest(
     ? computeFirstMessageHash(requestBody, url.pathname)
     : null;
   const conversationKey = buildConversationKey(proxyUser, sessionId, firstMessageHash);
-  // Claude Code's "quota" probe: small POST /v1/messages with content="quota"
-  // and max_tokens=1. In a rotating proxy, a per-account quota probe is not a
-  // meaningful client-facing signal: one upstream account can reject the probe
-  // while the fleet still has usable capacity. Newer Claude Code builds also
-  // treat probe failures as auth/subscription failures and retry with a
-  // different bearer, which the proxy correctly rejects. Answer the probe
-  // locally so subscription rotation remains transparent to the client.
-  const requestIsQuotaProbe = isQuotaProbe(requestBody, url.pathname);
-  if (requestIsQuotaProbe) {
-    const entry = keyManager.getNextAvailableKey();
-    if (entry !== null) {
-      const summary = summarizeRequestBody(requestBody);
-      if (proxyUser) keyManager.recordTokenSuccess(proxyUser, 0, 0);
-      log("info", "Quota probe answered locally", {
-        label: entry.label,
-        user: proxyUser?.label,
-        method: req.method,
-        path: url.pathname,
-        traceId,
-        sessionId,
-        conversationKey,
-        requestContentLength,
-        model: summary.model,
-      });
-      return {
-        kind: "success",
-        response: syntheticQuotaProbeResponse(summary.model, traceId),
-        usedKey: entry,
-      };
-    }
-    log("info", "Detected quota probe but no key is currently available", {
-      user: proxyUser?.label,
-      method: req.method,
-      path: url.pathname,
-      traceId,
-      sessionId,
-      conversationKey,
-      requestContentLength,
-    });
-  }
-
   const requestFirstChunkTimeoutMs = requestUsesContext1m(req.headers)
     ? config.firstChunkTimeoutMsContext1m
     : config.firstChunkTimeoutMs;
@@ -1025,34 +984,6 @@ async function bufferRequestBody(req: Request): Promise<BufferedRequestBody> {
   if (req.body === null) return null;
   const body = await req.arrayBuffer();
   return new Uint8Array(body);
-}
-
-function syntheticQuotaProbeResponse(model: string | null, traceId: string): Response {
-  const idSuffix = traceId.replace(/[^a-zA-Z0-9]/g, "").slice(0, 24) || "local";
-  return new Response(
-    JSON.stringify({
-      id: `msg_proxy_quota_${idSuffix}`,
-      type: "message",
-      role: "assistant",
-      model: model ?? "proxy-quota-probe",
-      content: [{ type: "text", text: "ok" }],
-      stop_reason: "end_turn",
-      stop_sequence: null,
-      usage: {
-        input_tokens: 1,
-        cache_creation_input_tokens: 0,
-        cache_read_input_tokens: 0,
-        output_tokens: 1,
-      },
-    }),
-    {
-      status: 200,
-      headers: {
-        "content-type": "application/json",
-        "x-claude-proxy-quota-probe": "synthetic",
-      },
-    },
-  );
 }
 
 // Flatten Response Headers into a plain object so it survives JSON-stringify

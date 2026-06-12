@@ -1250,12 +1250,11 @@ describe("Rate Limit Handling (429)", () => {
   }
 });
 
-describe("Quota-probe local response", () => {
+describe("Quota-probe routing", () => {
   // Claude Code sends a small `/v1/messages` request with max_tokens=1 and
-  // a single user message of literally "quota". In a rotating proxy this
-  // probe is not meaningful per upstream account, and newer Claude Code
-  // versions treat probe failures as auth/subscription failures. Answer it
-  // locally so it cannot poison key state or trigger client auth fallback.
+  // a single user message of literally "quota". These probes use the same
+  // upstream/auth path as normal messages; the server root HEAD preflight is
+  // handled separately so we do not need to fabricate Anthropic responses.
 
   function quotaProbeBody(): string {
     return JSON.stringify({
@@ -1265,65 +1264,19 @@ describe("Quota-probe local response", () => {
     });
   }
 
-  test("returns synthetic success without calling upstream or touching key state", async () => {
-    const { km, st } = setup();
-    km.addKey(FAKE_KEY_A, "key-a");
-    km.addKey(FAKE_KEY_B, "key-b");
-
-    let callCount = 0;
-    const mock = upstream(() => {
-      callCount++;
-      return new Response(
-        JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: "Error" } }),
-        { status: 429, headers: { "content-type": "application/json" } },
-      );
-    });
-
-    const config = makeConfig(mock.url);
-    const result = await proxyRequest(
-      makeRequest("/v1/messages", { method: "POST", body: quotaProbeBody() }),
-      km, config, st,
-    );
-
-    // Must not leak the probe to any upstream key.
-    expect(callCount).toBe(0);
-    expect(result.kind).toBe("success");
-    if (result.kind !== "success") return;
-    expect(result.response.status).toBe(200);
-    expect(result.response.headers.get("x-claude-proxy-quota-probe")).toBe("synthetic");
-    const body = await result.response.json() as {
-      type: string;
-      role: string;
-      model: string;
-      content: Array<{ type: string; text: string }>;
-      usage: { input_tokens: number; output_tokens: number };
-    };
-    expect(body.type).toBe("message");
-    expect(body.role).toBe("assistant");
-    expect(body.model).toBe("claude-opus-4-7");
-    expect(body.content).toEqual([{ type: "text", text: "ok" }]);
-    expect(body.usage.input_tokens).toBe(1);
-    expect(body.usage.output_tokens).toBe(1);
-
-    // Critical: neither key should have any request, cooldown, or AIMD state.
-    for (const k of km.listKeys()) {
-      expect(k.availableAt).toBe(0 as unknown as typeof k.availableAt);
-      expect(k.interRequestGapMs).toBe(0);
-      expect(k.stats.totalRequests).toBe(0);
-      expect(k.stats.successfulRequests).toBe(0);
-      expect(k.stats.rateLimitHits).toBe(0);
-    }
-  });
-
-  test("does not call upstream even if upstream would have returned 200", async () => {
+  test("forwards quota probe through normal upstream routing", async () => {
     const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
 
     let callCount = 0;
-    const mock = upstream(() => {
+    let forwardedBody = "";
+    const mock = upstream(async (req) => {
       callCount++;
-      return new Response(JSON.stringify({ id: "ok" }), {
-      status: 200, headers: { "content-type": "application/json" },
+      forwardedBody = await req.text();
+      expect(req.headers.get("x-api-key")).toBe(FAKE_KEY_A);
+      return new Response(JSON.stringify({ id: "msg_ok", type: "message" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
       });
     });
 
@@ -1332,13 +1285,52 @@ describe("Quota-probe local response", () => {
       makeRequest("/v1/messages", { method: "POST", body: quotaProbeBody() }),
       km, config, st,
     );
-    expect(callCount).toBe(0);
+
+    expect(callCount).toBe(1);
+    expect(JSON.parse(forwardedBody)).toMatchObject({
+      max_tokens: 1,
+      messages: [{ role: "user", content: "quota" }],
+    });
     expect(result.kind).toBe("success");
     if (result.kind !== "success") return;
     expect(result.response.status).toBe(200);
+    expect(await result.response.json()).toMatchObject({ id: "msg_ok" });
   });
 
-  test("non-probe 429 still triggers recordRateLimit + retry (probe gate is narrow)", async () => {
+  test("quota probe 429 follows normal rotation", async () => {
+    const { km, st } = setup();
+    km.addKey(FAKE_KEY_A, "key-a");
+    km.addKey(FAKE_KEY_B, "key-b");
+
+    let callCount = 0;
+    const mock = upstream((req) => {
+      callCount++;
+      const key = req.headers.get("x-api-key");
+      if (key === FAKE_KEY_A) {
+        return new Response("rate limited", { status: 429, headers: { "retry-after": "30" } });
+      }
+      return new Response(JSON.stringify({ id: "ok" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+
+    const config = makeConfig(mock.url);
+    const result = await proxyRequest(
+      makeRequest("/v1/messages", { method: "POST", body: quotaProbeBody() }),
+      km, config, st,
+    );
+    expect(callCount).toBe(2);
+    expect(result.kind).toBe("success");
+    if (result.kind !== "success") return;
+    expect(result.response.status).toBe(200);
+
+    const keyA = km.listKeys().find((k) => k.label === "key-a")!;
+    expect(keyA.availableAt).toBeGreaterThan(Date.now());
+    expect(keyA.stats.rateLimitHits).toBe(1);
+  });
+
+  test("non-probe 429 still triggers recordRateLimit + retry", async () => {
     const { km, st } = setup();
     km.addKey(FAKE_KEY_A, "key-a");
     km.addKey(FAKE_KEY_B, "key-b");

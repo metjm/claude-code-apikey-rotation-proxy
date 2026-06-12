@@ -110,6 +110,9 @@ function startServer(): void {
     async fetch(req: Request, server): Promise<Response> {
       // Serve dashboard
       const url = new URL(req.url);
+      if (url.pathname === "/" && req.method === "HEAD") {
+        return new Response(null, { status: 204 });
+      }
       if (url.pathname === "/dashboard" || url.pathname === "/dashboard/") {
         return new Response(Bun.file(join(import.meta.dir, "../public/dashboard.html")));
       }
