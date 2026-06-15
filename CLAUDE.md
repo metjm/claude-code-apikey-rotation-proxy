@@ -93,3 +93,35 @@ keeps emitting bytes is never reaped. And there is **no** `req.signal`
 disconnect handler — in Bun, `req.signal` and the response stream's `cancel()`
 share one disconnect detector and fire together, so it would be redundant with
 the (now-fixed) `cancel()` and still miss the half-open case the reaper covers.
+
+## Peer-auth whitelist: persisted across restarts
+
+When a request carries a valid proxy token, the proxy remembers its peer IP
+(`x-real-ip`, else first `x-forwarded-for`) so subsequent requests from the
+same peer that carry only a swapped Anthropic OAuth token — notably headless
+`workload/cron` sessions, which never re-present the proxy token — still pass.
+
+This whitelist lives in `KeyManager` (`recentPeerProxyAuth` map + the
+`peer_proxy_auth` SQLite table: `peer_key`, `token`, `expires_at`), mirroring
+`conversationAffinities`. It is **persisted**, not in-memory-only, because the
+container is `OOMKilled` under load (SIGKILL, exit 137) and the restart used to
+wipe an in-memory map — producing a burst of `invalid_proxy_token` 401s against
+sessions that had authenticated once and were riding their peer IP. `loadFromDb`
+rehydrates the map (resolving `token` → live `ProxyTokenEntry`, dropping rows
+whose token is gone or whose `expires_at` lapsed).
+
+Two correctness points specific to auth:
+
+- **Writes are immediate.** `rememberPeerProxyAuth` upserts the row inline — no
+  `scheduleSave` debounce — because an OOMKill never runs the SIGTERM flush, so
+  anything not already on disk is lost. (Conversation affinities accept that
+  loss; auth must not.)
+
+- **Token removal purges peers.** `removeToken`/`removeTokenByMasked` call
+  `purgePeerProxyAuthForToken` (map + table). Without it a revoked token would
+  keep authorizing its whitelisted peers for the full `PEER_PROXY_AUTH_TTL_MS`
+  (7 days).
+
+`server.ts` keeps only `requestPeerKey` (header parsing); the store is the
+KeyManager's. The container memory limit is **1Gi** (request 256Mi) in the vrdb
+manifest — raised 4× from 256Mi after the OOMKills that triggered the 401s.

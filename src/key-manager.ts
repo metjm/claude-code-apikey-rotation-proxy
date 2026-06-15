@@ -115,6 +115,17 @@ interface ConversationAffinityRow {
   last_seen_at: number;
 }
 
+interface PeerProxyAuthRow {
+  peer_key: string;
+  token: string;
+  expires_at: number;
+}
+
+interface PeerProxyAuthEntry {
+  readonly proxyUser: ProxyTokenEntry;
+  readonly expiresAt: UnixMs;
+}
+
 // ── KeyManager ────────────────────────────────────────────────────
 
 interface BucketAccumulator {
@@ -257,6 +268,7 @@ function parseBucketToSlot(bucket: string): { dow: number; hour: number } | null
 }
 
 const CONVERSATION_AFFINITY_TTL_MS = 60 * 60 * 1000;
+const PEER_PROXY_AUTH_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const RECENT_SESSION_WINDOW_MS = 15 * 60 * 1000;
 const DASHBOARD_RECENT_SESSION_WINDOW_MS = 2 * 60 * 1000;
 const PRIMARY_CAPACITY_WINDOW_NAMES = new Set(["unified", "unified-5h", "unified-7d"]);
@@ -378,6 +390,7 @@ export class KeyManager {
   private keys: ApiKeyEntry[] = [];
   private tokens: ProxyTokenEntry[] = [];
   private readonly conversationAffinities = new Map<string, ConversationAffinityEntry>();
+  private readonly recentPeerProxyAuth = new Map<string, PeerProxyAuthEntry>();
   private readonly db: Database;
   readonly dbPath: string;
   private readonly cleanupInterval: ReturnType<typeof setInterval>;
@@ -416,6 +429,7 @@ export class KeyManager {
         this.cleanupOldTimeseries();
         this.cleanupOldRoutingDecisions();
         this.cleanupExpiredConversationAffinities(true);
+        this.cleanupExpiredPeerProxyAuth();
         this.prunePastResetCapacityWindows();
       } catch (error) {
         log("warn", "Failed to clean up key manager timeseries", {
@@ -582,6 +596,12 @@ export class KeyManager {
 
       CREATE INDEX IF NOT EXISTS idx_conversation_affinities_key ON conversation_affinities(key);
       CREATE INDEX IF NOT EXISTS idx_conversation_affinities_last_seen ON conversation_affinities(last_seen_at);
+
+      CREATE TABLE IF NOT EXISTS peer_proxy_auth (
+        peer_key TEXT PRIMARY KEY,
+        token TEXT NOT NULL,
+        expires_at INTEGER NOT NULL
+      );
 
       CREATE TABLE IF NOT EXISTS routing_decisions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -781,9 +801,22 @@ export class KeyManager {
       });
     }
     this.cleanupExpiredConversationAffinities(true);
+
+    const peerAuthRows = this.db.query("SELECT * FROM peer_proxy_auth").all() as PeerProxyAuthRow[];
+    this.recentPeerProxyAuth.clear();
+    for (const row of peerAuthRows) {
+      const proxyUser = this.tokens.find((t) => t.token === row.token);
+      if (proxyUser === undefined) continue;
+      this.recentPeerProxyAuth.set(row.peer_key, {
+        proxyUser,
+        expiresAt: row.expires_at as UnixMs,
+      });
+    }
+    this.cleanupExpiredPeerProxyAuth();
+
     this.prunePastResetCapacityWindows();
 
-    log("info", `Loaded ${this.keys.length} key(s) and ${this.tokens.length} token(s) from SQLite`);
+    log("info", `Loaded ${this.keys.length} key(s), ${this.tokens.length} token(s), and ${this.recentPeerProxyAuth.size} whitelisted peer(s) from SQLite`);
   }
 
   // ── Key selection ───────────────────────────────────────────────
@@ -1526,6 +1559,7 @@ export class KeyManager {
     if (idx === -1) return false;
     const removed = this.tokens.splice(idx, 1)[0]!;
     this.db.run("DELETE FROM proxy_tokens WHERE token = ?", [removed.token]);
+    this.purgePeerProxyAuthForToken(removed.token);
     log("info", "Proxy token removed", { label: removed.label });
     return true;
   }
@@ -1535,6 +1569,7 @@ export class KeyManager {
     if (idx === -1) return false;
     const removed = this.tokens.splice(idx, 1)[0]!;
     this.db.run("DELETE FROM proxy_tokens WHERE token = ?", [removed.token]);
+    this.purgePeerProxyAuthForToken(removed.token);
     log("info", "Proxy token removed", { label: removed.label });
     return true;
   }
@@ -1566,6 +1601,56 @@ export class KeyManager {
 
   validateToken(raw: string): ProxyTokenEntry | null {
     return this.tokens.find((t) => t.token === raw) ?? null;
+  }
+
+  // ── Peer proxy auth whitelist ─────────────────────────────────────
+  // A client that presents a valid proxy token has its peer IP remembered
+  // so later requests from the same peer carrying only a swapped Anthropic
+  // OAuth token still pass. Persisted to SQLite — not just the in-memory
+  // map — so a restart, including an OOMKill that never runs the SIGTERM
+  // flush, does not wipe the whitelist and 401 every live session. Writes
+  // are immediate (no scheduleSave debounce) for exactly that unclean exit.
+
+  rememberPeerProxyAuth(peerKey: string, proxyUser: ProxyTokenEntry): void {
+    if (this.isClosed) return;
+    const expiresAt = unixMs(Date.now() + PEER_PROXY_AUTH_TTL_MS);
+    this.recentPeerProxyAuth.set(peerKey, { proxyUser, expiresAt });
+    this.db.run(
+      `INSERT INTO peer_proxy_auth (peer_key, token, expires_at) VALUES (?, ?, ?)
+       ON CONFLICT(peer_key) DO UPDATE SET token = excluded.token, expires_at = excluded.expires_at`,
+      [peerKey, proxyUser.token, expiresAt],
+    );
+  }
+
+  resolvePeerProxyAuth(peerKey: string): ProxyTokenEntry | null {
+    const entry = this.recentPeerProxyAuth.get(peerKey);
+    if (entry === undefined) return null;
+    if (entry.expiresAt <= now()) {
+      this.recentPeerProxyAuth.delete(peerKey);
+      if (!this.isClosed) this.db.run("DELETE FROM peer_proxy_auth WHERE peer_key = ?", [peerKey]);
+      return null;
+    }
+    return entry.proxyUser;
+  }
+
+  private cleanupExpiredPeerProxyAuth(): void {
+    const nowMs = now();
+    for (const [peerKey, entry] of this.recentPeerProxyAuth) {
+      if (entry.expiresAt > nowMs) continue;
+      this.recentPeerProxyAuth.delete(peerKey);
+    }
+    if (!this.isClosed) this.db.run("DELETE FROM peer_proxy_auth WHERE expires_at <= ?", [nowMs]);
+  }
+
+  // Removing a token must drop every peer it whitelisted, in memory and on
+  // disk — otherwise a revoked token keeps authorizing its peers for the
+  // full TTL.
+  private purgePeerProxyAuthForToken(token: ProxyToken): void {
+    for (const [peerKey, entry] of this.recentPeerProxyAuth) {
+      if (entry.proxyUser.token !== token) continue;
+      this.recentPeerProxyAuth.delete(peerKey);
+    }
+    if (!this.isClosed) this.db.run("DELETE FROM peer_proxy_auth WHERE token = ?", [token]);
   }
 
   // ── Proxy token stats ─────────────────────────────────────────

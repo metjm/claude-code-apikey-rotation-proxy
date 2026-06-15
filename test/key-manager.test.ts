@@ -281,6 +281,73 @@ describe("Migration from state.json", () => {
   });
 });
 
+// ── Peer proxy auth whitelist ────────────────────────────────────────────────
+
+describe("Peer proxy auth whitelist persistence", () => {
+  test("a whitelisted peer survives a restart", () => {
+    const km1 = create();
+    const token = km1.addToken(VALID_TOKEN_1, "alice");
+    km1.rememberPeerProxyAuth("203.0.113.50", token);
+    km1.close();
+
+    // Fresh KeyManager on the same data dir, as after an OOMKill.
+    const km2 = create();
+    const resolved = km2.resolvePeerProxyAuth("203.0.113.50");
+    expect(resolved?.label).toBe("alice");
+  });
+
+  test("removing the token purges its whitelisted peers, even across restart", () => {
+    const km1 = create();
+    const token = km1.addToken(VALID_TOKEN_1, "alice");
+    km1.rememberPeerProxyAuth("203.0.113.51", token);
+    expect(km1.resolvePeerProxyAuth("203.0.113.51")?.label).toBe("alice");
+
+    km1.removeToken(VALID_TOKEN_1);
+    expect(km1.resolvePeerProxyAuth("203.0.113.51")).toBeNull();
+    km1.close();
+
+    const km2 = create();
+    expect(km2.resolvePeerProxyAuth("203.0.113.51")).toBeNull();
+  });
+
+  test("an expired entry is pruned on restart and never resolved", () => {
+    const km1 = create();
+    const token = km1.addToken(VALID_TOKEN_1, "alice");
+    km1.rememberPeerProxyAuth("203.0.113.52", token);
+    const dbPath = km1.dbPath;
+    km1.close();
+
+    // Backdate the persisted expiry to the past, as if the TTL had lapsed.
+    const raw = new Database(dbPath);
+    raw.run("UPDATE peer_proxy_auth SET expires_at = ? WHERE peer_key = ?", [1, "203.0.113.52"]);
+    raw.close();
+
+    const km2 = create();
+    expect(km2.resolvePeerProxyAuth("203.0.113.52")).toBeNull();
+
+    const raw2 = new Database(dbPath);
+    const rows = raw2.query("SELECT * FROM peer_proxy_auth").all();
+    raw2.close();
+    expect(rows.length).toBe(0);
+  });
+
+  test("a token unknown at load time drops its stale rows", () => {
+    const km1 = create();
+    const token = km1.addToken(VALID_TOKEN_1, "alice");
+    km1.rememberPeerProxyAuth("203.0.113.53", token);
+    const dbPath = km1.dbPath;
+    km1.close();
+
+    // Delete the token row directly, leaving a dangling peer_proxy_auth row.
+    const raw = new Database(dbPath);
+    raw.run("DELETE FROM proxy_tokens WHERE token = ?", [VALID_TOKEN_1]);
+    raw.close();
+
+    const km2 = create();
+    expect(km2.resolvePeerProxyAuth("203.0.113.53")).toBeNull();
+  });
+});
+
 // ── Key CRUD ────────────────────────────────────────────────────────────────
 
 describe("Key CRUD", () => {

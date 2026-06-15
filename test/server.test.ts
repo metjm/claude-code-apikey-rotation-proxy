@@ -119,7 +119,6 @@ function startProxy(opts: {
     maxFirstChunkRetries: 2,
     webhookUrl: null,
   };
-  const recentPeerProxyAuth = new Map<string, { proxyUser: ProxyTokenEntry }>();
 
   const server = Bun.serve({
     port: 0,
@@ -165,18 +164,14 @@ function startProxy(opts: {
           proxyUser = km.validateToken(incoming);
           if (proxyUser !== null) {
             const peerKey = requestPeerKeyForTest(req);
-            if (peerKey !== null) {
-              recentPeerProxyAuth.set(peerKey, { proxyUser });
-            }
+            if (peerKey !== null) km.rememberPeerProxyAuth(peerKey, proxyUser);
           }
         }
 
         if (!proxyUser) {
           const peerKey = requestPeerKeyForTest(req);
-          const remembered = peerKey === null ? undefined : recentPeerProxyAuth.get(peerKey);
-          if (remembered !== undefined) {
-            proxyUser = remembered.proxyUser;
-          }
+          const whitelisted = peerKey === null ? null : km.resolvePeerProxyAuth(peerKey);
+          if (whitelisted !== null) proxyUser = whitelisted;
         }
 
         if (!proxyUser) {
@@ -1134,6 +1129,54 @@ describe("Proxy Auth Gate", () => {
       expect(noAuthDifferentIp.status).toBe(401);
     } finally {
       p.stop();
+      u.stop();
+      cleanupTempDir(dir);
+    }
+  });
+
+  test("whitelisted client IP survives a proxy restart", async () => {
+    const dir = makeTempDir();
+    const u = startMockUpstream(jsonOkHandler());
+    const sameIp = "203.0.113.20";
+    const body = JSON.stringify({
+      model: "claude-3-haiku-20240307",
+      max_tokens: 1,
+      messages: [],
+    });
+
+    const p1 = startProxy({ dataDir: dir, upstream: u.url });
+    p1.km.addKey(FAKE_KEY_1, "session-key");
+    p1.km.addToken(PROXY_TOKEN_ALICE, "alice");
+    try {
+      const seeded = await fetch(`${p1.url}/v1/messages`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": PROXY_TOKEN_ALICE,
+          "x-real-ip": sameIp,
+        },
+        body,
+      });
+      expect(seeded.status).toBe(200);
+    } finally {
+      p1.stop();
+    }
+
+    // Restart: fresh KeyManager on the same data dir, as after an OOMKill.
+    const p2 = startProxy({ dataDir: dir, upstream: u.url });
+    try {
+      const swappedAfterRestart = await fetch(`${p2.url}/v1/messages`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer sk-ant-oat-swapped-claude-token",
+          "x-real-ip": sameIp,
+        },
+        body,
+      });
+      expect(swappedAfterRestart.status).toBe(200);
+    } finally {
+      p2.stop();
       u.stop();
       cleanupTempDir(dir);
     }

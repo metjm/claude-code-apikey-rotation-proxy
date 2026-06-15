@@ -12,14 +12,6 @@ import type { ProxyTokenEntry, UnixMs } from "./types.ts";
 
 const subcommand = process.argv[2];
 const AUTH_REJECT_BODY_PREVIEW_BYTES = 4_000;
-const PEER_PROXY_AUTH_TTL_MS = 7 * 24 * 60 * 60 * 1000;
-
-interface RecentPeerProxyAuth {
-  readonly proxyUser: ProxyTokenEntry;
-  readonly expiresAt: number;
-}
-
-const recentPeerProxyAuth = new Map<string, RecentPeerProxyAuth>();
 
 if (subcommand === "service") {
   const action = process.argv[3];
@@ -167,12 +159,14 @@ function startServer(): void {
         if (incoming !== null) {
           proxyUser = keyManager.validateToken(incoming.value);
           if (proxyUser !== null) {
-            rememberPeerProxyAuth(req, proxyUser);
+            const peerKey = requestPeerKey(req);
+            if (peerKey !== null) keyManager.rememberPeerProxyAuth(peerKey, proxyUser);
           }
         }
 
         if (proxyUser === null) {
-          const whitelistedUser = resolveRecentPeerProxyAuth(req);
+          const peerKey = requestPeerKey(req);
+          const whitelistedUser = peerKey === null ? null : keyManager.resolvePeerProxyAuth(peerKey);
           if (whitelistedUser !== null) {
             proxyUser = whitelistedUser;
             log("warn", "Proxy auth accepted via IP whitelist", {
@@ -318,37 +312,6 @@ function classifyIncomingToken(token: string): IncomingTokenKind {
   if (token.startsWith("sk-ant-api")) return "anthropic_api_key";
   if (token.startsWith("sk-ant-oat")) return "anthropic_oauth";
   return "other";
-}
-
-function rememberPeerProxyAuth(req: Request, proxyUser: ProxyTokenEntry): void {
-  const peerKey = requestPeerKey(req);
-  if (peerKey === null) return;
-  const nowMs = Date.now();
-  cleanupExpiredPeerProxyAuth(nowMs);
-  recentPeerProxyAuth.set(peerKey, {
-    proxyUser,
-    expiresAt: nowMs + PEER_PROXY_AUTH_TTL_MS,
-  });
-}
-
-function resolveRecentPeerProxyAuth(req: Request): ProxyTokenEntry | null {
-  const peerKey = requestPeerKey(req);
-  if (peerKey === null) return null;
-  const nowMs = Date.now();
-  cleanupExpiredPeerProxyAuth(nowMs);
-  const remembered = recentPeerProxyAuth.get(peerKey);
-  if (remembered === undefined) return null;
-  if (remembered.expiresAt <= nowMs) {
-    recentPeerProxyAuth.delete(peerKey);
-    return null;
-  }
-  return remembered.proxyUser;
-}
-
-function cleanupExpiredPeerProxyAuth(nowMs: number): void {
-  for (const [peerKey, auth] of recentPeerProxyAuth) {
-    if (auth.expiresAt <= nowMs) recentPeerProxyAuth.delete(peerKey);
-  }
 }
 
 function requestPeerKey(req: Request): string | null {
